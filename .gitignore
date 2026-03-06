@@ -1,1 +1,6 @@
-uploads/\n.venv/\n__pycache__/\n*.pyc\nuv.lock
+uploads/
+.venv/
+__pycache__/
+*.pyc
+uv.lock
+.pytest_cache/

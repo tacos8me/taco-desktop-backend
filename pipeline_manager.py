@@ -22,7 +22,7 @@ from ltx_pipelines.retake import RetakePipeline
 from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
 from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, detect_params
-from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.media_io import encode_video, get_videostream_metadata
 
 import config
 
@@ -190,6 +190,7 @@ def _run_a2v(
     if image_path is not None:
         images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
 
+    params = detect_params(config.DEV_CHECKPOINT)
     video, audio = worker.a2vid(
         prompt=prompt,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
@@ -198,8 +199,8 @@ def _run_a2v(
         width=width,
         num_frames=num_frames,
         frame_rate=fps,
-        num_inference_steps=30,
-        video_guider_params=detect_params(config.DEV_CHECKPOINT).video_guider_params,
+        num_inference_steps=params.num_inference_steps,
+        video_guider_params=params.video_guider_params,
         images=images,
         audio_path=audio_path,
         audio_max_duration=num_frames / fps,
@@ -220,8 +221,8 @@ def _run_retake(
     seed: int,
 ) -> bytes:
     end_time = start_time + duration
-    regenerate_video = mode in ("full", "video")
-    regenerate_audio = mode in ("full", "audio")
+    regenerate_video = mode in ("replace_audio_and_video", "replace_video", "replace_video_only")
+    regenerate_audio = mode in ("replace_audio_and_video", "replace_audio")
 
     params = detect_params(config.DEV_CHECKPOINT)
     video, audio = worker.retake(
@@ -238,10 +239,6 @@ def _run_retake(
         regenerate_audio=regenerate_audio,
         tiling_config=TilingConfig.default(),
     )
-
-    # Retake gets frame info from the source video; we need num_frames
-    # for encoding. Use get_videostream_metadata to stay consistent.
-    from ltx_pipelines.utils.media_io import get_videostream_metadata
 
     fps, num_frames, _, _ = get_videostream_metadata(video_path)
     return _video_to_bytes(video, fps, audio, num_frames)

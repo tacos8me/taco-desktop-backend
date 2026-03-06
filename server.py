@@ -26,17 +26,6 @@ manager = PipelineManager()
 uploads = UploadStore(config.UPLOAD_DIR)
 
 # ---------------------------------------------------------------------------
-# Retake mode mapping: spec name -> pipeline name
-# ---------------------------------------------------------------------------
-
-_RETAKE_MODE_MAP: dict[str, str] = {
-    "replace_audio_and_video": "full",
-    "replace_video": "full",
-    "replace_video_only": "video",
-    "replace_audio": "audio",
-}
-
-# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -216,11 +205,6 @@ async def retake(body: RetakeRequest) -> Response:
         return _error(500, "No GPU workers loaded")
     try:
         video_path = str(uploads.resolve(body.video_uri))
-
-        pipeline_mode = _RETAKE_MODE_MAP.get(body.mode)
-        if pipeline_mode is None:
-            return _error(400, f"Unknown retake mode: {body.mode}")
-
         prompt = body.prompt or ""
         seed = random.randint(0, 2**32 - 1)
 
@@ -228,7 +212,7 @@ async def retake(body: RetakeRequest) -> Response:
             video_path=video_path,
             start_time=body.start_time,
             duration=body.duration,
-            mode=pipeline_mode,
+            mode=body.mode,
             prompt=prompt,
             seed=seed,
         )
