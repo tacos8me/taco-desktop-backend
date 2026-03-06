@@ -6,7 +6,7 @@ import logging
 import random
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -48,10 +48,15 @@ app = FastAPI(lifespan=lifespan)
 # ---------------------------------------------------------------------------
 
 
+ModelName = Literal["ltx-2-3-fast", "ltx-2-3-pro"]
+Resolution = Literal["1920x1080", "1080x1920", "2560x1440", "1440x2560", "3840x2160", "2160x3840"]
+RetakeMode = Literal["replace_audio_and_video", "replace_video", "replace_video_only", "replace_audio"]
+
+
 class TextToVideoRequest(BaseModel):
     prompt: str
-    model: str
-    resolution: str
+    model: ModelName
+    resolution: Resolution
     duration: float
     fps: float
     generate_audio: bool = False
@@ -61,8 +66,8 @@ class TextToVideoRequest(BaseModel):
 class ImageToVideoRequest(BaseModel):
     prompt: str
     image_uri: str
-    model: str
-    resolution: str
+    model: ModelName
+    resolution: Resolution
     duration: float
     fps: float
     generate_audio: bool = False
@@ -72,15 +77,15 @@ class AudioToVideoRequest(BaseModel):
     prompt: str
     audio_uri: str
     image_uri: str | None = None
-    model: str
-    resolution: str
+    model: ModelName
+    resolution: Resolution
 
 
 class RetakeRequest(BaseModel):
     video_uri: str
     start_time: float
     duration: float
-    mode: str
+    mode: RetakeMode
     prompt: str | None = None
 
 
@@ -97,7 +102,8 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
 
 
 def _error(status: int, msg: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": msg[:500]})
+    text = msg[:500]
+    return JSONResponse(status_code=status, content={"error": text, "message": text, "detail": text})
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +134,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
             num_frames=num_frames,
             fps=body.fps,
             seed=seed,
+            generate_audio=body.generate_audio,
         )
         return Response(content=video_bytes, media_type="video/mp4")
     except Exception as exc:
@@ -154,6 +161,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
             num_frames=num_frames,
             fps=body.fps,
             seed=seed,
+            generate_audio=body.generate_audio,
         )
         return Response(content=video_bytes, media_type="video/mp4")
     except FileNotFoundError as exc:
@@ -221,8 +229,7 @@ async def retake(body: RetakeRequest) -> Response:
         return _error(404, str(exc))
     except Exception as exc:
         logger.exception("retake failed")
-        # Return 422 for safety-filter-style errors if needed
-        return _error(500, str(exc))
+        return _error(422, f"Content rejected or generation failed: {exc}")
 
 
 @app.post("/v1/upload")

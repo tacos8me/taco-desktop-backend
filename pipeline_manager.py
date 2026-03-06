@@ -12,6 +12,7 @@ import asyncio
 import logging
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
@@ -47,19 +48,23 @@ def _duration_to_frames(duration: float, fps: float) -> int:
     return 8 * k + 1
 
 
-def _video_to_bytes(video, fps: float, audio, num_frames: int) -> bytes:
+def _video_to_bytes(video, fps: float, audio, num_frames: int, *, include_audio: bool = True) -> bytes:
     """Encode decoded video + audio to MP4 bytes via a temp file."""
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
         encode_video(
             video=video,
             fps=int(fps),
-            audio=audio,
-            output_path=tmp.name,
+            audio=audio if include_audio else None,
+            output_path=tmp_path,
             video_chunks_number=video_chunks_number,
         )
-        return tmp.read()
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +97,7 @@ def _run_t2v(
     num_frames: int,
     fps: float,
     seed: int,
+    generate_audio: bool,
 ) -> bytes:
     if model == "ltx-2-3-fast":
         video, audio = worker.distilled(
@@ -123,7 +129,7 @@ def _run_t2v(
     else:
         raise ValueError(f"Unknown model: {model}")
 
-    return _video_to_bytes(video, fps, audio, num_frames)
+    return _video_to_bytes(video, fps, audio, num_frames, include_audio=generate_audio)
 
 
 @torch.inference_mode()
@@ -137,6 +143,7 @@ def _run_i2v(
     num_frames: int,
     fps: float,
     seed: int,
+    generate_audio: bool,
 ) -> bytes:
     images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
 
@@ -170,7 +177,7 @@ def _run_i2v(
     else:
         raise ValueError(f"Unknown model: {model}")
 
-    return _video_to_bytes(video, fps, audio, num_frames)
+    return _video_to_bytes(video, fps, audio, num_frames, include_audio=generate_audio)
 
 
 @torch.inference_mode()
@@ -331,6 +338,7 @@ class PipelineManager:
         num_frames: int,
         fps: float,
         seed: int,
+        generate_audio: bool = True,
     ) -> bytes:
         worker = await self._acquire_worker()
         try:
@@ -346,6 +354,7 @@ class PipelineManager:
                 num_frames,
                 fps,
                 seed,
+                generate_audio,
             )
         finally:
             worker.lock.release()
@@ -360,6 +369,7 @@ class PipelineManager:
         num_frames: int,
         fps: float,
         seed: int,
+        generate_audio: bool = True,
     ) -> bytes:
         worker = await self._acquire_worker()
         try:
@@ -376,6 +386,7 @@ class PipelineManager:
                 num_frames,
                 fps,
                 seed,
+                generate_audio,
             )
         finally:
             worker.lock.release()
