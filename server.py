@@ -79,6 +79,8 @@ class AudioToVideoRequest(BaseModel):
     image_uri: str | None = None
     model: ModelName
     resolution: Resolution
+    duration: float = 6.0
+    fps: float = 24.0
 
 
 class RetakeRequest(BaseModel):
@@ -182,10 +184,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
             image_path = str(uploads.resolve(body.image_uri))
 
         width, height = _resolution_to_dims(body.resolution)
-        # Audio-to-video has no duration/fps in the spec; use defaults
-        fps = 24.0
-        duration = 6.0
-        num_frames = _duration_to_frames(duration, fps)
+        num_frames = _duration_to_frames(body.duration, body.fps)
         seed = random.randint(0, 2**32 - 1)
 
         video_bytes = await manager.generate_audio_to_video(
@@ -196,7 +195,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
             width=width,
             height=height,
             num_frames=num_frames,
-            fps=fps,
+            fps=body.fps,
             seed=seed,
         )
         return Response(content=video_bytes, media_type="video/mp4")
