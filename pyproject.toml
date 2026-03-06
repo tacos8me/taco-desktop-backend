@@ -1,0 +1,16 @@
+[project]
+name = "taco-backend"
+version = "0.1.0"
+description = "LTX-compatible inference server for taco-desktop"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.0",
+    "ltx-core",
+    "ltx-pipelines",
+]
+
+[tool.uv.sources]
+ltx-core = { path = "/mnt/nvme-1/repos/LTX-2/packages/ltx-core", editable = true }
+ltx-pipelines = { path = "/mnt/nvme-1/repos/LTX-2/packages/ltx-pipelines", editable = true }
