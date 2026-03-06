@@ -14,3 +14,9 @@ dependencies = [
 [tool.uv.sources]
 ltx-core = { path = "/mnt/nvme-1/repos/LTX-2/packages/ltx-core", editable = true }
 ltx-pipelines = { path = "/mnt/nvme-1/repos/LTX-2/packages/ltx-pipelines", editable = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
+]
