@@ -22,7 +22,11 @@ logger = logging.getLogger(__name__)
 # Globals
 # ---------------------------------------------------------------------------
 
-manager = PipelineManager()
+if config.USE_SPLIT_GPU:
+    from split_model_manager import SplitModelManager
+    manager = SplitModelManager()
+else:
+    manager = PipelineManager()
 uploads = UploadStore(config.UPLOAD_DIR)
 
 # ---------------------------------------------------------------------------
@@ -120,7 +124,7 @@ async def health() -> dict[str, str]:
 
 @app.post("/v1/text-to-video")
 async def text_to_video(body: TextToVideoRequest) -> Response:
-    if not manager.workers:
+    if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     try:
         width, height = _resolution_to_dims(body.resolution)
@@ -146,7 +150,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
 
 @app.post("/v1/image-to-video")
 async def image_to_video(body: ImageToVideoRequest) -> Response:
-    if not manager.workers:
+    if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     try:
         image_path = str(uploads.resolve(body.image_uri))
@@ -175,7 +179,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
 
 @app.post("/v1/audio-to-video")
 async def audio_to_video(body: AudioToVideoRequest) -> Response:
-    if not manager.workers:
+    if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     try:
         audio_path = str(uploads.resolve(body.audio_uri))
@@ -208,7 +212,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
 
 @app.post("/v1/retake")
 async def retake(body: RetakeRequest) -> Response:
-    if not manager.workers:
+    if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     try:
         video_path = str(uploads.resolve(body.video_uri))

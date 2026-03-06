@@ -267,6 +267,10 @@ class PipelineManager:
     def __init__(self) -> None:
         self.workers: list[GPUWorker] = []
 
+    @property
+    def is_ready(self) -> bool:
+        return len(self.workers) > 0
+
     def load_all(self) -> None:
         """Load all four pipeline types onto each configured GPU."""
         distilled_lora = [

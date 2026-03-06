@@ -16,6 +16,9 @@ GPU_DEVICES = ["cuda:0", "cuda:2"]
 # Upload storage
 UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")
 
+# Split-GPU mode: use SplitModelManager instead of per-GPU pipeline copies
+USE_SPLIT_GPU = len(GPU_DEVICES) >= 2
+
 # Server
 HOST = "0.0.0.0"
 PORT = 8090
