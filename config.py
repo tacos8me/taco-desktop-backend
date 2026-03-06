@@ -18,4 +18,4 @@ UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")
 
 # Server
 HOST = "0.0.0.0"
-PORT = 8080
+PORT = 8090

@@ -34,10 +34,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _snap_to_multiple(value: int, divisor: int) -> int:
+    """Round up to nearest multiple of divisor."""
+    return ((value + divisor - 1) // divisor) * divisor
+
+
 def _resolution_to_dims(resolution: str) -> tuple[int, int]:
-    """Parse '1920x1080' into (width, height)."""
+    """Parse '1920x1080' into (width, height), snapped to multiples of 64."""
     w, h = resolution.split("x")
-    return int(w), int(h)
+    return _snap_to_multiple(int(w), 64), _snap_to_multiple(int(h), 64)
 
 
 def _duration_to_frames(duration: float, fps: float) -> int:
