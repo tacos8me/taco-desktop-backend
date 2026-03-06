@@ -11,7 +11,7 @@ SPATIAL_UPSAMPLER = str(CHECKPOINTS_DIR / "ltx-2.3-spatial-upscaler-x2-1.0.safet
 GEMMA_ROOT = "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f"
 
 # GPU devices for inference (both RTX PRO 6000 Blackwell 96GB)
-GPU_DEVICES = ["cuda:0", "cuda:2"]
+GPU_DEVICES = ["cuda:0", "cuda:1"]
 
 # Upload storage
 UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")

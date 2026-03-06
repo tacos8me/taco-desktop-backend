@@ -450,7 +450,7 @@ class SplitModelManager:
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Audio encoding on GPU:0, then transfer
-        decoded_audio = decode_audio_from_file(audio_path, self._encoder_device, num_frames / fps)
+        decoded_audio = decode_audio_from_file(audio_path, self._encoder_device, max_duration=num_frames / fps)
         encoded_audio_latent = vae_encode_audio(decoded_audio, self._encoder_ledger.audio_encoder())
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / fps, channels=8, mel_bins=16)
         encoded_audio_latent = encoded_audio_latent[:, :, :audio_shape.frames].to(device)
@@ -479,7 +479,7 @@ class SplitModelManager:
                     audio_guider_factory=create_multimodal_guider_factory(params=MultiModalGuiderParams(), negative_context=None),
                     v_context=v_context_p, a_context=a_context_p, transformer=transformer))
 
-        video_state, audio_state = denoise_video_only(
+        video_state = denoise_video_only(
             output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
             sigmas=sigmas, stepper=stepper, denoising_loop_fn=stage1_loop,
             components=self._components, dtype=dtype, device=device,
@@ -499,19 +499,19 @@ class SplitModelManager:
             return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
                 denoise_fn=simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer))
 
-        video_state, audio_state = denoise_video_only(
+        video_state = denoise_video_only(
             output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
             sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
             components=self._components, dtype=dtype, device=device,
             noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=audio_state.latent,
+            initial_audio_latent=encoded_audio_latent,
         )
 
         self._ensure_transformer("dev")
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
         decoded_video = vae_decode_video(video_state.latent, self._denoiser_ledger.video_decoder(), TilingConfig.default(), generator)
-        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sample_rate=decoded_audio.sample_rate)
+        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
     @torch.inference_mode()
@@ -543,7 +543,7 @@ class SplitModelManager:
         initial_video_latent = video_encoder_enc(video_conditioning.to(self._encoder_device, dtype=dtype)).to(device)
 
         # Encode audio from video on GPU:0, transfer
-        decoded_audio = decode_audio_from_file(video_path, self._encoder_device, num_frames / fps_vid)
+        decoded_audio = decode_audio_from_file(video_path, self._encoder_device, max_duration=num_frames / fps_vid)
         audio_encoder = self._encoder_ledger.audio_encoder()
         initial_audio_latent = vae_encode_audio(decoded_audio, audio_encoder).to(device)
 
