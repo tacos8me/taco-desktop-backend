@@ -620,6 +620,8 @@ class SplitModelManager:
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
+    # TODO: temporal masking (start_time/duration/mode) is not yet implemented —
+    # the current implementation regenerates the entire video.
     @torch.inference_mode()
     def _run_retake(
         self, worker: DenoiserWorker, video_path: str, start_time: float, duration: float,
@@ -646,7 +648,7 @@ class SplitModelManager:
 
         # Encode input video on GPU:0, transfer to worker device
         video_encoder_enc = self._encoder_ledger.video_encoder()
-        video_conditioning = load_video_conditioning(video_path, height=vid_height, width=vid_width)
+        video_conditioning = load_video_conditioning(video_path, height=vid_height, width=vid_width, frame_cap=num_frames, dtype=dtype, device=self._encoder_device)
         initial_video_latent = video_encoder_enc(video_conditioning.to(self._encoder_device, dtype=dtype)).to(device)
 
         # Encode audio from video on GPU:0, transfer to worker device
