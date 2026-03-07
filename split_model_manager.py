@@ -17,8 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.guiders import (
+    MultiModalGuider,
     MultiModalGuiderParams,
     create_multimodal_guider_factory,
 )
@@ -30,11 +31,13 @@ from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
+from ltx_core.tools import VideoLatentShape
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.constants import (
     DEFAULT_NEGATIVE_PROMPT,
     DISTILLED_SIGMA_VALUES,
+    LTX_2_3_HQ_PARAMS,
     STAGE_2_DISTILLED_SIGMA_VALUES,
     detect_params,
 )
@@ -55,7 +58,7 @@ from ltx_pipelines.utils.media_io import (
     load_video_conditioning,
 )
 from ltx_pipelines.utils.model_ledger import ModelLedger
-from ltx_pipelines.utils.samplers import euler_denoising_loop
+from ltx_pipelines.utils.samplers import euler_denoising_loop, res2s_audio_video_denoising_loop
 from ltx_pipelines.utils.types import PipelineComponents
 
 import config
@@ -137,6 +140,18 @@ class DenoiserWorker:
         elif state == "dev_lora":
             distilled_lora = LoraPathStrengthAndSDOps(
                 path=config.DISTILLED_LORA, strength=1.0,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+            checkpoint, loras = config.DEV_CHECKPOINT, (distilled_lora,)
+        elif state == "dev_lora_025":
+            distilled_lora = LoraPathStrengthAndSDOps(
+                path=config.DISTILLED_LORA, strength=0.25,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+            checkpoint, loras = config.DEV_CHECKPOINT, (distilled_lora,)
+        elif state == "dev_lora_050":
+            distilled_lora = LoraPathStrengthAndSDOps(
+                path=config.DISTILLED_LORA, strength=0.5,
                 sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
             )
             checkpoint, loras = config.DEV_CHECKPOINT, (distilled_lora,)
@@ -409,6 +424,105 @@ class SplitModelManager:
 
         if not is_fast:
             worker.ensure_transformer("dev")
+
+        # Decode
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
+        decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+
+    @torch.inference_mode()
+    def _run_t2v_hq(
+        self, worker: DenoiserWorker, prompt: str, width: int, height: int,
+        num_frames: int, fps: float, seed: int, generate_audio: bool,
+        on_progress=None,
+    ) -> bytes:
+        device = worker.device
+        dtype = torch.bfloat16
+        hq_params = LTX_2_3_HQ_PARAMS
+
+        worker.ensure_transformer("dev_lora_025")
+
+        # Text encoding on GPU:0 (shared encoder)
+        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+        ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+
+        generator = torch.Generator(device=device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        stepper = Res2sDiffusionStep()
+
+        # Stage 1: half-resolution denoising with res2s sampler
+        stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
+        video_encoder = worker.ledger.video_encoder()
+        stage_1_cond = combined_image_conditionings(images=[], height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+
+        transformer = worker.ledger.transformer()
+
+        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
+        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=hq_params.num_inference_steps).to(dtype=torch.float32, device=device)
+        # res2s: 2 NFE per step + 1 final
+        s1_nfe = 2 * hq_params.num_inference_steps + 1
+
+        def denoising_loop(sigmas, video_state, audio_state, stepper):
+            dfn = multi_modal_guider_denoising_func(
+                video_guider=MultiModalGuider(params=hq_params.video_guider_params, negative_context=v_context_n),
+                audio_guider=MultiModalGuider(params=hq_params.audio_guider_params, negative_context=a_context_n),
+                v_context=v_context_p, a_context=a_context_p, transformer=transformer,
+            )
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, s1_nfe, offset=0.0, scale=0.7)
+            return res2s_audio_video_denoising_loop(
+                sigmas=sigmas, video_state=video_state, audio_state=audio_state,
+                stepper=stepper, denoise_fn=dfn,
+            )
+
+        video_state, audio_state = denoise_audio_video(
+            output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
+            sigmas=sigmas, stepper=stepper, denoising_loop_fn=denoising_loop,
+            components=worker.components, dtype=dtype, device=device,
+        )
+
+        # Stage 2: upsample + refine with dev_lora@0.5
+        upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        stage_1_audio_latent = audio_state.latent
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
+        cleanup_memory()
+
+        stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
+        stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+
+        worker.ensure_transformer("dev_lora_050")
+        transformer = worker.ledger.transformer()
+        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        # res2s stage 2: 2 NFE per step + 1 final (3 distilled steps = 2 actual steps)
+        s2_nfe = 2 * (len(distilled_sigmas) - 1) + 1
+
+        def stage2_loop(sigmas, video_state, audio_state, stepper):
+            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, s2_nfe, offset=0.7, scale=0.25)
+            return res2s_audio_video_denoising_loop(
+                sigmas=sigmas, video_state=video_state, audio_state=audio_state,
+                stepper=stepper, denoise_fn=dfn,
+            )
+
+        video_state, audio_state = denoise_audio_video(
+            output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
+            sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
+            components=worker.components, dtype=dtype, device=device,
+            noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
+            initial_audio_latent=stage_1_audio_latent,
+        )
+
+        # Save stage 2 latents, free everything before transformer swap
+        video_latent = video_state.latent
+        audio_latent = audio_state.latent
+        del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
+        del transformer, stage2_loop, distilled_sigmas
+        cleanup_memory()
+
+        worker.ensure_transformer("dev")
 
         # Decode
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
@@ -701,6 +815,11 @@ class SplitModelManager:
         worker = await self._acquire_worker()
         try:
             loop = asyncio.get_running_loop()
+            if model == "ltx-2-3-hq":
+                return await loop.run_in_executor(
+                    None, self._run_t2v_hq, worker, prompt, width, height,
+                    num_frames, fps, seed, generate_audio, on_progress,
+                )
             return await loop.run_in_executor(
                 None, self._run_t2v, worker, prompt, model, width, height,
                 num_frames, fps, seed, generate_audio, on_progress,

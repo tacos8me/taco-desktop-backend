@@ -50,6 +50,19 @@ def test_v2_submit_returns_202():
         _cleanup_queue()
 
 
+def test_v2_submit_hq_returns_202():
+    with _with_no_auth():
+        resp = client.post("/v2/text-to-video", json={
+            "prompt": "test", "model": "ltx-2-3-hq",
+            "resolution": "1920x1080", "duration": 5.0, "fps": 24.0,
+        })
+        assert resp.status_code == 202
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "queued"
+        _cleanup_queue()
+
+
 def test_v2_submit_rejects_invalid_input():
     with _with_no_auth():
         resp = client.post("/v2/text-to-video", json={

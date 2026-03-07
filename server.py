@@ -138,7 +138,7 @@ async def check_api_key(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 
-ModelName = Literal["ltx-2-3-fast", "ltx-2-3-pro"]
+ModelName = Literal["ltx-2-3-fast", "ltx-2-3-pro", "ltx-2-3-hq"]
 Resolution = Literal["1920x1080", "1080x1920", "2560x1440", "1440x2560", "3840x2160", "2160x3840"]
 RetakeMode = Literal["replace_audio_and_video", "replace_video", "replace_video_only", "replace_audio"]
 ImageModelName = Literal["flux2-dev"]
