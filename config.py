@@ -1,4 +1,23 @@
+import os
 from pathlib import Path
+
+
+def _load_api_keys() -> set[str]:
+    """Load API keys from .api_keys file and/or TACO_API_KEY env var."""
+    keys: set[str] = set()
+    keys_file = Path(__file__).parent / ".api_keys"
+    if keys_file.exists():
+        for line in keys_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                keys.add(line)
+    env_key = os.environ.get("TACO_API_KEY", "").strip()
+    if env_key:
+        keys.add(env_key)
+    return keys
+
+
+API_KEYS: set[str] = _load_api_keys()
 
 # Checkpoint paths
 CHECKPOINTS_DIR = Path("/mnt/nvme-1/huggingface/ltx-2.3-checkpoints")

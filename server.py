@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import secrets as _secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
 from split_model_manager import SplitModelManager
@@ -57,6 +59,32 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|192\.168\.\d+\.\d+)(:\d+)?$",
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+@app.middleware("http")
+async def check_api_key(request: Request, call_next):
+    if not config.API_KEYS:
+        return await call_next(request)
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+
+    if not token or not any(
+        _secrets.compare_digest(token, key) for key in config.API_KEYS
+    ):
+        return _error(401, "Invalid or missing API key")
+
+    return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -69,61 +97,61 @@ ImageModelName = Literal["flux2-dev"]
 
 
 class TextToVideoRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(max_length=10000)
     model: ModelName
     resolution: Resolution
-    duration: float
-    fps: float
+    duration: float = Field(gt=0, le=30)
+    fps: float = Field(gt=0, le=60)
     generate_audio: bool = False
-    camera_motion: str | None = None
+    camera_motion: str | None = Field(default=None, max_length=200)
 
 
 class ImageToVideoRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(max_length=10000)
     image_uri: str
     model: ModelName
     resolution: Resolution
-    duration: float
-    fps: float
+    duration: float = Field(gt=0, le=30)
+    fps: float = Field(gt=0, le=60)
     generate_audio: bool = False
 
 
 class AudioToVideoRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(max_length=10000)
     audio_uri: str
     image_uri: str | None = None
     model: ModelName
     resolution: Resolution
-    duration: float = 6.0
-    fps: float = 24.0
+    duration: float = Field(default=6.0, gt=0, le=30)
+    fps: float = Field(default=24.0, gt=0, le=60)
 
 
 class RetakeRequest(BaseModel):
     video_uri: str
-    start_time: float
-    duration: float
+    start_time: float = Field(ge=0)
+    duration: float = Field(gt=0, le=30)
     mode: RetakeMode
-    prompt: str | None = None
+    prompt: str | None = Field(default=None, max_length=10000)
 
 
 class TextToImageRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(max_length=10000)
     model: ImageModelName = "flux2-dev"
-    width: int = 1024
-    height: int = 1024
-    num_inference_steps: int = 50
-    guidance_scale: float = 4.0
+    width: int = Field(default=1024, ge=64, le=4096)
+    height: int = Field(default=1024, ge=64, le=4096)
+    num_inference_steps: int = Field(default=50, ge=1, le=100)
+    guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
 
 
 class ImageToImageRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(max_length=10000)
     image_uri: str
     model: ImageModelName = "flux2-dev"
-    width: int = 1024
-    height: int = 1024
-    num_inference_steps: int = 50
-    guidance_scale: float = 4.0
+    width: int = Field(default=1024, ge=64, le=4096)
+    height: int = Field(default=1024, ge=64, le=4096)
+    num_inference_steps: int = Field(default=50, ge=1, le=100)
+    guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
 
 
@@ -135,8 +163,8 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "gemma-3-12b-nvfp4"
     messages: list[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 512
+    temperature: float = Field(default=0.7, ge=0, le=2.0)
+    max_tokens: int = Field(default=512, ge=1, le=8192)
 
 
 # ---------------------------------------------------------------------------

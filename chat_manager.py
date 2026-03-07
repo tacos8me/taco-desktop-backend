@@ -72,9 +72,14 @@ class ChatManager:
         max_tokens: int = 512,
     ) -> dict:
         """Forward chat completion to external server and return OpenAI-format response."""
+        clean_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+        ]
+
         payload = {
             "model": config.CHAT_MODEL,
-            "messages": messages,
+            "messages": clean_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }

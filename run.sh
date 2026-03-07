@@ -9,4 +9,9 @@ export LD_LIBRARY_PATH="${VENV_NVIDIA}/cu13/lib:${VENV_NVIDIA}/cuda_nvrtc/lib:${
 # Reduce CUDA memory fragmentation
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Load environment variables (optional, for TACO_API_KEY override)
+if [ -f .env ]; then
+    set -a; source .env; set +a
+fi
+
 exec uv run --no-sync uvicorn server:app --host 0.0.0.0 --port 8090
