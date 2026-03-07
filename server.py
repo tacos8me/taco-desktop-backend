@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import config
 from split_model_manager import SplitModelManager
 from flux_manager import FluxManager
+from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 manager = SplitModelManager()
 flux = FluxManager()
 uploads = UploadStore(config.UPLOAD_DIR)
+chat = ChatManager()
 
 # Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
 # when Flux and LTX run CUDA inference concurrently in the same process.
@@ -47,6 +49,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("Loading Flux pipeline on %s ...", config.FLUX_DEVICE)
     flux.load()
     logger.info("Flux pipeline ready.")
+
+    chat.load()
+    logger.info("Chat proxy ready.")
     yield
 
 
@@ -122,6 +127,18 @@ class ImageToImageRequest(BaseModel):
     seed: int | None = None
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str | list  # str for text, list for multimodal
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "loco-operator"
+    messages: list[ChatMessage]
+    temperature: float = 0.7
+    max_tokens: int = 512
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -153,6 +170,7 @@ async def health() -> dict:
         "status": "ok",
         "ltx": "ready" if manager.is_ready else "not_loaded",
         "flux": "ready" if flux.is_ready else "not_loaded",
+        "chat": "ready" if chat.is_ready else "not_loaded",
     }
 
 
@@ -322,6 +340,25 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         return _error(404, str(exc))
     except Exception as exc:
         logger.exception("image-to-image failed")
+        return _error(500, str(exc))
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
+    if not chat.is_ready:
+        return _error(500, "Chat model not loaded")
+    if not body.messages:
+        return _error(422, "Messages list cannot be empty")
+    try:
+        messages = [m.model_dump() for m in body.messages]
+        result = await chat.generate_chat_completion(
+            messages=messages,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+        return JSONResponse(content=result)
+    except Exception as exc:
+        logger.exception("chat completion failed")
         return _error(500, str(exc))
 
 

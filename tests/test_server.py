@@ -19,6 +19,7 @@ def test_health():
     assert data["status"] == "ok"
     assert "ltx" in data
     assert "flux" in data
+    assert "chat" in data
 
 
 def test_upload_flow():
@@ -42,6 +43,35 @@ def test_upload_flow():
     file_bytes = b"\x89PNG\r\n\x1a\nfake-image-data"
     resp = client.put(path, content=file_bytes)
     assert resp.status_code == 201
+
+
+def test_chat_completions_returns_error_without_gpu():
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "loco-operator",
+            "messages": [
+                {"role": "system", "content": "You are a prompt engineer."},
+                {"role": "user", "content": "a cat on a windowsill"},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 512,
+        },
+    )
+    assert resp.status_code == 500
+    data = resp.json()
+    assert "error" in data
+
+
+def test_chat_completions_validates_messages():
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "loco-operator",
+            "messages": [],
+        },
+    )
+    assert resp.status_code in (422, 500)
 
 
 def test_text_to_video_returns_error_without_gpu():

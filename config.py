@@ -13,6 +13,8 @@ GEMMA_ROOT = "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapsho
 # GPU devices
 LTX_DEVICE = "cuda:0"    # LTX-2 video generation (~59GB)
 FLUX_DEVICE = "cuda:1"   # Flux 2 image generation (~79GB FP8)
+CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
+CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
 
 # SplitModelManager: encoder hub + denoiser on single GPU
 GPU_DEVICES = [LTX_DEVICE]
