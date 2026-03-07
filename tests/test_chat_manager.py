@@ -25,7 +25,7 @@ def test_build_openai_response():
     assert resp["choices"][0]["message"]["content"] == "Enhanced prompt text here"
     assert resp["choices"][0]["message"]["role"] == "assistant"
     assert resp["id"].startswith("chatcmpl-")
-    assert resp["model"] == "loco-operator"
+    assert resp["model"] == "gemma-3-12b-nvfp4"
     assert "created" in resp
 
 
@@ -52,7 +52,7 @@ async def test_generate_forwards_to_server():
     )
 
     assert result["choices"][0]["message"]["content"] == "A cinematic shot of a cat"
-    assert result["model"] == "loco-operator"
+    assert result["model"] == "gemma-3-12b-nvfp4"
 
     call_args = mgr._client.post.call_args
     assert call_args[0][0] == "/v1/chat/completions"

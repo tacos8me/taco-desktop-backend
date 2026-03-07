@@ -11,7 +11,8 @@ dependencies = [
     "ltx-pipelines",
     "diffusers>=0.37.0.dev0",
     "sentencepiece",
-    "torchao",
+    "httpx>=0.28.1",
+    "torch>=2.9,<2.10",
 ]
 
 [[tool.uv.index]]
@@ -25,10 +26,9 @@ ltx-pipelines = { path = "/mnt/nvme-1/repos/LTX-2/packages/ltx-pipelines", edita
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
-torchao = { index = "pytorch-cu130" }
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
 ]

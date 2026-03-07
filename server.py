@@ -133,7 +133,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "loco-operator"
+    model: str = "gemma-3-12b-nvfp4"
     messages: list[ChatMessage]
     temperature: float = 0.7
     max_tokens: int = 512

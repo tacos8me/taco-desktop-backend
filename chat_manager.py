@@ -52,7 +52,7 @@ class ChatManager:
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "loco-operator",
+            "model": config.CHAT_MODEL,
             "choices": [
                 {
                     "index": 0,
