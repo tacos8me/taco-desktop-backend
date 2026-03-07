@@ -15,9 +15,7 @@ LTX_DEVICE = "cuda:0"    # LTX-2 video generation (~59GB)
 FLUX_DEVICE = "cuda:1"   # Flux 2 image generation (~79GB FP8)
 
 # SplitModelManager: encoder hub + denoiser on single GPU
-# (PipelineManager can't be used — loads 4 pipelines with 4 transformers = OOM)
 GPU_DEVICES = [LTX_DEVICE]
-USE_SPLIT_GPU = True
 
 # Flux model
 FLUX_MODEL_REPO = "black-forest-labs/FLUX.2-dev"

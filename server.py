@@ -16,7 +16,7 @@ from pydantic import BaseModel
 import config
 from split_model_manager import SplitModelManager
 from flux_manager import FluxManager
-from pipeline_manager import _duration_to_frames, _resolution_to_dims
+from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,10 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
 
 
 def _error(status: int, msg: str) -> JSONResponse:
+    # Avoid leaking internal filesystem paths in error responses
     text = msg[:500]
+    if "/mnt/" in text or "/home/" in text or "/tmp/" in text:
+        text = "Internal server error"
     return JSONResponse(status_code=status, content={"error": text, "message": text, "detail": text})
 
 
@@ -341,7 +344,13 @@ async def upload(request: Request) -> JSONResponse:
 
 @app.put("/uploads/put/{upload_id}")
 async def upload_put(upload_id: str, request: Request) -> Response:
+    from upload_store import MAX_UPLOAD_BYTES
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_UPLOAD_BYTES:
+        return _error(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     data = await request.body()
+    if len(data) > MAX_UPLOAD_BYTES:
+        return _error(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     uploads.save(upload_id, data)
     return Response(status_code=201)
 

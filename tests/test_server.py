@@ -15,7 +15,10 @@ client = TestClient(app)
 def test_health():
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert "ltx" in data
+    assert "flux" in data
 
 
 def test_upload_flow():
