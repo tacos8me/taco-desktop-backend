@@ -41,6 +41,7 @@ from ltx_pipelines.utils.constants import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     detect_params,
 )
+from ltx_pipelines.retake import TemporalRegionMask
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     combined_image_conditionings,
@@ -49,6 +50,8 @@ from ltx_pipelines.utils.helpers import (
     encode_prompts,
     multi_modal_guider_denoising_func,
     multi_modal_guider_factory_denoising_func,
+    noise_audio_state,
+    noise_video_state,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.media_io import (
@@ -737,8 +740,6 @@ class SplitModelManager:
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
-    # TODO: temporal masking (start_time/duration/mode) is not yet implemented —
-    # the current implementation regenerates the entire video.
     @torch.inference_mode()
     def _run_retake(
         self, worker: DenoiserWorker, video_path: str, start_time: float, duration: float,
@@ -768,10 +769,12 @@ class SplitModelManager:
         video_conditioning = load_video_conditioning(video_path, height=vid_height, width=vid_width, frame_cap=num_frames, dtype=dtype, device=self._encoder_device)
         initial_video_latent = video_encoder_enc(video_conditioning.to(self._encoder_device, dtype=dtype)).to(device)
 
-        # Encode audio from video on GPU:0, transfer to worker device
-        decoded_audio = decode_audio_from_file(video_path, self._encoder_device, max_duration=num_frames / fps_vid)
-        audio_encoder = self._encoder_ledger.audio_encoder()
-        initial_audio_latent = vae_encode_audio(decoded_audio, audio_encoder).to(device)
+        # Encode audio from video (may be None if no audio track)
+        audio_in = decode_audio_from_file(video_path, self._encoder_device, max_duration=num_frames / fps_vid)
+        initial_audio_latent = None
+        if audio_in is not None:
+            audio_encoder = self._encoder_ledger.audio_encoder()
+            initial_audio_latent = vae_encode_audio(audio_in, audio_encoder).to(device)
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -793,13 +796,44 @@ class SplitModelManager:
 
         output_shape = VideoPixelShape(batch=1, frames=num_frames, width=vid_width, height=vid_height, fps=fps_vid)
 
-        video_state, audio_state = denoise_audio_video(
-            output_shape=output_shape, conditionings=[], noiser=noiser,
-            sigmas=sigmas, stepper=stepper, denoising_loop_fn=retake_loop,
+        # Build temporal conditionings: mask=1 inside [start, end) for regen, mask=0 for preserve
+        video_conditionings = [
+            TemporalRegionMask(
+                start_time=start_time if regenerate_video else 0.0,
+                end_time=end_time if regenerate_video else 0.0,
+                fps=fps_vid,
+            )
+        ]
+        audio_conditionings = []
+        if audio_in is not None:
+            audio_conditionings = [
+                TemporalRegionMask(
+                    start_time=start_time if regenerate_audio else 0.0,
+                    end_time=end_time if regenerate_audio else 0.0,
+                    fps=fps_vid,
+                )
+            ]
+
+        # Noise video and audio states separately with per-modality temporal masks
+        video_state, video_tools = noise_video_state(
+            output_shape=output_shape, noiser=noiser,
+            conditionings=video_conditionings,
             components=worker.components, dtype=dtype, device=device,
-            initial_video_latent=initial_video_latent,
-            initial_audio_latent=initial_audio_latent,
+            initial_latent=initial_video_latent,
         )
+        audio_state, audio_tools = noise_audio_state(
+            output_shape=output_shape, noiser=noiser,
+            conditionings=audio_conditionings,
+            components=worker.components, dtype=dtype, device=device,
+            initial_latent=initial_audio_latent,
+        )
+
+        video_state, audio_state = retake_loop(sigmas, video_state, audio_state, stepper)
+
+        video_state = video_tools.clear_conditioning(video_state)
+        video_state = video_tools.unpatchify(video_state)
+        audio_state = audio_tools.clear_conditioning(audio_state)
+        audio_state = audio_tools.unpatchify(audio_state)
 
         decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
         decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
