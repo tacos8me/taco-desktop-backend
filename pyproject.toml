@@ -9,6 +9,8 @@ dependencies = [
     "pydantic>=2.0",
     "ltx-core",
     "ltx-pipelines",
+    "diffusers>=0.37.0.dev0",
+    "sentencepiece",
 ]
 
 [[tool.uv.index]]

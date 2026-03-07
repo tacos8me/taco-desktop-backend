@@ -10,14 +10,21 @@ SPATIAL_UPSAMPLER = str(CHECKPOINTS_DIR / "ltx-2.3-spatial-upscaler-x2-1.0.safet
 # Text encoder — point to the HF snapshot directory containing model*.safetensors
 GEMMA_ROOT = "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f"
 
-# GPU devices for inference (both RTX PRO 6000 Blackwell 96GB)
-GPU_DEVICES = ["cuda:0", "cuda:1"]
+# GPU devices
+LTX_DEVICE = "cuda:0"    # LTX-2 video generation (~59GB)
+FLUX_DEVICE = "cuda:1"   # Flux 2 image generation (~79GB FP8)
+
+# SplitModelManager: encoder hub + denoiser on single GPU
+# (PipelineManager can't be used — loads 4 pipelines with 4 transformers = OOM)
+GPU_DEVICES = [LTX_DEVICE]
+USE_SPLIT_GPU = True
+
+# Flux model
+FLUX_MODEL_REPO = "black-forest-labs/FLUX.2-dev"
+HF_CACHE_DIR = "/mnt/nvme-1/huggingface/hub"
 
 # Upload storage
 UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")
-
-# Split-GPU mode: use SplitModelManager instead of per-GPU pipeline copies
-USE_SPLIT_GPU = len(GPU_DEVICES) >= 2
 
 # Server
 HOST = "0.0.0.0"

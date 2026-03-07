@@ -143,20 +143,24 @@ class DenoiserWorker:
         else:
             raise ValueError(f"Unknown transformer state: {state}")
 
+        # Free old transformer BEFORE loading new one to avoid OOM
+        # (both ~22GB; GPU:0 has ~72GB baseline, can't hold two)
+        old = self.transformer
+        self.transformer = None
+        self.cache["transformer"] = None
+        del old
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+
         ledger = ModelLedger(
             dtype=torch.bfloat16, device=self.device,
             checkpoint_path=checkpoint, gemma_root_path=config.GEMMA_ROOT,
             spatial_upsampler_path=config.SPATIAL_UPSAMPLER, loras=loras,
         )
         new_transformer = ledger.transformer()
-
-        old = self.transformer
         self.transformer = new_transformer
         self.cache["transformer"] = new_transformer
         self.transformer_state = state
-        del old
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
         logger.info("Worker %s: transformer now %s", self.device, state)
 
 
@@ -348,13 +352,17 @@ class SplitModelManager:
 
         # Stage 2: upsample + refine
         upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        stage_1_audio_latent = audio_state.latent
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
+        cleanup_memory()
+
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         if not is_fast:
             worker.ensure_transformer("dev_lora")
-            transformer = worker.ledger.transformer()
 
+        transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -366,15 +374,22 @@ class SplitModelManager:
             sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
             components=worker.components, dtype=dtype, device=device,
             noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=audio_state.latent,
+            initial_audio_latent=stage_1_audio_latent,
         )
+
+        # Save stage 2 latents, free everything before potential transformer swap
+        video_latent = video_state.latent
+        audio_latent = audio_state.latent
+        del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
+        del transformer, stage2_loop, distilled_sigmas
+        cleanup_memory()
 
         if not is_fast:
             worker.ensure_transformer("dev")
 
         # Decode
-        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
-        decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
+        decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
     @torch.inference_mode()
@@ -434,13 +449,17 @@ class SplitModelManager:
 
         # Stage 2
         upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        stage_1_audio_latent = audio_state.latent
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
+        cleanup_memory()
+
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         if not is_fast:
             worker.ensure_transformer("dev_lora")
-            transformer = worker.ledger.transformer()
 
+        transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
         def stage2_loop(sigmas, video_state, audio_state, stepper):
             return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
@@ -451,14 +470,21 @@ class SplitModelManager:
             sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
             components=worker.components, dtype=dtype, device=device,
             noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=audio_state.latent,
+            initial_audio_latent=stage_1_audio_latent,
         )
+
+        # Save stage 2 latents, free everything before potential transformer swap
+        video_latent = video_state.latent
+        audio_latent = audio_state.latent
+        del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
+        del transformer, stage2_loop, distilled_sigmas
+        cleanup_memory()
 
         if not is_fast:
             worker.ensure_transformer("dev")
 
-        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
-        decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
+        decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
     @torch.inference_mode()
@@ -516,6 +542,9 @@ class SplitModelManager:
 
         # Stage 2: refine with distilled LoRA
         upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        del video_state, stage_1_cond, sigmas, transformer, stage1_loop
+        cleanup_memory()
+
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
@@ -535,10 +564,16 @@ class SplitModelManager:
             initial_audio_latent=encoded_audio_latent,
         )
 
+        # Save stage 2 latent, free everything before transformer swap
+        video_latent = video_state.latent
+        del video_state, stage_2_cond, upscaled
+        del transformer, stage2_loop, distilled_sigmas
+        cleanup_memory()
+
         worker.ensure_transformer("dev")
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
-        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), TilingConfig.default(), generator)
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
