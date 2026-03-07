@@ -2,6 +2,7 @@
 import config
 
 config.GPU_DEVICES = []
+config.API_KEYS = set()  # disable auth for validation tests
 
 from fastapi.testclient import TestClient  # noqa: E402
 

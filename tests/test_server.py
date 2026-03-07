@@ -2,8 +2,9 @@
 
 import config
 
-# Disable GPU loading before importing the server module
+# Disable GPU loading and auth before importing the server module
 config.GPU_DEVICES = []
+config.API_KEYS = set()
 
 from fastapi.testclient import TestClient  # noqa: E402
 

@@ -21,6 +21,10 @@ from flux_manager import FluxManager
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
+from job_queue import (
+    Job, JobStatus, JobType, JobStore, make_job_id, make_flux_callback,
+    worker_loop, cleanup_loop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +41,39 @@ chat = ChatManager()
 # when Flux and LTX run CUDA inference concurrently in the same process.
 _inference_lock = asyncio.Lock()
 
+# Job queue
+job_store = JobStore()
+_job_queue: asyncio.Queue[str] = asyncio.Queue()
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+
+
+async def _dispatch_job(job: Job) -> bytes:
+    """Route a job to the correct manager and return result bytes."""
+    p = job.params
+
+    def on_progress(progress: float) -> None:
+        job.progress = progress
+
+    match job.type:
+        case JobType.TEXT_TO_VIDEO:
+            return await manager.generate_text_to_video(**p, on_progress=on_progress)
+        case JobType.IMAGE_TO_VIDEO:
+            return await manager.generate_image_to_video(**p, on_progress=on_progress)
+        case JobType.AUDIO_TO_VIDEO:
+            return await manager.generate_audio_to_video(**p, on_progress=on_progress)
+        case JobType.RETAKE:
+            return await manager.retake(**p, on_progress=on_progress)
+        case JobType.TEXT_TO_IMAGE:
+            cb = make_flux_callback(job, p.get("num_inference_steps", 50))
+            return await flux.generate_text_to_image(**p, callback_on_step_end=cb)
+        case JobType.IMAGE_TO_IMAGE:
+            cb = make_flux_callback(job, p.get("num_inference_steps", 50))
+            return await flux.generate_image_to_image(**p, callback_on_step_end=cb)
+        case _:
+            raise ValueError(f"Unknown job type: {job.type}")
 
 
 @asynccontextmanager
@@ -54,7 +88,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     chat.load()
     logger.info("Chat proxy ready.")
+
+    worker_task = asyncio.create_task(
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads),
+        name="queue-worker",
+    )
+    cleanup_task = asyncio.create_task(
+        cleanup_loop(job_store, uploads),
+        name="queue-cleanup",
+    )
+    logger.info("Job queue started.")
+
     yield
+
+    worker_task.cancel()
+    cleanup_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -199,6 +247,7 @@ async def health() -> dict:
         "ltx": "ready" if manager.is_ready else "not_loaded",
         "flux": "ready" if flux.is_ready else "not_loaded",
         "chat": "ready" if chat.is_ready else "not_loaded",
+        "queue": job_store.stats(),
     }
 
 
@@ -418,6 +467,156 @@ async def upload_put(upload_id: str, request: Request) -> Response:
         return _error(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     uploads.save(upload_id, data)
     return Response(status_code=201)
+
+
+# ---------------------------------------------------------------------------
+# V2 Async Job Endpoints
+# ---------------------------------------------------------------------------
+
+
+def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONResponse:
+    """Create a job, enqueue it, return 202."""
+    if job_store.pending_count() >= config.MAX_QUEUE_DEPTH:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "queue_full", "message": "Job queue is full. Try again later."},
+            headers={"Retry-After": "30"},
+        )
+
+    auth = request.headers.get("Authorization", "")
+    api_key = auth[7:] if auth.startswith("Bearer ") else ""
+
+    job = Job(id=make_job_id(), type=job_type, params=params, api_key=api_key)
+    job_store.add(job)
+    _job_queue.put_nowait(job.id)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job.id,
+            "status": "queued",
+            "poll_url": f"/v2/jobs/{job.id}",
+            "stream_url": f"/v2/jobs/{job.id}/stream",
+        },
+    )
+
+
+@app.post("/v2/text-to-video")
+async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONResponse:
+    width, height = _resolution_to_dims(body.resolution)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    prompt = _build_prompt(body.prompt, body.camera_motion)
+    seed = random.randint(0, 2**32 - 1)
+    params = dict(prompt=prompt, model=body.model, width=width, height=height,
+                  num_frames=num_frames, fps=body.fps, seed=seed, generate_audio=body.generate_audio)
+    return _submit_job(JobType.TEXT_TO_VIDEO, params, request)
+
+
+@app.post("/v2/image-to-video")
+async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSONResponse:
+    image_path = str(uploads.resolve(body.image_uri))
+    width, height = _resolution_to_dims(body.resolution)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    seed = random.randint(0, 2**32 - 1)
+    params = dict(prompt=body.prompt, image_path=image_path, model=body.model,
+                  width=width, height=height, num_frames=num_frames, fps=body.fps,
+                  seed=seed, generate_audio=body.generate_audio)
+    return _submit_job(JobType.IMAGE_TO_VIDEO, params, request)
+
+
+@app.post("/v2/audio-to-video")
+async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSONResponse:
+    audio_path = str(uploads.resolve(body.audio_uri))
+    image_path: str | None = None
+    if body.image_uri:
+        image_path = str(uploads.resolve(body.image_uri))
+    width, height = _resolution_to_dims(body.resolution)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    seed = random.randint(0, 2**32 - 1)
+    params = dict(prompt=body.prompt, audio_path=audio_path, image_path=image_path,
+                  model=body.model, width=width, height=height, num_frames=num_frames,
+                  fps=body.fps, seed=seed)
+    return _submit_job(JobType.AUDIO_TO_VIDEO, params, request)
+
+
+@app.post("/v2/retake")
+async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
+    video_path = str(uploads.resolve(body.video_uri))
+    prompt = body.prompt or ""
+    seed = random.randint(0, 2**32 - 1)
+    params = dict(video_path=video_path, start_time=body.start_time,
+                  duration=body.duration, mode=body.mode, prompt=prompt, seed=seed)
+    return _submit_job(JobType.RETAKE, params, request)
+
+
+@app.post("/v2/text-to-image")
+async def v2_text_to_image(body: TextToImageRequest, request: Request) -> JSONResponse:
+    width = (body.width // 16) * 16
+    height = (body.height // 16) * 16
+    seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
+    params = dict(prompt=body.prompt, width=width, height=height,
+                  num_inference_steps=body.num_inference_steps,
+                  guidance_scale=body.guidance_scale, seed=seed)
+    return _submit_job(JobType.TEXT_TO_IMAGE, params, request)
+
+
+@app.post("/v2/image-to-image")
+async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSONResponse:
+    image_path = str(uploads.resolve(body.image_uri))
+    width = (body.width // 16) * 16
+    height = (body.height // 16) * 16
+    seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
+    params = dict(prompt=body.prompt, image_path=image_path, width=width, height=height,
+                  num_inference_steps=body.num_inference_steps,
+                  guidance_scale=body.guidance_scale, seed=seed)
+    return _submit_job(JobType.IMAGE_TO_IMAGE, params, request)
+
+
+@app.get("/v2/jobs/{job_id}")
+async def v2_job_status(job_id: str) -> JSONResponse:
+    job = job_store.get(job_id)
+    if job is None:
+        return _error(404, "Job not found")
+    return JSONResponse(content={
+        "job_id": job.id,
+        "status": job.status,
+        "type": job.type,
+        "progress": job.progress if job.status == JobStatus.PROCESSING else (1.0 if job.status == JobStatus.COMPLETED else None),
+        "queue_position": job_store.queue_position(job.id) if job.status == JobStatus.QUEUED else None,
+        "error": {"code": job.error_code or "generation_failed", "message": job.error} if job.error else None,
+        "result_url": f"/v2/jobs/{job.id}/result" if job.status == JobStatus.COMPLETED else None,
+        "result_media_type": job.result_media_type,
+    })
+
+
+@app.get("/v2/jobs/{job_id}/result")
+async def v2_job_result(job_id: str) -> Response:
+    job = job_store.get(job_id)
+    if job is None:
+        return _error(404, "Job not found")
+    if job.status != JobStatus.COMPLETED or not job.result_uri:
+        return _error(409, "Job result not ready")
+    try:
+        path = uploads.resolve(job.result_uri)
+        data = path.read_bytes()
+        return Response(
+            content=data,
+            media_type=job.result_media_type or "application/octet-stream",
+            headers={"Cache-Control": "no-store"},
+        )
+    except FileNotFoundError:
+        return _error(404, "Result file expired or not found")
+
+
+@app.delete("/v2/jobs/{job_id}")
+async def v2_cancel_job(job_id: str) -> JSONResponse:
+    job = job_store.get(job_id)
+    if job is None:
+        return _error(404, "Job not found")
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+        return _error(409, "Cannot cancel a finished job")
+    job.status = JobStatus.CANCELLED
+    return JSONResponse(content={"job_id": job.id, "status": "cancelled"})
 
 
 # ---------------------------------------------------------------------------

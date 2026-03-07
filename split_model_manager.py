@@ -293,10 +293,24 @@ class SplitModelManager:
 
     # --- Generation flows ---
 
+    @staticmethod
+    def _wrap_denoise(denoise_fn, on_progress, total_steps, offset=0.0, scale=1.0):
+        """Wrap a denoise_fn to report progress on each step."""
+        step_count = [0]  # mutable counter for closure
+
+        def wrapped(*args, **kwargs):
+            result = denoise_fn(*args, **kwargs)
+            step_count[0] += 1
+            p = offset + min(step_count[0] / max(total_steps, 1), 1.0) * scale
+            on_progress(min(p, 0.99))
+            return result
+        return wrapped
+
     @torch.inference_mode()
     def _run_t2v(
         self, worker: DenoiserWorker, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
+        on_progress=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -329,20 +343,26 @@ class SplitModelManager:
 
         if is_fast:
             sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                    denoise_fn=simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer))
+                dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
         else:
             params = detect_params(config.DEV_CHECKPOINT)
             sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                    denoise_fn=multi_modal_guider_factory_denoising_func(
-                        video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                        audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
-                        v_context=v_context_p, a_context=a_context_p, transformer=transformer))
+                dfn = multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                    audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
+                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
@@ -364,10 +384,13 @@ class SplitModelManager:
 
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                denoise_fn=simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer))
+            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, s2_steps, offset=0.7, scale=0.25)
+            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
@@ -396,6 +419,7 @@ class SplitModelManager:
     def _run_i2v(
         self, worker: DenoiserWorker, prompt: str, image_path: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
+        on_progress=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -428,18 +452,26 @@ class SplitModelManager:
 
         if is_fast:
             sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            s1_steps = len(sigmas) - 1
+
             def denoising_loop(sigmas, video_state, audio_state, stepper):
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                    denoise_fn=simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer))
+                dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
         else:
             params = detect_params(config.DEV_CHECKPOINT)
             sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            s1_steps = len(sigmas) - 1
+
             def denoising_loop(sigmas, video_state, audio_state, stepper):
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                    denoise_fn=multi_modal_guider_factory_denoising_func(
-                        video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                        audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
-                        v_context=v_context_p, a_context=a_context_p, transformer=transformer))
+                dfn = multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                    audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
+                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
@@ -461,9 +493,13 @@ class SplitModelManager:
 
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        s2_steps = len(distilled_sigmas) - 1
+
         def stage2_loop(sigmas, video_state, audio_state, stepper):
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                denoise_fn=simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer))
+            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, s2_steps, offset=0.7, scale=0.25)
+            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
@@ -491,6 +527,7 @@ class SplitModelManager:
     def _run_a2v(
         self, worker: DenoiserWorker, prompt: str, audio_path: str, image_path: str | None,
         width: int, height: int, num_frames: int, fps: float, seed: int,
+        on_progress=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -525,13 +562,16 @@ class SplitModelManager:
         transformer = worker.ledger.transformer()
 
         sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+        s1_steps = len(sigmas) - 1
 
         def stage1_loop(sigmas, video_state, audio_state, stepper):
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                denoise_fn=multi_modal_guider_factory_denoising_func(
-                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                    audio_guider_factory=create_multimodal_guider_factory(params=MultiModalGuiderParams(), negative_context=None),
-                    v_context=v_context_p, a_context=a_context_p, transformer=transformer))
+            dfn = multi_modal_guider_factory_denoising_func(
+                video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                audio_guider_factory=create_multimodal_guider_factory(params=MultiModalGuiderParams(), negative_context=None),
+                v_context=v_context_p, a_context=a_context_p, transformer=transformer)
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state = denoise_video_only(
             output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
@@ -551,10 +591,13 @@ class SplitModelManager:
         worker.ensure_transformer("dev_lora")
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                denoise_fn=simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer))
+            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, s2_steps, offset=0.7, scale=0.25)
+            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state = denoise_video_only(
             output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
@@ -581,6 +624,7 @@ class SplitModelManager:
     def _run_retake(
         self, worker: DenoiserWorker, video_path: str, start_time: float, duration: float,
         mode: str, prompt: str, seed: int,
+        on_progress=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -614,16 +658,19 @@ class SplitModelManager:
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+        total_steps = len(sigmas) - 1
 
         transformer = worker.ledger.transformer()
 
-        # Build denoising function with guiders
+        # Build denoising function with guiders (retake is single-stage, maps 0-0.95)
         def retake_loop(sigmas, video_state, audio_state, stepper):
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper,
-                denoise_fn=multi_modal_guider_denoising_func(
-                    video_guider=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n).build(sigmas[0]),
-                    audio_guider=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n).build(sigmas[0]),
-                    v_context=v_context_p, a_context=a_context_p, transformer=transformer))
+            dfn = multi_modal_guider_denoising_func(
+                video_guider=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n).build(sigmas[0]),
+                audio_guider=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n).build(sigmas[0]),
+                v_context=v_context_p, a_context=a_context_p, transformer=transformer)
+            if on_progress:
+                dfn = self._wrap_denoise(dfn, on_progress, total_steps, offset=0.0, scale=0.95)
+            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         output_shape = VideoPixelShape(batch=1, frames=num_frames, width=vid_width, height=vid_height, fps=fps_vid)
 
@@ -644,13 +691,14 @@ class SplitModelManager:
     async def generate_text_to_video(
         self, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
+        on_progress=None,
     ) -> bytes:
         worker = await self._acquire_worker()
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_t2v, worker, prompt, model, width, height,
-                num_frames, fps, seed, generate_audio,
+                num_frames, fps, seed, generate_audio, on_progress,
             )
         finally:
             worker.lock.release()
@@ -658,13 +706,14 @@ class SplitModelManager:
     async def generate_image_to_video(
         self, prompt: str, image_path: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
+        on_progress=None,
     ) -> bytes:
         worker = await self._acquire_worker()
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_i2v, worker, prompt, image_path, model, width, height,
-                num_frames, fps, seed, generate_audio,
+                num_frames, fps, seed, generate_audio, on_progress,
             )
         finally:
             worker.lock.release()
@@ -672,13 +721,14 @@ class SplitModelManager:
     async def generate_audio_to_video(
         self, prompt: str, audio_path: str, image_path: str | None,
         model: str, width: int, height: int, num_frames: int, fps: float, seed: int,
+        on_progress=None,
     ) -> bytes:
         worker = await self._acquire_worker()
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_a2v, worker, prompt, audio_path, image_path,
-                width, height, num_frames, fps, seed,
+                width, height, num_frames, fps, seed, on_progress,
             )
         finally:
             worker.lock.release()
@@ -686,13 +736,14 @@ class SplitModelManager:
     async def retake(
         self, video_path: str, start_time: float, duration: float,
         mode: str, prompt: str, seed: int,
+        on_progress=None,
     ) -> bytes:
         worker = await self._acquire_worker()
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_retake, worker, video_path, start_time, duration,
-                mode, prompt, seed,
+                mode, prompt, seed, on_progress,
             )
         finally:
             worker.lock.release()

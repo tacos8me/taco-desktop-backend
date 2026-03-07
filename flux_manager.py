@@ -88,19 +88,24 @@ class FluxManager:
         num_inference_steps: int,
         guidance_scale: float,
         seed: int,
+        callback_on_step_end: object = None,
     ) -> bytes:
         """Generate an image (txt2img) and return PNG bytes."""
         generator = torch.Generator(device=self._device).manual_seed(seed)
 
+        kwargs: dict = dict(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+        )
+        if callback_on_step_end is not None:
+            kwargs["callback_on_step_end"] = callback_on_step_end
+
         try:
-            result = self._pipe(
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-            )
+            result = self._pipe(**kwargs)
         except (torch.cuda.OutOfMemoryError, RuntimeError):
             logger.exception("Flux generate OOM, unloading pipeline")
             self.unload()
@@ -121,21 +126,26 @@ class FluxManager:
         num_inference_steps: int,
         guidance_scale: float,
         seed: int,
+        callback_on_step_end: object = None,
     ) -> bytes:
         """Edit an image using Flux 2 Kontext reference latents."""
         generator = torch.Generator(device=self._device).manual_seed(seed)
         ref_image = Image.open(image_path).convert("RGB")
 
+        kwargs: dict = dict(
+            image=ref_image,
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+        )
+        if callback_on_step_end is not None:
+            kwargs["callback_on_step_end"] = callback_on_step_end
+
         try:
-            result = self._pipe(
-                image=ref_image,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-            )
+            result = self._pipe(**kwargs)
         except (torch.cuda.OutOfMemoryError, RuntimeError):
             logger.exception("Flux img2img OOM, unloading pipeline")
             self.unload()
@@ -156,12 +166,14 @@ class FluxManager:
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0,
         seed: int = 0,
+        callback_on_step_end: object = None,
     ) -> bytes:
         async with self._lock:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._generate, prompt, width, height,
                 num_inference_steps, guidance_scale, seed,
+                callback_on_step_end,
             )
 
     async def generate_image_to_image(
@@ -173,10 +185,12 @@ class FluxManager:
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0,
         seed: int = 0,
+        callback_on_step_end: object = None,
     ) -> bytes:
         async with self._lock:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._img2img, prompt, image_path, width, height,
                 num_inference_steps, guidance_scale, seed,
+                callback_on_step_end,
             )

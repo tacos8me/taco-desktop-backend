@@ -13,6 +13,7 @@ dependencies = [
     "sentencepiece",
     "httpx>=0.28.1",
     "torch>=2.9,<2.10",
+    "torchaudio>=2.9,<2.10",
 ]
 
 [[tool.uv.index]]
