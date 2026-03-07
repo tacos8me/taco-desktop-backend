@@ -417,14 +417,17 @@ class SplitModelManager:
 
     @torch.inference_mode()
     def _run_i2v(
-        self, worker: DenoiserWorker, prompt: str, image_path: str, model: str, width: int, height: int,
+        self, worker: DenoiserWorker, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
         on_progress=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
         is_fast = model == "ltx-2-3-fast"
-        images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
+        images = [
+            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"])
+            for kf in keyframes
+        ]
 
         worker.ensure_transformer("distilled" if is_fast else "dev")
 
@@ -706,7 +709,7 @@ class SplitModelManager:
             worker.lock.release()
 
     async def generate_image_to_video(
-        self, prompt: str, image_path: str, model: str, width: int, height: int,
+        self, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
         on_progress=None,
     ) -> bytes:
@@ -714,7 +717,7 @@ class SplitModelManager:
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._run_i2v, worker, prompt, image_path, model, width, height,
+                None, self._run_i2v, worker, prompt, keyframes, model, width, height,
                 num_frames, fps, seed, generate_audio, on_progress,
             )
         finally:

@@ -154,9 +154,16 @@ class TextToVideoRequest(BaseModel):
     camera_motion: str | None = Field(default=None, max_length=200)
 
 
+class KeyframeInput(BaseModel):
+    image_uri: str
+    frame_index: int = Field(default=0, ge=0)
+    strength: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
 class ImageToVideoRequest(BaseModel):
     prompt: str = Field(max_length=10000)
-    image_uri: str
+    image_uri: str | None = None
+    keyframes: list[KeyframeInput] | None = None
     model: ModelName
     resolution: Resolution
     duration: float = Field(gt=0, le=30)
@@ -227,6 +234,32 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
     return prompt
 
 
+def _resolve_keyframes(body: ImageToVideoRequest) -> list[dict] | JSONResponse:
+    """Resolve keyframes from an ImageToVideoRequest. Returns list of dicts or JSONResponse on error."""
+    if body.keyframes and body.image_uri:
+        return _error(422, "Cannot specify both image_uri and keyframes")
+    if body.keyframes:
+        if len(body.keyframes) == 0:
+            return _error(422, "keyframes list must not be empty")
+        if len(body.keyframes) > 8:
+            return _error(422, "At most 8 keyframes are allowed")
+        frame_indices = [kf.frame_index for kf in body.keyframes]
+        if len(frame_indices) != len(set(frame_indices)):
+            return _error(422, "Duplicate frame_index values are not allowed")
+        if frame_indices.count(0) > 1:
+            return _error(422, "At most one keyframe can have frame_index 0")
+        keyframe_inputs = []
+        for kf in body.keyframes:
+            path = str(uploads.resolve(kf.image_uri))
+            keyframe_inputs.append({"image_path": path, "frame_index": kf.frame_index, "strength": kf.strength})
+        return keyframe_inputs
+    elif body.image_uri:
+        path = str(uploads.resolve(body.image_uri))
+        return [{"image_path": path, "frame_index": 0, "strength": 1.0}]
+    else:
+        return _error(422, "Either image_uri or keyframes is required")
+
+
 def _error(status: int, msg: str) -> JSONResponse:
     # Avoid leaking internal filesystem paths in error responses
     text = msg[:500]
@@ -280,10 +313,12 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
 
 @app.post("/v1/image-to-video")
 async def image_to_video(body: ImageToVideoRequest) -> Response:
+    keyframe_inputs = _resolve_keyframes(body)
+    if isinstance(keyframe_inputs, JSONResponse):
+        return keyframe_inputs
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     try:
-        image_path = str(uploads.resolve(body.image_uri))
         width, height = _resolution_to_dims(body.resolution)
         num_frames = _duration_to_frames(body.duration, body.fps)
         seed = random.randint(0, 2**32 - 1)
@@ -291,7 +326,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         async with _inference_lock:
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
-                image_path=image_path,
+                keyframes=keyframe_inputs,
                 model=body.model,
                 width=width,
                 height=height,
@@ -514,11 +549,13 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
 
 @app.post("/v2/image-to-video")
 async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSONResponse:
-    image_path = str(uploads.resolve(body.image_uri))
+    keyframe_inputs = _resolve_keyframes(body)
+    if isinstance(keyframe_inputs, JSONResponse):
+        return keyframe_inputs
     width, height = _resolution_to_dims(body.resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
     seed = random.randint(0, 2**32 - 1)
-    params = dict(prompt=body.prompt, image_path=image_path, model=body.model,
+    params = dict(prompt=body.prompt, keyframes=keyframe_inputs, model=body.model,
                   width=width, height=height, num_frames=num_frames, fps=body.fps,
                   seed=seed, generate_audio=body.generate_audio)
     return _submit_job(JobType.IMAGE_TO_VIDEO, params, request)
