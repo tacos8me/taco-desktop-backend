@@ -130,6 +130,16 @@ class DenoiserWorker:
     transformer: object = None
     cache: dict[str, object] = field(default_factory=dict)
 
+    def evict_transformer(self) -> None:
+        """Remove transformer from GPU to free VRAM for heavy operations like VAE encode."""
+        if self.transformer is not None:
+            logger.info("Worker %s: evicting transformer (%s) to free VRAM", self.device, self.transformer_state)
+            self.transformer = None
+            self.cache["transformer"] = None
+            self.transformer_state = ""
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
     def ensure_transformer(self, state: str) -> None:
         """Swap transformer checkpoint on this worker's GPU."""
         if self.transformer_state == state:
@@ -752,8 +762,6 @@ class SplitModelManager:
         regenerate_video = mode in ("replace_audio_and_video", "replace_video", "replace_video_only")
         regenerate_audio = mode in ("replace_audio_and_video", "replace_audio")
 
-        worker.ensure_transformer("dev")
-
         # Get video metadata
         fps_vid, num_frames, vid_width, vid_height = get_videostream_metadata(video_path)
 
@@ -764,7 +772,8 @@ class SplitModelManager:
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
-        # Free text encoder memory before heavy VAE encode
+        # Evict transformer (~44GB) to make room for VAE encode (~46GB intermediates)
+        worker.evict_transformer()
         cleanup_memory()
 
         # Encode input video on GPU:0, transfer to worker device
@@ -780,6 +789,9 @@ class SplitModelManager:
         if audio_in is not None:
             audio_encoder = self._encoder_ledger.audio_encoder()
             initial_audio_latent = vae_encode_audio(audio_in, audio_encoder).to(device)
+
+        # Reload transformer now that VAE encode is done
+        worker.ensure_transformer("dev")
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
