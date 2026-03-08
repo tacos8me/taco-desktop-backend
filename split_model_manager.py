@@ -764,10 +764,15 @@ class SplitModelManager:
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
+        # Free text encoder memory before heavy VAE encode
+        cleanup_memory()
+
         # Encode input video on GPU:0, transfer to worker device
         video_encoder_enc = self._encoder_ledger.video_encoder()
         video_conditioning = load_video_conditioning(video_path, height=vid_height, width=vid_width, frame_cap=num_frames, dtype=dtype, device=self._encoder_device)
         initial_video_latent = video_encoder_enc(video_conditioning.to(self._encoder_device, dtype=dtype)).to(device)
+        del video_conditioning
+        cleanup_memory()
 
         # Encode audio from video (may be None if no audio track)
         audio_in = decode_audio_from_file(video_path, self._encoder_device, max_duration=num_frames / fps_vid)
