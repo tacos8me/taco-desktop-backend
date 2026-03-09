@@ -127,6 +127,7 @@ class DenoiserWorker:
     components: PipelineComponents
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     transformer_state: str = ""
+    _user_lora: tuple[str, float] | None = None
     transformer: object = None
     cache: dict[str, object] = field(default_factory=dict)
 
@@ -137,15 +138,22 @@ class DenoiserWorker:
             self.transformer = None
             self.cache["transformer"] = None
             self.transformer_state = ""
+            self._user_lora = None
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
 
-    def ensure_transformer(self, state: str) -> None:
-        """Swap transformer checkpoint on this worker's GPU."""
-        if self.transformer_state == state:
+    def ensure_transformer(self, state: str, user_lora: tuple[str, float] | None = None) -> None:
+        """Swap transformer checkpoint on this worker's GPU.
+
+        Args:
+            state: Base transformer state (dev, distilled, dev_lora, etc.)
+            user_lora: Optional (path, strength) for a user-supplied LoRA to fuse
+                       alongside any preset LoRAs for this state.
+        """
+        if self.transformer_state == state and self._user_lora == user_lora:
             return
 
-        logger.info("Worker %s: swapping transformer %s -> %s", self.device, self.transformer_state, state)
+        logger.info("Worker %s: swapping transformer %s -> %s (user_lora=%s)", self.device, self.transformer_state, state, user_lora)
         if state == "dev":
             checkpoint, loras = config.DEV_CHECKPOINT, ()
         elif state == "distilled":
@@ -171,6 +179,14 @@ class DenoiserWorker:
         else:
             raise ValueError(f"Unknown transformer state: {state}")
 
+        # Append user-supplied LoRA if provided
+        if user_lora:
+            path, strength = user_lora
+            loras = loras + (LoraPathStrengthAndSDOps(
+                path=path, strength=strength,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            ),)
+
         # Free old transformer BEFORE loading new one to avoid OOM
         # (both ~22GB; GPU:0 has ~72GB baseline, can't hold two)
         old = self.transformer
@@ -189,6 +205,7 @@ class DenoiserWorker:
         self.transformer = new_transformer
         self.cache["transformer"] = new_transformer
         self.transformer_state = state
+        self._user_lora = user_lora
         logger.info("Worker %s: transformer now %s", self.device, state)
 
 
@@ -338,13 +355,13 @@ class SplitModelManager:
     def _run_t2v(
         self, worker: DenoiserWorker, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
-        on_progress=None,
+        on_progress=None, user_lora=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
         is_fast = model == "ltx-2-3-fast"
 
-        worker.ensure_transformer("distilled" if is_fast else "dev")
+        worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
         if is_fast:
@@ -408,7 +425,7 @@ class SplitModelManager:
         stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         if not is_fast:
-            worker.ensure_transformer("dev_lora")
+            worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
@@ -447,13 +464,13 @@ class SplitModelManager:
     def _run_t2v_hq(
         self, worker: DenoiserWorker, prompt: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
-        on_progress=None,
+        on_progress=None, user_lora=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
         hq_params = LTX_2_3_HQ_PARAMS
 
-        worker.ensure_transformer("dev_lora_025")
+        worker.ensure_transformer("dev_lora_025", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
         ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
@@ -505,7 +522,7 @@ class SplitModelManager:
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
-        worker.ensure_transformer("dev_lora_050")
+        worker.ensure_transformer("dev_lora_050", user_lora=user_lora)
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
         # res2s stage 2: 2 NFE per step + 1 final (3 distilled steps = 2 actual steps)
@@ -546,7 +563,7 @@ class SplitModelManager:
     def _run_i2v(
         self, worker: DenoiserWorker, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
-        on_progress=None,
+        on_progress=None, user_lora=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -556,7 +573,7 @@ class SplitModelManager:
             for kf in keyframes
         ]
 
-        worker.ensure_transformer("distilled" if is_fast else "dev")
+        worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
         if is_fast:
@@ -619,7 +636,7 @@ class SplitModelManager:
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         if not is_fast:
-            worker.ensure_transformer("dev_lora")
+            worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
@@ -657,12 +674,12 @@ class SplitModelManager:
     def _run_a2v(
         self, worker: DenoiserWorker, prompt: str, audio_path: str, image_path: str | None,
         width: int, height: int, num_frames: int, fps: float, seed: int,
-        on_progress=None,
+        on_progress=None, user_lora=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
 
-        worker.ensure_transformer("dev")
+        worker.ensure_transformer("dev", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
         ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
@@ -718,7 +735,7 @@ class SplitModelManager:
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
-        worker.ensure_transformer("dev_lora")
+        worker.ensure_transformer("dev_lora", user_lora=user_lora)
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
         s2_steps = len(distilled_sigmas) - 1
@@ -754,7 +771,7 @@ class SplitModelManager:
     def _run_retake(
         self, worker: DenoiserWorker, video_path: str, start_time: float, duration: float,
         mode: str, prompt: str, seed: int,
-        on_progress=None,
+        on_progress=None, user_lora=None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -791,7 +808,7 @@ class SplitModelManager:
             initial_audio_latent = vae_encode_audio(audio_in, audio_encoder).to(device)
 
         # Reload transformer now that VAE encode is done
-        worker.ensure_transformer("dev")
+        worker.ensure_transformer("dev", user_lora=user_lora)
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -861,19 +878,20 @@ class SplitModelManager:
     async def generate_text_to_video(
         self, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
-        on_progress=None,
+        on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
     ) -> bytes:
         worker = await self._acquire_worker()
+        user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             if model == "ltx-2-3-hq":
                 return await loop.run_in_executor(
                     None, self._run_t2v_hq, worker, prompt, width, height,
-                    num_frames, fps, seed, generate_audio, on_progress,
+                    num_frames, fps, seed, generate_audio, on_progress, user_lora,
                 )
             return await loop.run_in_executor(
                 None, self._run_t2v, worker, prompt, model, width, height,
-                num_frames, fps, seed, generate_audio, on_progress,
+                num_frames, fps, seed, generate_audio, on_progress, user_lora,
             )
         finally:
             worker.lock.release()
@@ -881,14 +899,15 @@ class SplitModelManager:
     async def generate_image_to_video(
         self, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
-        on_progress=None,
+        on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
     ) -> bytes:
         worker = await self._acquire_worker()
+        user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_i2v, worker, prompt, keyframes, model, width, height,
-                num_frames, fps, seed, generate_audio, on_progress,
+                num_frames, fps, seed, generate_audio, on_progress, user_lora,
             )
         finally:
             worker.lock.release()
@@ -896,14 +915,15 @@ class SplitModelManager:
     async def generate_audio_to_video(
         self, prompt: str, audio_path: str, image_path: str | None,
         model: str, width: int, height: int, num_frames: int, fps: float, seed: int,
-        on_progress=None,
+        on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
     ) -> bytes:
         worker = await self._acquire_worker()
+        user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_a2v, worker, prompt, audio_path, image_path,
-                width, height, num_frames, fps, seed, on_progress,
+                width, height, num_frames, fps, seed, on_progress, user_lora,
             )
         finally:
             worker.lock.release()
@@ -911,14 +931,15 @@ class SplitModelManager:
     async def retake(
         self, video_path: str, start_time: float, duration: float,
         mode: str, prompt: str, seed: int,
-        on_progress=None,
+        on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
     ) -> bytes:
         worker = await self._acquire_worker()
+        user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._run_retake, worker, video_path, start_time, duration,
-                mode, prompt, seed, on_progress,
+                mode, prompt, seed, on_progress, user_lora,
             )
         finally:
             worker.lock.release()

@@ -45,6 +45,10 @@ HF_CACHE_DIR = "/mnt/nvme-1/huggingface/hub"
 # Upload storage
 UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")
 
+# LoRA storage
+LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/loras")
+MAX_LORA_SIZE_BYTES = 500 * 1024 * 1024  # 500MB
+
 # Job queue
 MAX_QUEUE_DEPTH = 10
 JOB_RESULT_TTL_SECONDS = 600  # 10 minutes

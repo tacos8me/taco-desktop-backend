@@ -21,6 +21,7 @@ from flux_manager import FluxManager
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
+from lora_registry import LoRARegistry
 from job_queue import (
     Job, JobStatus, JobType, JobStore, make_job_id, make_flux_callback,
     worker_loop, cleanup_loop,
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 manager = SplitModelManager()
 flux = FluxManager()
 uploads = UploadStore(config.UPLOAD_DIR)
+lora_registry = LoRARegistry(config.LORAS_DIR)
 chat = ChatManager()
 
 # Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
@@ -110,7 +112,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https?://(localhost|192\.168\.\d+\.\d+)(:\d+)?$",
-    allow_methods=["GET", "POST", "PUT"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -139,6 +141,11 @@ async def check_api_key(request: Request, call_next):
 
 
 ModelName = Literal["ltx-2-3-fast", "ltx-2-3-pro", "ltx-2-3-hq"]
+
+
+class LoRAInput(BaseModel):
+    id: str = Field(description="LoRA ID from /v1/loras")
+    strength: float = Field(default=1.0, ge=0.0, le=2.0)
 Resolution = Literal["1920x1080", "1080x1920", "2560x1440", "1440x2560", "3840x2160", "2160x3840"]
 RetakeMode = Literal["replace_audio_and_video", "replace_video", "replace_video_only", "replace_audio"]
 ImageModelName = Literal["flux2-dev"]
@@ -152,6 +159,7 @@ class TextToVideoRequest(BaseModel):
     fps: float = Field(gt=0, le=60)
     generate_audio: bool = False
     camera_motion: str | None = Field(default=None, max_length=200)
+    lora: LoRAInput | None = None
 
 
 class KeyframeInput(BaseModel):
@@ -169,6 +177,7 @@ class ImageToVideoRequest(BaseModel):
     duration: float = Field(gt=0, le=30)
     fps: float = Field(gt=0, le=60)
     generate_audio: bool = False
+    lora: LoRAInput | None = None
 
 
 class AudioToVideoRequest(BaseModel):
@@ -179,6 +188,7 @@ class AudioToVideoRequest(BaseModel):
     resolution: Resolution
     duration: float = Field(default=6.0, gt=0, le=30)
     fps: float = Field(default=24.0, gt=0, le=60)
+    lora: LoRAInput | None = None
 
 
 class RetakeRequest(BaseModel):
@@ -187,6 +197,7 @@ class RetakeRequest(BaseModel):
     duration: float = Field(gt=0, le=30)
     mode: RetakeMode
     prompt: str | None = Field(default=None, max_length=10000)
+    lora: LoRAInput | None = None
 
 
 class TextToImageRequest(BaseModel):
@@ -260,6 +271,16 @@ def _resolve_keyframes(body: ImageToVideoRequest) -> list[dict] | JSONResponse:
         return _error(422, "Either image_uri or keyframes is required")
 
 
+def _resolve_lora(body) -> tuple[str | None, float] | JSONResponse:
+    """Resolve optional LoRA from request. Returns (path, strength) or JSONResponse on error."""
+    if not getattr(body, "lora", None):
+        return None, 1.0
+    info = lora_registry.get(body.lora.id)
+    if info is None:
+        return _error(404, f"LoRA not found: {body.lora.id}")
+    return str(lora_registry.resolve_path(body.lora.id)), body.lora.strength
+
+
 def _error(status: int, msg: str) -> JSONResponse:
     # Avoid leaking internal filesystem paths in error responses
     text = msg[:500]
@@ -288,6 +309,10 @@ async def health() -> dict:
 async def text_to_video(body: TextToVideoRequest) -> Response:
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     try:
         width, height = _resolution_to_dims(body.resolution)
         num_frames = _duration_to_frames(body.duration, body.fps)
@@ -304,6 +329,8 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
                 fps=body.fps,
                 seed=seed,
                 generate_audio=body.generate_audio,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except Exception as exc:
@@ -318,6 +345,10 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         return keyframe_inputs
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     try:
         width, height = _resolution_to_dims(body.resolution)
         num_frames = _duration_to_frames(body.duration, body.fps)
@@ -334,6 +365,8 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
                 fps=body.fps,
                 seed=seed,
                 generate_audio=body.generate_audio,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except FileNotFoundError as exc:
@@ -347,6 +380,10 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
 async def audio_to_video(body: AudioToVideoRequest) -> Response:
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     try:
         audio_path = str(uploads.resolve(body.audio_uri))
         image_path: str | None = None
@@ -368,6 +405,8 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
                 num_frames=num_frames,
                 fps=body.fps,
                 seed=seed,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except FileNotFoundError as exc:
@@ -381,6 +420,10 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
 async def retake(body: RetakeRequest) -> Response:
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     try:
         video_path = str(uploads.resolve(body.video_uri))
         prompt = body.prompt or ""
@@ -394,6 +437,8 @@ async def retake(body: RetakeRequest) -> Response:
                 mode=body.mode,
                 prompt=prompt,
                 seed=seed,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except FileNotFoundError as exc:
@@ -505,6 +550,72 @@ async def upload_put(upload_id: str, request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# LoRA Management Endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/loras")
+async def list_loras() -> JSONResponse:
+    loras = lora_registry.list_all()
+    return JSONResponse(content={
+        "loras": [
+            {"id": l.id, "name": l.name, "filename": l.filename, "base_model": l.base_model,
+             "size_bytes": l.size_bytes, "uploaded_at": l.uploaded_at, "description": l.description}
+            for l in loras
+        ],
+        "count": len(loras),
+    })
+
+
+@app.post("/v1/loras", status_code=201)
+async def upload_lora(request: Request) -> Response:
+    from fastapi import UploadFile
+    import io
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        return _error(400, "Expected multipart/form-data")
+
+    form = await request.form()
+    file = form.get("file")
+    name = form.get("name")
+    description = str(form.get("description", ""))
+    base_model = str(form.get("base_model", "ltx-2.3"))
+
+    if not file or not hasattr(file, "read"):
+        return _error(400, "Missing 'file' field")
+    if not name:
+        return _error(422, "Missing 'name' field")
+
+    filename = getattr(file, "filename", "unknown.safetensors") or "unknown.safetensors"
+    if not filename.endswith(".safetensors"):
+        return _error(400, "File must be a .safetensors file")
+
+    data = await file.read()
+    if len(data) > config.MAX_LORA_SIZE_BYTES:
+        return _error(413, f"File exceeds {config.MAX_LORA_SIZE_BYTES // (1024*1024)}MB limit")
+
+    try:
+        info = lora_registry.add(name=str(name), filename=filename, data=data, description=description, base_model=base_model)
+    except ValueError as exc:
+        return _error(400, str(exc))
+
+    return JSONResponse(
+        status_code=201,
+        content={"id": info.id, "name": info.name, "filename": info.filename,
+                 "base_model": info.base_model, "size_bytes": info.size_bytes,
+                 "uploaded_at": info.uploaded_at, "description": info.description},
+    )
+
+
+@app.delete("/v1/loras/{lora_id}")
+async def delete_lora(lora_id: str) -> JSONResponse:
+    if not lora_registry.delete(lora_id):
+        return _error(404, f"LoRA not found: {lora_id}")
+    return JSONResponse(content={"deleted": True, "id": lora_id})
+
+
+# ---------------------------------------------------------------------------
 # V2 Async Job Endpoints
 # ---------------------------------------------------------------------------
 
@@ -538,12 +649,17 @@ def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONRespon
 
 @app.post("/v2/text-to-video")
 async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONResponse:
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     width, height = _resolution_to_dims(body.resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
     prompt = _build_prompt(body.prompt, body.camera_motion)
     seed = random.randint(0, 2**32 - 1)
     params = dict(prompt=prompt, model=body.model, width=width, height=height,
-                  num_frames=num_frames, fps=body.fps, seed=seed, generate_audio=body.generate_audio)
+                  num_frames=num_frames, fps=body.fps, seed=seed, generate_audio=body.generate_audio,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.TEXT_TO_VIDEO, params, request)
 
 
@@ -552,17 +668,26 @@ async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSON
     keyframe_inputs = _resolve_keyframes(body)
     if isinstance(keyframe_inputs, JSONResponse):
         return keyframe_inputs
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     width, height = _resolution_to_dims(body.resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
     seed = random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, keyframes=keyframe_inputs, model=body.model,
                   width=width, height=height, num_frames=num_frames, fps=body.fps,
-                  seed=seed, generate_audio=body.generate_audio)
+                  seed=seed, generate_audio=body.generate_audio,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.IMAGE_TO_VIDEO, params, request)
 
 
 @app.post("/v2/audio-to-video")
 async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSONResponse:
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     audio_path = str(uploads.resolve(body.audio_uri))
     image_path: str | None = None
     if body.image_uri:
@@ -572,17 +697,23 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
     seed = random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, audio_path=audio_path, image_path=image_path,
                   model=body.model, width=width, height=height, num_frames=num_frames,
-                  fps=body.fps, seed=seed)
+                  fps=body.fps, seed=seed,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.AUDIO_TO_VIDEO, params, request)
 
 
 @app.post("/v2/retake")
 async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
     video_path = str(uploads.resolve(body.video_uri))
     prompt = body.prompt or ""
     seed = random.randint(0, 2**32 - 1)
     params = dict(video_path=video_path, start_time=body.start_time,
-                  duration=body.duration, mode=body.mode, prompt=prompt, seed=seed)
+                  duration=body.duration, mode=body.mode, prompt=prompt, seed=seed,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.RETAKE, params, request)
 
 
