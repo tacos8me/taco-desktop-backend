@@ -217,12 +217,7 @@ class DenoiserWorker:
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Temporal-only tiling: avoids spatial grid seams while keeping VRAM usage manageable.
-# Full single-pass decode needs ~100GB+ for high-res long videos (conv3d activations).
-DECODE_TILING = TilingConfig(
-    spatial_config=None,  # No spatial tiling — avoids grid seam artifacts
-    temporal_config=TemporalTilingConfig(tile_size_in_frames=64, tile_overlap_in_frames=24),
-)
+DECODE_TILING = TilingConfig.default()
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
