@@ -10,6 +10,7 @@ state independently.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import tempfile
 from collections.abc import Iterator
@@ -67,6 +68,9 @@ from ltx_pipelines.utils.types import PipelineComponents
 import config
 
 logger = logging.getLogger(__name__)
+
+# Pre-compute dev checkpoint params once at import time (avoids repeated disk I/O)
+_DEV_PARAMS = detect_params(config.DEV_CHECKPOINT)
 
 # ---------------------------------------------------------------------------
 # CachingModelLedger — returns pre-loaded models instead of disk I/O
@@ -219,6 +223,8 @@ DECODE_TILING = None  # Single-pass decode — cuDNN >=9.15 fixes conv3d memory 
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
+    # Can't use BytesIO here: encode_video calls av.open(path, mode="w") without
+    # format= kwarg, so PyAV can't infer the container format from a file-like object.
     video_chunks_number = get_video_chunks_number(num_frames, DECODE_TILING)
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = tmp.name
@@ -390,7 +396,7 @@ class SplitModelManager:
         transformer = worker.ledger.transformer()
 
         if is_fast:
-            sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
@@ -399,8 +405,9 @@ class SplitModelManager:
                     dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
                 return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
         else:
-            params = detect_params(config.DEV_CHECKPOINT)
-            sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            params = _DEV_PARAMS
+            empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
+            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
@@ -431,7 +438,7 @@ class SplitModelManager:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -454,7 +461,7 @@ class SplitModelManager:
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
         del transformer, stage2_loop, distilled_sigmas
         worker.evict_transformer()
-        cleanup_memory()
+        gc.collect()
 
         # Decode
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
@@ -525,7 +532,7 @@ class SplitModelManager:
 
         worker.ensure_transformer("dev_lora_050", user_lora=user_lora)
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
         # res2s stage 2: 2 NFE per step + 1 final (3 distilled steps = 2 actual steps)
         s2_nfe = 2 * (len(distilled_sigmas) - 1) + 1
 
@@ -552,7 +559,7 @@ class SplitModelManager:
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
         del transformer, stage2_loop, distilled_sigmas
         worker.evict_transformer()
-        cleanup_memory()
+        gc.collect()
 
         # Decode
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
@@ -598,7 +605,7 @@ class SplitModelManager:
         transformer = worker.ledger.transformer()
 
         if is_fast:
-            sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(device)
+            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
@@ -607,8 +614,9 @@ class SplitModelManager:
                     dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
                 return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
         else:
-            params = detect_params(config.DEV_CHECKPOINT)
-            sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            params = _DEV_PARAMS
+            empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
+            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
@@ -639,7 +647,7 @@ class SplitModelManager:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -662,7 +670,7 @@ class SplitModelManager:
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
         del transformer, stage2_loop, distilled_sigmas
         worker.evict_transformer()
-        cleanup_memory()
+        gc.collect()
 
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
@@ -698,7 +706,7 @@ class SplitModelManager:
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
-        params = detect_params(config.DEV_CHECKPOINT)
+        params = _DEV_PARAMS
 
         # Stage 1: video-only denoising (audio frozen)
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
@@ -706,7 +714,8 @@ class SplitModelManager:
         stage_1_cond = combined_image_conditionings(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
         transformer = worker.ledger.transformer()
 
-        sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
+        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
         s1_steps = len(sigmas) - 1
 
         def stage1_loop(sigmas, video_state, audio_state, stepper):
@@ -735,7 +744,7 @@ class SplitModelManager:
 
         worker.ensure_transformer("dev_lora", user_lora=user_lora)
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -757,7 +766,7 @@ class SplitModelManager:
         del video_state, stage_2_cond, upscaled
         del transformer, stage2_loop, distilled_sigmas
         worker.evict_transformer()
-        cleanup_memory()
+        gc.collect()
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
@@ -780,7 +789,7 @@ class SplitModelManager:
         fps_vid, num_frames, vid_width, vid_height = get_videostream_metadata(video_path)
 
         # Text encoding on GPU:0 (shared encoder)
-        params = detect_params(config.DEV_CHECKPOINT)
+        params = _DEV_PARAMS
         ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
@@ -788,7 +797,7 @@ class SplitModelManager:
 
         # Evict transformer (~44GB) to make room for VAE encode (~46GB intermediates)
         worker.evict_transformer()
-        cleanup_memory()
+        gc.collect()
 
         # Encode input video on GPU:0, transfer to worker device
         video_encoder_enc = self._encoder_ledger.video_encoder()
@@ -823,7 +832,8 @@ class SplitModelManager:
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
-        sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(output_shape).to_torch_shape())
+        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
         total_steps = len(sigmas) - 1
 
         transformer = worker.ledger.transformer()
@@ -880,7 +890,7 @@ class SplitModelManager:
         # Evict transformer (~22GB) before VAE decode to avoid OOM
         del transformer
         worker.evict_transformer()
-        cleanup_memory()
+        gc.collect()
 
         decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
         decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())

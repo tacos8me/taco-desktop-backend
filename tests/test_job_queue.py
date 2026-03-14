@@ -113,18 +113,18 @@ def test_v2_result_completed_returns_binary():
     with _with_no_auth():
         # Create a completed job manually
         job = Job(id=make_job_id(), type=JobType.TEXT_TO_IMAGE, status=JobStatus.COMPLETED,
-                  result_media_type="image/png")
+                  result_media_type="image/webp")
         # Store some fake result via upload_store
         from server import uploads
         uid, uri = uploads.create()
-        uploads.save(uid, b"fake-png-data")
+        uploads.save(uid, b"fake-webp-data")
         job.result_uri = uri
         job_store.add(job)
 
         resp = client.get(f"/v2/jobs/{job.id}/result")
         assert resp.status_code == 200
-        assert resp.content == b"fake-png-data"
-        assert resp.headers["content-type"] == "image/png"
+        assert resp.content == b"fake-webp-data"
+        assert resp.headers["content-type"] == "image/webp"
         _cleanup_queue()
 
 

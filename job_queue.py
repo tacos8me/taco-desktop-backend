@@ -42,8 +42,8 @@ _MEDIA_TYPES: dict[JobType, str] = {
     JobType.IMAGE_TO_VIDEO: "video/mp4",
     JobType.AUDIO_TO_VIDEO: "video/mp4",
     JobType.RETAKE: "video/mp4",
-    JobType.TEXT_TO_IMAGE: "image/png",
-    JobType.IMAGE_TO_IMAGE: "image/png",
+    JobType.TEXT_TO_IMAGE: "image/webp",
+    JobType.IMAGE_TO_IMAGE: "image/webp",
 }
 
 

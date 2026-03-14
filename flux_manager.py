@@ -90,7 +90,7 @@ class FluxManager:
         seed: int,
         callback_on_step_end: object = None,
     ) -> bytes:
-        """Generate an image (txt2img) and return PNG bytes."""
+        """Generate an image (txt2img) and return WEBP bytes."""
         generator = torch.Generator(device=self._device).manual_seed(seed)
 
         kwargs: dict = dict(
@@ -113,7 +113,7 @@ class FluxManager:
 
         image = result.images[0]
         buf = io.BytesIO()
-        image.save(buf, format="PNG")
+        image.save(buf, format="WEBP", quality=95)
         return buf.getvalue()
 
     @torch.inference_mode()
@@ -153,7 +153,7 @@ class FluxManager:
 
         image = result.images[0]
         buf = io.BytesIO()
-        image.save(buf, format="PNG")
+        image.save(buf, format="WEBP", quality=95)
         return buf.getvalue()
 
     # --- Async API ---

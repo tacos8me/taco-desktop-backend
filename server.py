@@ -12,7 +12,7 @@ from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import config
@@ -466,7 +466,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 guidance_scale=body.guidance_scale,
                 seed=seed,
             )
-        return Response(content=image_bytes, media_type="image/png")
+        return Response(content=image_bytes, media_type="image/webp")
     except Exception as exc:
         logger.exception("text-to-image failed")
         return _error(500, str(exc))
@@ -492,7 +492,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 guidance_scale=body.guidance_scale,
                 seed=seed,
             )
-        return Response(content=image_bytes, media_type="image/png")
+        return Response(content=image_bytes, media_type="image/webp")
     except FileNotFoundError as exc:
         return _error(404, str(exc))
     except Exception as exc:
@@ -766,9 +766,10 @@ async def v2_job_result(job_id: str) -> Response:
         return _error(409, "Job result not ready")
     try:
         path = uploads.resolve(job.result_uri)
-        data = path.read_bytes()
-        return Response(
-            content=data,
+        if not path.exists():
+            raise FileNotFoundError()
+        return FileResponse(
+            path=str(path),
             media_type=job.result_media_type or "application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )

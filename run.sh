@@ -9,6 +9,12 @@ export LD_LIBRARY_PATH="${VENV_NVIDIA}/cu13/lib:${VENV_NVIDIA}/cuda_nvrtc/lib:${
 # Reduce CUDA memory fragmentation
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Lazy-load CUDA modules (faster startup, lower memory)
+export CUDA_MODULE_LOADING=LAZY
+
+# Silence tokenizers fork warning
+export TOKENIZERS_PARALLELISM=false
+
 # Load environment variables (optional, for TACO_API_KEY override)
 if [ -f .env ]; then
     set -a; source .env; set +a

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import time
 import uuid
@@ -57,7 +58,9 @@ class LoRARegistry:
                 for l in self._loras.values()
             ]
         }
-        self._registry_path.write_text(json.dumps(data, indent=2))
+        tmp = self._registry_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, self._registry_path)
 
     def list_all(self) -> list[LoRAInfo]:
         return list(self._loras.values())

@@ -56,3 +56,8 @@ JOB_RESULT_TTL_SECONDS = 600  # 10 minutes
 # Server
 HOST = "0.0.0.0"
 PORT = 8090
+
+# PyTorch performance settings
+import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
