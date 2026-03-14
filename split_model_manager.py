@@ -217,7 +217,10 @@ class DenoiserWorker:
 # Helpers
 # ---------------------------------------------------------------------------
 
-DECODE_TILING = TilingConfig.default()
+DECODE_TILING = TilingConfig(
+    spatial_config=None,
+    temporal_config=TemporalTilingConfig(tile_size_in_frames=64, tile_overlap_in_frames=24),
+)
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
