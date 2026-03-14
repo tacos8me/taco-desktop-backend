@@ -14,6 +14,7 @@ dependencies = [
     "httpx>=0.28.1",
     "torch>=2.9,<2.10",
     "torchaudio>=2.9,<2.10",
+    "python-multipart>=0.0.22",
 ]
 
 [[tool.uv.index]]

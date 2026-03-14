@@ -576,7 +576,7 @@ async def upload_lora(request: Request) -> Response:
     if "multipart/form-data" not in content_type:
         return _error(400, "Expected multipart/form-data")
 
-    form = await request.form()
+    form = await request.form(max_part_size=config.MAX_LORA_SIZE_BYTES)
     file = form.get("file")
     name = form.get("name")
     description = str(form.get("description", ""))
