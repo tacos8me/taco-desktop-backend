@@ -1,0 +1,31 @@
+[Unit]
+Description=taco-backend LTX/Flux inference server
+After=network.target
+
+[Service]
+Type=exec
+User=ian
+Group=ian
+WorkingDirectory=/mnt/nvme-1/servers/taco-backend
+ExecStart=/mnt/nvme-1/servers/taco-backend/run.sh
+Restart=on-failure
+RestartSec=5
+
+# Logging — stdout/stderr go to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=taco-backend
+
+# Environment
+Environment=HOME=/home/ian
+Environment=PATH=/home/ian/.local/bin:/home/ian/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# GPU access
+SupplementaryGroups=video render
+
+# No timeout on startup (model loading takes ~45s)
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
