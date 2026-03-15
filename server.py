@@ -296,13 +296,28 @@ def _error(status: int, msg: str) -> JSONResponse:
 
 @app.get("/health")
 async def health() -> dict:
+    ltx_status = "paused" if manager._paused else ("ready" if manager.is_ready else "not_loaded")
     return {
         "status": "ok",
-        "ltx": "ready" if manager.is_ready else "not_loaded",
+        "ltx": ltx_status,
         "flux": "ready" if flux.is_ready else "not_loaded",
         "chat": "ready" if chat.is_ready else "not_loaded",
         "queue": job_store.stats(),
     }
+
+
+@app.post("/v1/system/pause")
+async def system_pause() -> dict:
+    """Evict LTX transformer to free GPU:0 for training."""
+    await manager.pause()
+    return {"status": "paused"}
+
+
+@app.post("/v1/system/resume")
+async def system_resume() -> dict:
+    """Re-enable LTX inference. Transformer reloads on next request."""
+    await manager.resume()
+    return {"status": "resumed"}
 
 
 @app.post("/v1/text-to-video")

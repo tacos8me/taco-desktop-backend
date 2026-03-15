@@ -263,7 +263,22 @@ class SplitModelManager:
 
     @property
     def is_ready(self) -> bool:
-        return len(self._workers) > 0
+        return len(self._workers) > 0 and not self._paused
+
+    _paused: bool = False
+
+    async def pause(self) -> None:
+        """Evict LTX transformer from GPU:0 to free VRAM for external training."""
+        self._paused = True
+        for worker in self._workers:
+            if worker.device == self._encoder_device:
+                worker.evict_transformer()
+                logger.info("Paused: evicted transformer from %s", worker.device)
+
+    async def resume(self) -> None:
+        """Re-enable inference. Transformer reloads on next request."""
+        self._paused = False
+        logger.info("Resumed: inference re-enabled")
 
     def load_all(self) -> None:
         devices = [torch.device(d) for d in config.GPU_DEVICES]
