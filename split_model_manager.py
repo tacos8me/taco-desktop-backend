@@ -263,24 +263,28 @@ class SplitModelManager:
 
     @property
     def is_ready(self) -> bool:
-        return len(self._workers) > 0 and not self._paused
+        return len(self._workers) > 0
 
-    _paused: bool = False
-
-    async def pause(self) -> None:
-        """Evict LTX transformer from GPU:0 to free VRAM for external training."""
-        self._paused = True
+    def evict_all(self) -> None:
+        """Free all GPU memory — evict transformer + encoder hub on all workers."""
         for worker in self._workers:
-            if worker.device == self._encoder_device:
-                worker.evict_transformer()
-                logger.info("Paused: evicted transformer from %s", worker.device)
-
-    async def resume(self) -> None:
-        """Re-enable inference. Transformer reloads on next request."""
-        self._paused = False
-        logger.info("Resumed: inference re-enabled")
+            worker.evict_transformer()
+            # Also evict decoders/encoders in worker cache
+            for key in list(worker.cache.keys()):
+                worker.cache[key] = None
+        self._workers.clear()
+        if self._encoder_ledger is not None:
+            for key in list(self._encoder_ledger._cache.keys()):
+                self._encoder_ledger._cache[key] = None
+            self._encoder_ledger = None
+        gc.collect()
+        for device_name in config.GPU_DEVICES:
+            torch.cuda.synchronize(torch.device(device_name))
+            torch.cuda.empty_cache()
+        logger.info("All LTX models evicted from GPU")
 
     def load_all(self) -> None:
+        self._workers.clear()
         devices = [torch.device(d) for d in config.GPU_DEVICES]
 
         # --- Shared encoder hub on GPU:0 ---

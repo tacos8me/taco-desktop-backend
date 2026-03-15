@@ -42,6 +42,7 @@ chat = ChatManager()
 # Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
 # when Flux and LTX run CUDA inference concurrently in the same process.
 _inference_lock = asyncio.Lock()
+_paused = False
 
 # Job queue
 job_store = JobStore()
@@ -54,6 +55,8 @@ _job_queue: asyncio.Queue[str] = asyncio.Queue()
 
 async def _dispatch_job(job: Job) -> bytes:
     """Route a job to the correct manager and return result bytes."""
+    if _paused:
+        raise RuntimeError("System is paused for maintenance")
     p = job.params
 
     def on_progress(progress: float) -> None:
@@ -296,10 +299,17 @@ def _error(status: int, msg: str) -> JSONResponse:
 
 @app.get("/health")
 async def health() -> dict:
-    ltx_status = "paused" if manager._paused else ("ready" if manager.is_ready else "not_loaded")
+    if _paused:
+        return {
+            "status": "paused",
+            "ltx": "paused",
+            "flux": "paused",
+            "chat": "ready" if chat.is_ready else "not_loaded",
+            "queue": job_store.stats(),
+        }
     return {
         "status": "ok",
-        "ltx": ltx_status,
+        "ltx": "ready" if manager.is_ready else "not_loaded",
         "flux": "ready" if flux.is_ready else "not_loaded",
         "chat": "ready" if chat.is_ready else "not_loaded",
         "queue": job_store.stats(),
@@ -308,20 +318,55 @@ async def health() -> dict:
 
 @app.post("/v1/system/pause")
 async def system_pause() -> dict:
-    """Evict LTX transformer to free GPU:0 for training."""
-    await manager.pause()
-    return {"status": "paused"}
+    """Evict all models from GPU to free VRAM for training."""
+    global _paused
+    if _paused:
+        return {"status": "already_paused"}
+    try:
+        async with _inference_lock:
+            # Cancel queued (not yet processing) jobs
+            while not _job_queue.empty():
+                try:
+                    job_id = _job_queue.get_nowait()
+                    job = job_store.get(job_id)
+                    if job and job.status == JobStatus.QUEUED:
+                        job.status = JobStatus.FAILED
+                        job.error = "System paused"
+                except asyncio.QueueEmpty:
+                    break
+            _paused = True
+            manager.evict_all()
+            flux.unload()
+        logger.info("System paused — all GPU memory freed")
+        return {"status": "paused"}
+    except Exception:
+        logger.exception("Pause failed")
+        _paused = True
+        return JSONResponse(status_code=500, content={"error": "pause_failed", "status": "paused"})
 
 
 @app.post("/v1/system/resume")
 async def system_resume() -> dict:
-    """Re-enable LTX inference. Transformer reloads on next request."""
-    await manager.resume()
-    return {"status": "resumed"}
+    """Reload all models after training."""
+    global _paused
+    if not _paused:
+        return {"status": "already_running"}
+    try:
+        async with _inference_lock:
+            manager.load_all()
+            flux.load()
+            _paused = False
+        logger.info("System resumed — all models reloaded")
+        return {"status": "ready"}
+    except Exception:
+        logger.exception("Resume failed — system remains paused")
+        return JSONResponse(status_code=500, content={"error": "resume_failed", "status": "paused"})
 
 
 @app.post("/v1/text-to-video")
 async def text_to_video(body: TextToVideoRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     lora_result = _resolve_lora(body)
@@ -358,6 +403,8 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
     keyframe_inputs = _resolve_keyframes(body)
     if isinstance(keyframe_inputs, JSONResponse):
         return keyframe_inputs
+    if _paused:
+        return _error(503, "System is paused for maintenance")
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     lora_result = _resolve_lora(body)
@@ -393,6 +440,8 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
 
 @app.post("/v1/audio-to-video")
 async def audio_to_video(body: AudioToVideoRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     lora_result = _resolve_lora(body)
@@ -433,6 +482,8 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
 
 @app.post("/v1/retake")
 async def retake(body: RetakeRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
     if not manager.is_ready:
         return _error(500, "No GPU workers loaded")
     lora_result = _resolve_lora(body)
@@ -465,6 +516,8 @@ async def retake(body: RetakeRequest) -> Response:
 
 @app.post("/v1/text-to-image")
 async def text_to_image(body: TextToImageRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
     if not flux.is_ready:
         return _error(500, "Flux pipeline not loaded")
     try:
@@ -489,6 +542,8 @@ async def text_to_image(body: TextToImageRequest) -> Response:
 
 @app.post("/v1/image-to-image")
 async def image_to_image(body: ImageToImageRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
     if not flux.is_ready:
         return _error(500, "Flux pipeline not loaded")
     try:
@@ -637,6 +692,12 @@ async def delete_lora(lora_id: str) -> JSONResponse:
 
 def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONResponse:
     """Create a job, enqueue it, return 202."""
+    if _paused:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "system_paused", "message": "System is paused for maintenance."},
+            headers={"Retry-After": "300"},
+        )
     if job_store.pending_count() >= config.MAX_QUEUE_DEPTH:
         return JSONResponse(
             status_code=429,

@@ -1,4 +1,5 @@
 uploads/
+loras/
 .venv/
 __pycache__/
 *.pyc

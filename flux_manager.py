@@ -76,8 +76,9 @@ class FluxManager:
             del self._pipe
             self._pipe = None
             gc.collect()
+            torch.cuda.synchronize(torch.device(self._device))
             torch.cuda.empty_cache()
-            logger.info("Flux2 pipeline unloaded")
+            logger.info("Flux2 pipeline unloaded from %s", self._device)
 
     @torch.inference_mode()
     def _generate(
