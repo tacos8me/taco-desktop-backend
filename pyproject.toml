@@ -15,6 +15,8 @@ dependencies = [
     "torch>=2.9,<2.10",
     "torchaudio>=2.9,<2.10",
     "python-multipart>=0.0.22",
+    "nvidia-cudnn-cu13>=9.20",
+    "nvidia-cublas>=13.2",
 ]
 
 [[tool.uv.index]]
