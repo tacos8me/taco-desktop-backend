@@ -87,9 +87,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     manager.load_all()
     logger.info("LTX pipelines ready.")
 
-    logger.info("Loading Flux pipeline on %s ...", config.FLUX_DEVICE)
-    flux.load()
-    logger.info("Flux pipeline ready.")
+    if config.LOAD_FLUX:
+        logger.info("Loading Flux pipeline on %s ...", config.FLUX_DEVICE)
+        flux.load()
+        logger.info("Flux pipeline ready.")
+    else:
+        logger.info("Flux loading disabled (LOAD_FLUX not set)")
 
     chat.load()
     logger.info("Chat proxy ready.")
