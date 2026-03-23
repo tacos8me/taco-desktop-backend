@@ -27,7 +27,13 @@ DISTILLED_LORA = str(CHECKPOINTS_DIR / "ltx-2.3-22b-distilled-lora-384.safetenso
 SPATIAL_UPSAMPLER = str(CHECKPOINTS_DIR / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
 
 # Text encoder — point to the HF snapshot directory containing model*.safetensors
-GEMMA_ROOT = "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f"
+# Set GEMMA_VARIANT=sikaworld in .env to use the abliterated FP4 text encoder
+_GEMMA_VARIANTS = {
+    "default": "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f",
+    "sikaworld": "/mnt/nvme-1/huggingface/gemma-3-12b-sikaworld",
+}
+GEMMA_VARIANT = os.environ.get("GEMMA_VARIANT", "default")
+GEMMA_ROOT = _GEMMA_VARIANTS.get(GEMMA_VARIANT, _GEMMA_VARIANTS["default"])
 
 # GPU devices
 LTX_DEVICE = "cuda:0"    # LTX-2 video generation (~59GB)

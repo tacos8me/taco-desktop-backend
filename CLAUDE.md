@@ -38,6 +38,12 @@ LTX-compatible inference server for taco-desktop.
 - Retake uses `MultiModalGuider(...)` directly, NOT `create_multimodal_guider_factory().build()` — factory has no `.build()` method
 - Audio latent must be trimmed/padded to `AudioLatentShape.from_video_pixel_shape(output_shape).frames`
 
+## Text encoder variants
+- `GEMMA_VARIANT=default` — Google Gemma 3 12B PT (standard, BF16)
+- `GEMMA_VARIANT=sikaworld` — Sikaworld abliterated FP4 (uncensored, NVFP4 quantized)
+- Set via `.env` or environment variable, requires server restart
+- Sikaworld path: `/mnt/nvme-1/huggingface/gemma-3-12b-sikaworld/`
+
 ## Dependencies
 - LTX-2 repo: `/mnt/nvme-1/repos/LTX-2` (editable install)
 - Checkpoints: `/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/`
