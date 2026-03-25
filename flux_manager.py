@@ -46,28 +46,36 @@ class FluxManager:
         logger.info("Loading %s (%s) on %s ...", model_name, model_repo, self._device)
         t0 = time.monotonic()
 
-        transformer = Flux2Transformer2DModel.from_pretrained(
-            model_repo,
-            subfolder="transformer",
-            torch_dtype=torch.bfloat16,
-            cache_dir=config.HF_CACHE_DIR,
-        )
-        transformer.enable_layerwise_casting(
-            storage_dtype=torch.float8_e4m3fn,
-            compute_dtype=torch.bfloat16,
-        )
+        _load_kw = dict(torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR, local_files_only=True)
 
         if model_name == "flux2-klein":
             from diffusers import Flux2KleinPipeline
+            # Klein repo has single safetensors at root + sharded index in transformer/
+            # but shards are gated. Load transformer from the single file instead.
+            klein_ckpt, klein_snap = self._resolve_klein_checkpoint()
+            transformer = Flux2Transformer2DModel.from_single_file(
+                klein_ckpt, torch_dtype=torch.bfloat16,
+                config=str(klein_snap / "transformer"),
+            )
+            transformer.enable_layerwise_casting(
+                storage_dtype=torch.float8_e4m3fn,
+                compute_dtype=torch.bfloat16,
+            )
             pipe = Flux2KleinPipeline.from_pretrained(
-                model_repo, transformer=transformer,
-                torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR,
+                str(klein_snap), transformer=transformer,
+                torch_dtype=torch.bfloat16, local_files_only=True,
             )
         else:
             from diffusers import Flux2Pipeline
+            transformer = Flux2Transformer2DModel.from_pretrained(
+                model_repo, subfolder="transformer", **_load_kw,
+            )
+            transformer.enable_layerwise_casting(
+                storage_dtype=torch.float8_e4m3fn,
+                compute_dtype=torch.bfloat16,
+            )
             pipe = Flux2Pipeline.from_pretrained(
-                model_repo, transformer=transformer,
-                torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR,
+                model_repo, transformer=transformer, **_load_kw,
             )
 
         pipe = pipe.to(self._device)
@@ -76,6 +84,17 @@ class FluxManager:
 
         elapsed = time.monotonic() - t0
         logger.info("%s loaded in %.1fs on %s", model_name, elapsed, self._device)
+
+    def _resolve_klein_checkpoint(self) -> tuple:
+        """Find the Klein single-file checkpoint in the HF cache. Returns (ckpt_path, snapshot_dir)."""
+        from pathlib import Path
+        cache_dir = Path(config.HF_CACHE_DIR)
+        model_dir = cache_dir / "models--black-forest-labs--FLUX.2-klein-9b-kv"
+        for snap_dir in (model_dir / "snapshots").iterdir():
+            ckpt = snap_dir / "flux-2-klein-9b-kv.safetensors"
+            if ckpt.exists():
+                return str(ckpt), snap_dir
+        raise FileNotFoundError("Klein checkpoint not found in HF cache. Run: huggingface-cli download black-forest-labs/FLUX.2-klein-9b-kv --cache-dir /mnt/nvme-1/huggingface/hub")
 
     def unload(self) -> None:
         """Free GPU memory."""
