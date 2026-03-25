@@ -45,8 +45,11 @@ CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
 # SplitModelManager: encoder hub + denoiser on single GPU
 GPU_DEVICES = [LTX_DEVICE]
 
-# Flux model
-FLUX_MODEL_REPO = "black-forest-labs/FLUX.2-dev"
+# Flux models
+FLUX_MODELS = {
+    "flux2-dev": "black-forest-labs/FLUX.2-dev",
+    "flux2-klein": "black-forest-labs/FLUX.2-klein-9b-kv",
+}
 HF_CACHE_DIR = "/mnt/nvme-1/huggingface/hub"
 
 # Upload storage

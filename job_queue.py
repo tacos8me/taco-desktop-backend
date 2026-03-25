@@ -35,6 +35,7 @@ class JobType(StrEnum):
     RETAKE = "retake"
     TEXT_TO_IMAGE = "text-to-image"
     IMAGE_TO_IMAGE = "image-to-image"
+    IMAGE_EDIT = "image-edit"
 
 
 _MEDIA_TYPES: dict[JobType, str] = {
@@ -44,6 +45,7 @@ _MEDIA_TYPES: dict[JobType, str] = {
     JobType.RETAKE: "video/mp4",
     JobType.TEXT_TO_IMAGE: "image/webp",
     JobType.IMAGE_TO_IMAGE: "image/webp",
+    JobType.IMAGE_EDIT: "image/webp",
 }
 
 

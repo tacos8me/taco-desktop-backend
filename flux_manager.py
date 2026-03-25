@@ -1,7 +1,8 @@
-"""Flux 2 Dev image generation manager.
+"""Flux image generation manager with model swapping.
 
-Loads Flux2Pipeline with FP8 layerwise casting on a dedicated GPU.
-FP8 transformer (~32GB) + bf16 Mistral text encoder (~47GB) = ~79GB.
+Supports FLUX.2-dev (text-to-image, img2img) and FLUX.2-klein-9b-kv
+(text-to-image, img2img, multi-reference editing). Models swap on demand
+— evicts current pipeline and loads requested model if different.
 """
 
 from __future__ import annotations
@@ -24,12 +25,12 @@ os.environ.setdefault("HF_HOME", "/mnt/nvme-1/huggingface")
 logger = logging.getLogger(__name__)
 
 
-
 class FluxManager:
-    """Manages Flux 2 pipeline lifecycle and inference on a dedicated GPU."""
+    """Manages Flux pipelines with on-demand model swapping."""
 
     def __init__(self) -> None:
         self._pipe = None
+        self._current_model: str | None = None
         self._device = config.FLUX_DEVICE
         self._lock = asyncio.Lock()
 
@@ -37,18 +38,16 @@ class FluxManager:
     def is_ready(self) -> bool:
         return self._pipe is not None
 
-    def load(self) -> None:
-        """Load the Flux 2 pipeline with FP8 transformer."""
-        from diffusers import Flux2Pipeline
+    def load(self, model_name: str = "flux2-dev") -> None:
+        """Load a Flux pipeline with FP8 transformer."""
         from diffusers.models import Flux2Transformer2DModel
 
-        logger.info("Loading Flux2 pipeline on %s ...", self._device)
+        model_repo = config.FLUX_MODELS[model_name]
+        logger.info("Loading %s (%s) on %s ...", model_name, model_repo, self._device)
         t0 = time.monotonic()
 
-        # FP8 layerwise casting: stores weights in float8_e4m3fn (~32GB)
-        # but computes in bf16. Halves VRAM vs full bf16 (~64GB).
         transformer = Flux2Transformer2DModel.from_pretrained(
-            config.FLUX_MODEL_REPO,
+            model_repo,
             subfolder="transformer",
             torch_dtype=torch.bfloat16,
             cache_dir=config.HF_CACHE_DIR,
@@ -58,49 +57,65 @@ class FluxManager:
             compute_dtype=torch.bfloat16,
         )
 
-        pipe = Flux2Pipeline.from_pretrained(
-            config.FLUX_MODEL_REPO,
-            transformer=transformer,
-            torch_dtype=torch.bfloat16,
-            cache_dir=config.HF_CACHE_DIR,
-        )
+        if model_name == "flux2-klein":
+            from diffusers import Flux2KleinPipeline
+            pipe = Flux2KleinPipeline.from_pretrained(
+                model_repo, transformer=transformer,
+                torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR,
+            )
+        else:
+            from diffusers import Flux2Pipeline
+            pipe = Flux2Pipeline.from_pretrained(
+                model_repo, transformer=transformer,
+                torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR,
+            )
+
         pipe = pipe.to(self._device)
         self._pipe = pipe
+        self._current_model = model_name
 
         elapsed = time.monotonic() - t0
-        logger.info("Flux2 pipeline loaded in %.1fs on %s", elapsed, self._device)
+        logger.info("%s loaded in %.1fs on %s", model_name, elapsed, self._device)
 
     def unload(self) -> None:
         """Free GPU memory."""
         if self._pipe is not None:
             del self._pipe
             self._pipe = None
+            self._current_model = None
             gc.collect()
             torch.cuda.synchronize(torch.device(self._device))
             torch.cuda.empty_cache()
-            logger.info("Flux2 pipeline unloaded from %s", self._device)
+            logger.info("Flux pipeline unloaded from %s", self._device)
+
+    def ensure_model(self, model_name: str) -> None:
+        """Swap model if needed. No-op if already loaded."""
+        if self._current_model == model_name:
+            return
+        if self._pipe is not None:
+            logger.info("Swapping Flux model: %s → %s", self._current_model, model_name)
+            self.unload()
+        self.load(model_name)
+
+    def _to_webp(self, image: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        image.save(buf, format="WEBP", quality=95)
+        return buf.getvalue()
 
     @torch.inference_mode()
     def _generate(
-        self,
-        prompt: str,
-        width: int,
-        height: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        seed: int,
-        callback_on_step_end: object = None,
+        self, prompt: str, width: int, height: int,
+        num_inference_steps: int, guidance_scale: float, seed: int,
+        model: str = "flux2-dev", callback_on_step_end: object = None,
     ) -> bytes:
         """Generate an image (txt2img) and return WEBP bytes."""
+        self.ensure_model(model)
         generator = torch.Generator(device=self._device).manual_seed(seed)
 
         kwargs: dict = dict(
-            prompt=prompt,
-            height=height,
-            width=width,
+            prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
+            guidance_scale=guidance_scale, generator=generator,
         )
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
@@ -112,35 +127,23 @@ class FluxManager:
             self.unload()
             raise
 
-        image = result.images[0]
-        buf = io.BytesIO()
-        image.save(buf, format="WEBP", quality=95)
-        return buf.getvalue()
+        return self._to_webp(result.images[0])
 
     @torch.inference_mode()
     def _img2img(
-        self,
-        prompt: str,
-        image_path: str,
-        width: int,
-        height: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        seed: int,
-        callback_on_step_end: object = None,
+        self, prompt: str, image_path: str, width: int, height: int,
+        num_inference_steps: int, guidance_scale: float, seed: int,
+        model: str = "flux2-dev", callback_on_step_end: object = None,
     ) -> bytes:
-        """Edit an image using Flux 2 Kontext reference latents."""
+        """Edit an image using single reference."""
+        self.ensure_model(model)
         generator = torch.Generator(device=self._device).manual_seed(seed)
         ref_image = Image.open(image_path).convert("RGB")
 
         kwargs: dict = dict(
-            image=ref_image,
-            prompt=prompt,
-            height=height,
-            width=width,
+            image=ref_image, prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
+            guidance_scale=guidance_scale, generator=generator,
         )
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
@@ -152,46 +155,55 @@ class FluxManager:
             self.unload()
             raise
 
-        image = result.images[0]
-        buf = io.BytesIO()
-        image.save(buf, format="WEBP", quality=95)
-        return buf.getvalue()
+        return self._to_webp(result.images[0])
+
+    @torch.inference_mode()
+    def _edit(
+        self, prompt: str, image_paths: list[str], width: int, height: int,
+        num_inference_steps: int = 4, guidance_scale: float = 4.0,
+        seed: int = 0, callback_on_step_end: object = None,
+    ) -> bytes:
+        """Multi-reference image editing via Klein."""
+        self.ensure_model("flux2-klein")
+        generator = torch.Generator(device=self._device).manual_seed(seed)
+        images = [Image.open(p).convert("RGB") for p in image_paths]
+
+        kwargs: dict = dict(
+            image=images, prompt=prompt, height=height, width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale, generator=generator,
+        )
+        if callback_on_step_end is not None:
+            kwargs["callback_on_step_end"] = callback_on_step_end
+
+        try:
+            result = self._pipe(**kwargs)
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            logger.exception("Flux edit OOM, unloading pipeline")
+            self.unload()
+            raise
+
+        return self._to_webp(result.images[0])
 
     # --- Async API ---
 
-    async def generate_text_to_image(
-        self,
-        prompt: str,
-        width: int,
-        height: int,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 4.0,
-        seed: int = 0,
-        callback_on_step_end: object = None,
-    ) -> bytes:
+    async def generate_text_to_image(self, *, model: str = "flux2-dev", **kwargs) -> bytes:
         async with self._lock:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._generate, prompt, width, height,
-                num_inference_steps, guidance_scale, seed,
-                callback_on_step_end,
+                None, lambda: self._generate(model=model, **kwargs),
             )
 
-    async def generate_image_to_image(
-        self,
-        prompt: str,
-        image_path: str,
-        width: int,
-        height: int,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 4.0,
-        seed: int = 0,
-        callback_on_step_end: object = None,
-    ) -> bytes:
+    async def generate_image_to_image(self, *, model: str = "flux2-dev", **kwargs) -> bytes:
         async with self._lock:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._img2img, prompt, image_path, width, height,
-                num_inference_steps, guidance_scale, seed,
-                callback_on_step_end,
+                None, lambda: self._img2img(model=model, **kwargs),
+            )
+
+    async def generate_image_edit(self, *, model: str = "flux2-klein", **kwargs) -> bytes:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: self._edit(**kwargs),
             )

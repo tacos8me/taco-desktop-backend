@@ -77,6 +77,9 @@ async def _dispatch_job(job: Job) -> bytes:
         case JobType.IMAGE_TO_IMAGE:
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_image_to_image(**p, callback_on_step_end=cb)
+        case JobType.IMAGE_EDIT:
+            cb = make_flux_callback(job, p.get("num_inference_steps", 4))
+            return await flux.generate_image_edit(**p, callback_on_step_end=cb)
         case _:
             raise ValueError(f"Unknown job type: {job.type}")
 
@@ -154,7 +157,7 @@ class LoRAInput(BaseModel):
     strength: float = Field(default=1.0, ge=0.0, le=2.0)
 Resolution = Literal["1920x1080", "1080x1920", "2560x1440", "1440x2560", "3840x2160", "2160x3840"]
 RetakeMode = Literal["replace_audio_and_video", "replace_video", "replace_video_only", "replace_audio"]
-ImageModelName = Literal["flux2-dev"]
+ImageModelName = Literal["flux2-dev", "flux2-klein"]
 
 
 class TextToVideoRequest(BaseModel):
@@ -223,6 +226,17 @@ class ImageToImageRequest(BaseModel):
     width: int = Field(default=1024, ge=64, le=4096)
     height: int = Field(default=1024, ge=64, le=4096)
     num_inference_steps: int = Field(default=50, ge=1, le=100)
+    guidance_scale: float = Field(default=4.0, ge=0, le=20)
+    seed: int | None = None
+
+
+class ImageEditRequest(BaseModel):
+    prompt: str = Field(max_length=10000)
+    image_uris: list[str] = Field(min_length=1, max_length=10)
+    model: ImageModelName = "flux2-klein"
+    width: int = Field(default=1024, ge=64, le=4096)
+    height: int = Field(default=1024, ge=64, le=4096)
+    num_inference_steps: int = Field(default=4, ge=1, le=100)
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
 
@@ -536,6 +550,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 num_inference_steps=body.num_inference_steps,
                 guidance_scale=body.guidance_scale,
                 seed=seed,
+                model=body.model,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except Exception as exc:
@@ -564,12 +579,43 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 num_inference_steps=body.num_inference_steps,
                 guidance_scale=body.guidance_scale,
                 seed=seed,
+                model=body.model,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FileNotFoundError as exc:
         return _error(404, str(exc))
     except Exception as exc:
         logger.exception("image-to-image failed")
+        return _error(500, str(exc))
+
+
+@app.post("/v1/image-edit")
+async def image_edit(body: ImageEditRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
+    if not config.LOAD_FLUX:
+        return _error(500, "Flux pipeline not loaded")
+    try:
+        image_paths = [str(uploads.resolve(uri)) for uri in body.image_uris]
+        width = (body.width // 16) * 16
+        height = (body.height // 16) * 16
+        seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
+
+        async with _inference_lock:
+            image_bytes = await flux.generate_image_edit(
+                prompt=body.prompt,
+                image_paths=image_paths,
+                width=width,
+                height=height,
+                num_inference_steps=body.num_inference_steps,
+                guidance_scale=body.guidance_scale,
+                seed=seed,
+            )
+        return Response(content=image_bytes, media_type="image/webp")
+    except FileNotFoundError as exc:
+        return _error(404, str(exc))
+    except Exception as exc:
+        logger.exception("image-edit failed")
         return _error(500, str(exc))
 
 
@@ -803,7 +849,8 @@ async def v2_text_to_image(body: TextToImageRequest, request: Request) -> JSONRe
     seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
-                  guidance_scale=body.guidance_scale, seed=seed)
+                  guidance_scale=body.guidance_scale, seed=seed,
+                  model=body.model)
     return _submit_job(JobType.TEXT_TO_IMAGE, params, request)
 
 
@@ -815,8 +862,21 @@ async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSON
     seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, image_path=image_path, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
-                  guidance_scale=body.guidance_scale, seed=seed)
+                  guidance_scale=body.guidance_scale, seed=seed,
+                  model=body.model)
     return _submit_job(JobType.IMAGE_TO_IMAGE, params, request)
+
+
+@app.post("/v2/image-edit")
+async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONResponse:
+    image_paths = [str(uploads.resolve(uri)) for uri in body.image_uris]
+    width = (body.width // 16) * 16
+    height = (body.height // 16) * 16
+    seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
+    params = dict(prompt=body.prompt, image_paths=image_paths, width=width, height=height,
+                  num_inference_steps=body.num_inference_steps,
+                  guidance_scale=body.guidance_scale, seed=seed)
+    return _submit_job(JobType.IMAGE_EDIT, params, request)
 
 
 @app.get("/v2/jobs/{job_id}")
