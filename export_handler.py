@@ -66,30 +66,45 @@ def export_composition(
         inputs.extend(["-i", str(p)])
 
     # Build xfade filter chain
-    filter_parts: list[str] = []
-    cumulative_offset = 0.0
-    prev_label = "[0:v]"
+    # Check if any transitions have actual duration
+    has_xfade = any(
+        (t.get("durationSec", t.get("duration_sec", 0)) or 0) > 0
+        for t in transitions
+    )
 
-    for i in range(1, len(clip_paths)):
-        # Find transition for this pair
-        trans = next(
-            (t for t in transitions if t.get("clipBIndex", t.get("clip_b_index")) == i),
-            None,
-        )
-        trans_duration = trans.get("durationSec", trans.get("duration_sec", 0)) if trans else 0
-        trans_type_key = trans.get("type", "crossfade") if trans else "crossfade"
-        ffmpeg_transition = TRANSITION_MAP.get(trans_type_key, "fade")
+    if not has_xfade:
+        # Simple concat — no xfade needed
+        filter_parts = []
+        for i in range(len(clip_paths)):
+            filter_parts.append(f"[{i}:v]")
+        filter_complex = f"{''.join(filter_parts)}concat=n={len(clip_paths)}:v=1:a=0[vout]"
+    else:
+        # xfade chain
+        filter_parts: list[str] = []
+        cumulative_offset = 0.0
+        prev_label = "[0:v]"
 
-        cumulative_offset += clip_durations[i - 1] - trans_duration
-        out_label = f"[v{i:02d}]" if i < len(clip_paths) - 1 else "[vout]"
+        for i in range(1, len(clip_paths)):
+            trans = next(
+                (t for t in transitions if t.get("clipBIndex", t.get("clip_b_index")) == i),
+                None,
+            )
+            trans_duration = trans.get("durationSec", trans.get("duration_sec", 0)) if trans else 0
+            if trans_duration <= 0:
+                trans_duration = 0.5  # minimum crossfade for xfade mode
+            trans_type_key = trans.get("type", "crossfade") if trans else "crossfade"
+            ffmpeg_transition = TRANSITION_MAP.get(trans_type_key, "fade")
 
-        filter_parts.append(
-            f"{prev_label}[{i}:v]xfade=transition={ffmpeg_transition}"
-            f":duration={trans_duration}:offset={cumulative_offset}{out_label}"
-        )
-        prev_label = out_label
+            cumulative_offset += clip_durations[i - 1] - trans_duration
+            out_label = f"[v{i:02d}]" if i < len(clip_paths) - 1 else "[vout]"
 
-    filter_complex = ";".join(filter_parts)
+            filter_parts.append(
+                f"{prev_label}[{i}:v]xfade=transition={ffmpeg_transition}"
+                f":duration={trans_duration}:offset={cumulative_offset}{out_label}"
+            )
+            prev_label = out_label
+
+        filter_complex = ";".join(filter_parts)
 
     cmd = [
         "ffmpeg", "-y",
