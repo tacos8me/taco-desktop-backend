@@ -12,7 +12,7 @@ from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import config
@@ -26,6 +26,7 @@ from job_queue import (
     Job, JobStatus, JobType, JobStore, make_job_id, make_flux_callback,
     worker_loop, cleanup_loop,
 )
+from history_store import HistoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ flux = FluxManager()
 uploads = UploadStore(config.UPLOAD_DIR)
 lora_registry = LoRARegistry(config.LORAS_DIR)
 chat = ChatManager()
+history = HistoryStore()
 
 # Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
 # when Flux and LTX run CUDA inference concurrently in the same process.
@@ -101,7 +103,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("Chat proxy ready.")
 
     worker_task = asyncio.create_task(
-        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads),
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history),
         name="queue-worker",
     )
     cleanup_task = asyncio.create_task(
@@ -217,6 +219,7 @@ class TextToImageRequest(BaseModel):
     num_inference_steps: int = Field(default=50, ge=1, le=100)
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
+    turbo: bool = False
 
 
 class ImageToImageRequest(BaseModel):
@@ -228,6 +231,7 @@ class ImageToImageRequest(BaseModel):
     num_inference_steps: int = Field(default=50, ge=1, le=100)
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
+    turbo: bool = False
 
 
 class ImageEditRequest(BaseModel):
@@ -551,6 +555,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 guidance_scale=body.guidance_scale,
                 seed=seed,
                 model=body.model,
+                turbo=body.turbo,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except Exception as exc:
@@ -580,6 +585,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 guidance_scale=body.guidance_scale,
                 seed=seed,
                 model=body.model,
+                turbo=body.turbo,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FileNotFoundError as exc:
@@ -617,6 +623,8 @@ async def image_edit(body: ImageEditRequest) -> Response:
     except Exception as exc:
         logger.exception("image-edit failed")
         return _error(500, str(exc))
+
+
 
 
 @app.post("/v1/chat/completions")
@@ -850,7 +858,7 @@ async def v2_text_to_image(body: TextToImageRequest, request: Request) -> JSONRe
     params = dict(prompt=body.prompt, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model)
+                  model=body.model, turbo=body.turbo)
     return _submit_job(JobType.TEXT_TO_IMAGE, params, request)
 
 
@@ -863,7 +871,7 @@ async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSON
     params = dict(prompt=body.prompt, image_path=image_path, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model)
+                  model=body.model, turbo=body.turbo)
     return _submit_job(JobType.IMAGE_TO_IMAGE, params, request)
 
 
@@ -896,6 +904,16 @@ async def v2_job_status(job_id: str) -> JSONResponse:
     })
 
 
+@app.get("/v2/jobs/{job_id}/preview")
+async def v2_job_preview(job_id: str) -> Response:
+    job = job_store.get(job_id)
+    if job is None:
+        return _error(404, "Job not found")
+    if not job.preview_bytes:
+        return _error(404, "No preview available")
+    return Response(content=job.preview_bytes, media_type="image/jpeg")
+
+
 @app.get("/v2/jobs/{job_id}/result")
 async def v2_job_result(job_id: str) -> Response:
     job = job_store.get(job_id)
@@ -925,6 +943,304 @@ async def v2_cancel_job(job_id: str) -> JSONResponse:
         return _error(409, "Cannot cancel a finished job")
     job.status = JobStatus.CANCELLED
     return JSONResponse(content={"job_id": job.id, "status": "cancelled"})
+
+
+# ---------------------------------------------------------------------------
+# SSE session tokens (short-lived, keeps API key out of URLs)
+# ---------------------------------------------------------------------------
+
+_sse_tokens: dict[str, tuple[str, float]] = {}  # token → (api_key, expires_at)
+
+
+@app.post("/v1/sse-token")
+async def create_sse_token(request: Request) -> JSONResponse:
+    """Issue a 5-minute disposable token for SSE EventSource connections."""
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    import time as _time
+    token = _secrets.token_urlsafe(32)
+    _sse_tokens[token] = (api_key, _time.time() + 300)
+    # Prune expired tokens
+    now = _time.time()
+    expired = [t for t, (_, exp) in _sse_tokens.items() if exp < now]
+    for t in expired:
+        del _sse_tokens[t]
+    return JSONResponse(content={"token": token, "expires_in": 300})
+
+
+def _resolve_sse_token(token: str | None) -> str | None:
+    """Resolve an SSE token to its API key, or None if invalid/expired."""
+    if not token:
+        return None
+    import time as _time
+    entry = _sse_tokens.get(token)
+    if not entry:
+        return None
+    api_key, expires_at = entry
+    if _time.time() > expires_at:
+        del _sse_tokens[token]
+        return None
+    return api_key
+
+
+# ---------------------------------------------------------------------------
+# Approved Images (noodle-i → noodle-v pipeline)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/approved-images")
+async def approve_image(request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    body = await request.json()
+    image_uri = body.get("image_uri")
+    if not image_uri:
+        return _error(400, "Missing image_uri")
+
+    import json, hashlib, time as _time
+    config.APPROVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
+    raw = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
+    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+
+    entry = {
+        "id": hashlib.sha256(f"{image_uri}{_time.time()}".encode()).hexdigest()[:16],
+        "image_uri": image_uri,
+        "prompt": body.get("prompt", ""),
+        "model": body.get("model", ""),
+        "width": body.get("width", 0),
+        "height": body.get("height", 0),
+        "api_key_hash": hashlib.sha256(api_key.encode()).hexdigest(),
+        "created_at": _time.time(),
+    }
+    manifest.insert(0, entry)
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    return JSONResponse(content={"id": entry["id"], "status": "approved"}, status_code=201)
+
+
+@app.get("/v1/approved-images")
+async def list_approved_images(request: Request, limit: int = 50, offset: int = 0) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+
+    import json
+    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return JSONResponse(content=[])
+
+    raw = json.loads(manifest_path.read_text())
+    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+    page = manifest[offset : offset + limit]
+
+    results = []
+    for e in page:
+        r = {k: v for k, v in e.items() if k != "api_key_hash"}
+        r["image_url"] = f"/v1/approved-images/{e['id']}/file"
+        results.append(r)
+    return JSONResponse(content=results)
+
+
+@app.get("/v1/approved-images/events")
+async def approved_images_events(request: Request, token: str | None = None) -> StreamingResponse:
+    """SSE stream — emits new approved images as they arrive."""
+    api_key = _resolve_sse_token(token) or _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+
+    import json
+
+    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
+
+    async def event_stream():
+        seen_ids: set[str] = set()
+        last_mtime: float = 0
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            try:
+                if manifest_path.exists():
+                    mtime = manifest_path.stat().st_mtime
+                    if mtime != last_mtime:
+                        last_mtime = mtime
+                        raw = json.loads(manifest_path.read_text())
+                        manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+
+                        for entry in manifest:
+                            if entry["id"] not in seen_ids:
+                                seen_ids.add(entry["id"])
+                                r = {k: v for k, v in entry.items() if k != "api_key_hash"}
+                                r["image_url"] = f"/v1/approved-images/{entry['id']}/file"
+                                yield f"data: {json.dumps(r)}\n\n"
+            except Exception:
+                pass
+
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/v1/approved-images/{image_id}/file")
+async def get_approved_image_file(image_id: str, request: Request) -> Response:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+
+    import json
+    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return _error(404, "Not found")
+
+    raw = json.loads(manifest_path.read_text())
+    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+    entry = next((e for e in manifest if e["id"] == image_id), None)
+    if not entry:
+        return _error(404, "Not found")
+
+    path = uploads.resolve(entry["image_uri"])
+    if not path.exists():
+        return _error(404, "Image file not found")
+    return FileResponse(path=str(path), media_type="image/webp")
+
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v2/history")
+async def v2_history(request: Request, limit: int = 50, offset: int = 0, type: str | None = None) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    items = history.list(api_key, limit=min(limit, 200), offset=offset, job_type=type)
+    results = []
+    for item in items:
+        r = {
+            "id": item["id"],
+            "prompt": item["prompt"],
+            "model": item["model"],
+            "width": item["width"],
+            "height": item["height"],
+            "turbo": bool(item["turbo"]),
+            "status": item["status"],
+            "created_at": item["created_at"],
+            "error": item["error"],
+        }
+        if item["thumbnail_uri"]:
+            r["thumbnail_url"] = f"/v2/history/{item['id']}/thumbnail"
+        if item["result_uri"]:
+            r["image_url"] = f"/v2/history/{item['id']}/image"
+        results.append(r)
+    return JSONResponse(content=results)
+
+
+@app.get("/v2/history/{generation_id}/image")
+async def v2_history_image(generation_id: str, request: Request) -> Response:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    item = history.get(generation_id, api_key)
+    if not item or not item["result_uri"]:
+        return _error(404, "Not found")
+    path = uploads.resolve(item["result_uri"])
+    if not path.exists():
+        return _error(404, "Result file not found")
+    media_type = "video/mp4" if "video" in item.get("job_type", "") else "image/webp"
+    return FileResponse(path=str(path), media_type=media_type)
+
+
+@app.get("/v2/history/{generation_id}/thumbnail")
+async def v2_history_thumbnail(generation_id: str, request: Request) -> Response:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    item = history.get(generation_id, api_key)
+    if not item or not item["thumbnail_uri"]:
+        return _error(404, "Not found")
+    thumb_id = item["thumbnail_uri"].removeprefix("thumb://")
+    path = config.THUMBNAIL_DIR / thumb_id
+    if not path.exists():
+        return _error(404, "Thumbnail not found")
+    return FileResponse(path=str(path), media_type="image/jpeg")
+
+
+def _extract_api_key(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Compositions
+# ---------------------------------------------------------------------------
+
+from composition_store import CompositionStore
+compositions = CompositionStore()
+
+
+@app.post("/v2/compositions")
+async def v2_compositions_create(request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    body = await request.json()
+    name = body.get("name", "Untitled")
+    data = {"clips": body.get("clips", []), "transitions": body.get("transitions", [])}
+    result = compositions.create(api_key, name, data)
+    return JSONResponse(content=result, status_code=201)
+
+
+@app.get("/v2/compositions")
+async def v2_compositions_list(request: Request, limit: int = 50, offset: int = 0) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    items = compositions.list(api_key, limit=min(limit, 200), offset=offset)
+    return JSONResponse(content=items)
+
+
+@app.get("/v2/compositions/{comp_id}")
+async def v2_compositions_get(comp_id: str, request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    item = compositions.get(comp_id, api_key)
+    if not item:
+        return _error(404, "Composition not found")
+    return JSONResponse(content=item)
+
+
+@app.put("/v2/compositions/{comp_id}")
+async def v2_compositions_update(comp_id: str, request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    body = await request.json()
+    name = body.get("name", "Untitled")
+    data = {"clips": body.get("clips", []), "transitions": body.get("transitions", [])}
+    updated = compositions.update(comp_id, api_key, name, data)
+    if not updated:
+        return _error(404, "Composition not found")
+    return JSONResponse(content={"status": "updated"})
+
+
+@app.delete("/v2/compositions/{comp_id}")
+async def v2_compositions_delete(comp_id: str, request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    deleted = compositions.delete(comp_id, api_key)
+    if not deleted:
+        return _error(404, "Composition not found")
+    return JSONResponse(content={"status": "deleted"})
 
 
 # ---------------------------------------------------------------------------
