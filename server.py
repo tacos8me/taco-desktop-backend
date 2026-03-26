@@ -82,6 +82,11 @@ async def _dispatch_job(job: Job) -> bytes:
         case JobType.IMAGE_EDIT:
             cb = make_flux_callback(job, p.get("num_inference_steps", 4))
             return await flux.generate_image_edit(**p, callback_on_step_end=cb)
+        case JobType.EXPORT_COMPOSITION:
+            from export_handler import export_composition
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: export_composition(p["clips"], p["transitions"], uploads)
+            )
         case _:
             raise ValueError(f"Unknown job type: {job.type}")
 
@@ -1241,6 +1246,22 @@ async def v2_compositions_delete(comp_id: str, request: Request) -> JSONResponse
     if not deleted:
         return _error(404, "Composition not found")
     return JSONResponse(content={"status": "deleted"})
+
+
+@app.post("/v2/compositions/{comp_id}/export")
+async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    comp = compositions.get(comp_id, api_key)
+    if not comp:
+        return _error(404, "Composition not found")
+    params = {
+        "composition_id": comp_id,
+        "clips": comp["data"].get("clips", []),
+        "transitions": comp["data"].get("transitions", []),
+    }
+    return _submit_job(JobType.EXPORT_COMPOSITION, params, request)
 
 
 # ---------------------------------------------------------------------------

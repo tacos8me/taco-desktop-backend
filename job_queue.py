@@ -36,6 +36,7 @@ class JobType(StrEnum):
     TEXT_TO_IMAGE = "text-to-image"
     IMAGE_TO_IMAGE = "image-to-image"
     IMAGE_EDIT = "image-edit"
+    EXPORT_COMPOSITION = "export-composition"
 
 
 _MEDIA_TYPES: dict[JobType, str] = {
@@ -46,6 +47,7 @@ _MEDIA_TYPES: dict[JobType, str] = {
     JobType.TEXT_TO_IMAGE: "image/webp",
     JobType.IMAGE_TO_IMAGE: "image/webp",
     JobType.IMAGE_EDIT: "image/webp",
+    JobType.EXPORT_COMPOSITION: "video/mp4",
 }
 
 
@@ -66,6 +68,7 @@ class Job:
     result_media_type: str | None = None
     error: str | None = None
     error_code: str | None = None
+    preview_bytes: bytes | None = None
 
 
 class JobStore:
@@ -156,6 +159,7 @@ async def worker_loop(
     inference_lock: asyncio.Lock,
     dispatch_fn: Callable,
     uploads: UploadStore,
+    history: "HistoryStore | None" = None,
 ) -> None:
     """Background worker that processes jobs from the queue."""
     logger.info("Queue worker started")
@@ -170,6 +174,7 @@ async def worker_loop(
         job.started_at = time.monotonic()
         logger.info("Processing job %s (%s)", job.id, job.type)
 
+        result_bytes: bytes | None = None
         try:
             async with inference_lock:
                 result_bytes = await dispatch_fn(job)
@@ -192,11 +197,33 @@ async def worker_loop(
 
         finally:
             job.completed_at = time.monotonic()
+            # Persist to history DB
+            if history and job.api_key:
+                try:
+                    params = job.params or {}
+                    history.save(
+                        job_id=job.id,
+                        api_key=job.api_key,
+                        job_type=job.type,
+                        prompt=params.get("prompt", ""),
+                        model=params.get("model"),
+                        width=params.get("width", 0),
+                        height=params.get("height", 0),
+                        turbo=params.get("turbo", False),
+                        status=job.status,
+                        result_uri=job.result_uri,
+                        result_bytes=result_bytes,
+                        created_at=time.time(),
+                        completed_at=time.time() if job.completed_at else None,
+                        error=job.error,
+                    )
+                except Exception:
+                    logger.warning("Failed to save job %s to history", job.id, exc_info=True)
             queue.task_done()
 
 
 async def cleanup_loop(job_store: JobStore, uploads: UploadStore) -> None:
-    """Periodically remove expired jobs and their result files."""
+    """Periodically remove expired job metadata. Result files for completed jobs are kept (managed by history store)."""
     ttl = config.JOB_RESULT_TTL_SECONDS
     logger.info("Cleanup loop started (TTL=%ds)", ttl)
     while True:
@@ -210,7 +237,8 @@ async def cleanup_loop(job_store: JobStore, uploads: UploadStore) -> None:
 
         for job_id in to_remove:
             job = job_store.get(job_id)
-            if job and job.result_uri:
+            if job and job.result_uri and job.status != JobStatus.COMPLETED:
+                # Only delete result files for failed/cancelled jobs — completed results are managed by history
                 upload_id = job.result_uri.removeprefix("storage://")
                 path = uploads.base_dir / upload_id
                 path.unlink(missing_ok=True)
