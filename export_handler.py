@@ -111,7 +111,7 @@ def export_composition(
         *inputs,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:v", "libopenh264",
         str(output_path),
     ]
 
@@ -119,9 +119,13 @@ def export_composition(
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
     if result.returncode != 0:
-        logger.error("FFmpeg stderr: %s", result.stderr[-500:])
+        # Get the actual error from the end of stderr (skip version banner)
+        err_lines = [l for l in result.stderr.splitlines() if l.strip() and not l.startswith("  ")]
+        err_msg = "\n".join(err_lines[-5:]) if err_lines else result.stderr[-300:]
+        logger.error("FFmpeg failed:\n%s", err_msg)
+        logger.error("FFmpeg command: %s", " ".join(cmd))
         output_path.unlink(missing_ok=True)
-        raise RuntimeError(f"FFmpeg failed: {result.stderr[:500]}")
+        raise RuntimeError(f"FFmpeg failed: {err_msg[:300]}")
 
     video_bytes = output_path.read_bytes()
     output_path.unlink(missing_ok=True)
