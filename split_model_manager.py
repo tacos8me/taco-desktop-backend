@@ -219,14 +219,22 @@ class DenoiserWorker:
 
 DECODE_TILING = TilingConfig(
     spatial_config=None,
-    temporal_config=TemporalTilingConfig(tile_size_in_frames=64, tile_overlap_in_frames=24),
+    temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=32),
 )
+
+# No tiling for short videos — single-pass decode, zero tile boundaries, zero artifacts
+SHORT_VIDEO_THRESHOLD = 120  # frames (5s @ 24fps)
+
+
+def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
+    """Skip tiling for short videos to avoid temporal boundary artifacts."""
+    return None if num_frames <= SHORT_VIDEO_THRESHOLD else DECODE_TILING
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
     # Can't use BytesIO here: encode_video calls av.open(path, mode="w") without
     # format= kwarg, so PyAV can't infer the container format from a file-like object.
-    video_chunks_number = get_video_chunks_number(num_frames, DECODE_TILING)
+    video_chunks_number = get_video_chunks_number(num_frames, _get_decode_tiling(num_frames))
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -484,7 +492,7 @@ class SplitModelManager:
         gc.collect()
 
         # Decode
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -582,7 +590,7 @@ class SplitModelManager:
         gc.collect()
 
         # Decode
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -692,7 +700,7 @@ class SplitModelManager:
         worker.evict_transformer()
         gc.collect()
 
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -789,7 +797,7 @@ class SplitModelManager:
         gc.collect()
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
@@ -912,7 +920,7 @@ class SplitModelManager:
         worker.evict_transformer()
         gc.collect()
 
-        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), DECODE_TILING, generator)
+        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
 
