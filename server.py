@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import torch
 import logging
 import random
 import secrets as _secrets
@@ -66,25 +67,32 @@ async def _dispatch_job(job: Job) -> bytes:
 
     match job.type:
         case JobType.TEXT_TO_VIDEO:
+            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_text_to_video(**p, on_progress=on_progress)
         case JobType.IMAGE_TO_VIDEO:
+            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_image_to_video(**p, on_progress=on_progress)
         case JobType.AUDIO_TO_VIDEO:
+            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_audio_to_video(**p, on_progress=on_progress)
         case JobType.RETAKE:
+            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.retake(**p, on_progress=on_progress)
         case JobType.TEXT_TO_IMAGE:
+            torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_text_to_image(**p, callback_on_step_end=cb)
         case JobType.IMAGE_TO_IMAGE:
+            torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_image_to_image(**p, callback_on_step_end=cb)
         case JobType.IMAGE_EDIT:
+            torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 4))
             return await flux.generate_image_edit(**p, callback_on_step_end=cb)
         case JobType.EXPORT_COMPOSITION:
             from export_handler import export_composition
-            return await asyncio.get_event_loop().run_in_executor(
+            return await asyncio.get_running_loop().run_in_executor(
                 None, lambda: export_composition(p["clips"], p["transitions"], uploads)
             )
         case _:
@@ -137,7 +145,7 @@ app.add_middleware(
 async def check_api_key(request: Request, call_next):
     if not config.API_KEYS:
         return await call_next(request)
-    if request.url.path == "/health":
+    if request.url.path in ("/health", "/v1/approved-images/events"):
         return await call_next(request)
 
     auth = request.headers.get("Authorization", "")
@@ -405,6 +413,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
         prompt = _build_prompt(body.prompt, body.camera_motion)
         seed = random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
             video_bytes = await manager.generate_text_to_video(
                 prompt=prompt,
@@ -442,6 +451,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         num_frames = _duration_to_frames(body.duration, body.fps)
         seed = random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
@@ -484,6 +494,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
         num_frames = _duration_to_frames(body.duration, body.fps)
         seed = random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
             video_bytes = await manager.generate_audio_to_video(
                 prompt=body.prompt,
@@ -521,6 +532,7 @@ async def retake(body: RetakeRequest) -> Response:
         prompt = body.prompt or ""
         seed = random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
             video_bytes = await manager.retake(
                 video_path=video_path,
@@ -551,6 +563,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
         height = (body.height // 16) * 16
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.FLUX_DEVICE)
         async with _inference_lock:
             image_bytes = await flux.generate_text_to_image(
                 prompt=body.prompt,
@@ -580,6 +593,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         height = (body.height // 16) * 16
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.FLUX_DEVICE)
         async with _inference_lock:
             image_bytes = await flux.generate_image_to_image(
                 prompt=body.prompt,
@@ -612,6 +626,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
         height = (body.height // 16) * 16
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
+        torch.cuda.set_device(config.FLUX_DEVICE)
         async with _inference_lock:
             image_bytes = await flux.generate_image_edit(
                 prompt=body.prompt,
