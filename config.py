@@ -84,4 +84,4 @@ PORT = 8090
 import torch
 torch.backends.cuda.matmul.allow_tf32 = False  # Full float32 precision for VAE decode
 torch.backends.cudnn.allow_tf32 = False         # Full float32 precision for VAE convolutions
-# torch.backends.cudnn.deterministic = True  # DISABLED — causes CUDA illegal memory access with Conv3d bf16
+torch.backends.cudnn.deterministic = True  # Stable algorithm selection
