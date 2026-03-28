@@ -432,6 +432,7 @@ class SplitModelManager:
             s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
+                nonlocal transformer
                 # Pass 1: dev + LoRA 0.2 with CFG=3 (first 4 steps)
                 sigmas_1 = sigmas[:split_at + 1]
                 params = _DEV_PARAMS
@@ -444,7 +445,6 @@ class SplitModelManager:
                 video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_1)
 
                 # Swap to distilled for pass 2
-                nonlocal transformer
                 worker.ensure_transformer("distilled", user_lora=user_lora)
                 transformer = worker.ledger.transformer()
 
