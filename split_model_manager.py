@@ -496,11 +496,7 @@ class SplitModelManager:
         gc.collect()
 
         # Decode
-        # Float32 VAE decode for precision (bf16 compounds rounding over 20+ conv layers)
-        _decoder = worker.ledger.video_decoder()
-        _decoder.float()
-        decoded_video = vae_decode_video(video_latent.float(), _decoder, _get_decode_tiling(num_frames), generator)
-        _decoder.bfloat16()
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -598,11 +594,7 @@ class SplitModelManager:
         gc.collect()
 
         # Decode
-        # Float32 VAE decode for precision (bf16 compounds rounding over 20+ conv layers)
-        _decoder = worker.ledger.video_decoder()
-        _decoder.float()
-        decoded_video = vae_decode_video(video_latent.float(), _decoder, _get_decode_tiling(num_frames), generator)
-        _decoder.bfloat16()
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -712,11 +704,7 @@ class SplitModelManager:
         worker.evict_transformer()
         gc.collect()
 
-        # Float32 VAE decode for precision (bf16 compounds rounding over 20+ conv layers)
-        _decoder = worker.ledger.video_decoder()
-        _decoder.float()
-        decoded_video = vae_decode_video(video_latent.float(), _decoder, _get_decode_tiling(num_frames), generator)
-        _decoder.bfloat16()
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -813,11 +801,7 @@ class SplitModelManager:
         gc.collect()
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
-        # Float32 VAE decode for precision (bf16 compounds rounding over 20+ conv layers)
-        _decoder = worker.ledger.video_decoder()
-        _decoder.float()
-        decoded_video = vae_decode_video(video_latent.float(), _decoder, _get_decode_tiling(num_frames), generator)
-        _decoder.bfloat16()
+        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
@@ -940,11 +924,7 @@ class SplitModelManager:
         worker.evict_transformer()
         gc.collect()
 
-        # Float32 VAE decode for precision
-        _decoder = worker.ledger.video_decoder()
-        _decoder.float()
-        decoded_video = vae_decode_video(video_state.latent.float(), _decoder, _get_decode_tiling(num_frames), generator)
-        _decoder.bfloat16()
+        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
 
