@@ -1047,14 +1047,16 @@ async def list_approved_images(request: Request, limit: int = 50, offset: int = 
     if not api_key:
         return _error(401, "Missing API key")
 
-    import json
+    import json, hashlib
     manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
     if not manifest_path.exists():
         return JSONResponse(content=[])
 
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     raw = json.loads(manifest_path.read_text())
     manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
-    page = manifest[offset : offset + limit]
+    filtered = [e for e in manifest if e.get("api_key_hash") == key_hash]
+    page = filtered[offset : offset + limit]
 
     results = []
     for e in page:
