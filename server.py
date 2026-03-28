@@ -1073,8 +1073,9 @@ async def approved_images_events(request: Request, token: str | None = None) -> 
     if not api_key:
         return _error(401, "Missing API key")
 
-    import json
+    import json, hashlib
 
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
 
     async def event_stream():
@@ -1092,8 +1093,9 @@ async def approved_images_events(request: Request, token: str | None = None) -> 
                         last_mtime = mtime
                         raw = json.loads(manifest_path.read_text())
                         manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+                        filtered = [e for e in manifest if e.get("api_key_hash") == key_hash]
 
-                        for entry in manifest:
+                        for entry in filtered:
                             if entry["id"] not in seen_ids:
                                 seen_ids.add(entry["id"])
                                 r = {k: v for k, v in entry.items() if k != "api_key_hash"}
@@ -1114,14 +1116,15 @@ async def get_approved_image_file(image_id: str, request: Request) -> Response:
     if not api_key:
         return _error(401, "Missing API key")
 
-    import json
+    import json, hashlib
     manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
     if not manifest_path.exists():
         return _error(404, "Not found")
 
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     raw = json.loads(manifest_path.read_text())
     manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
-    entry = next((e for e in manifest if e["id"] == image_id), None)
+    entry = next((e for e in manifest if e["id"] == image_id and e.get("api_key_hash") == key_hash), None)
     if not entry:
         return _error(404, "Not found")
 
