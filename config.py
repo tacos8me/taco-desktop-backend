@@ -52,8 +52,21 @@ FLUX_MODELS = {
 }
 HF_CACHE_DIR = "/mnt/nvme-1/huggingface/hub"
 
+# Turbo LoRA (fal.ai FLUX.2-dev-Turbo — 8-step distilled)
+FLUX_TURBO_LORA = "fal/FLUX.2-dev-Turbo"
+FLUX_TURBO_LORA_WEIGHT = "flux.2-turbo-lora.safetensors"
+FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.00031]
+
 # Upload storage
 UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")
+
+# Approved images (curated feed from noodle-i for noodle-v)
+APPROVED_IMAGES_DIR = Path("/mnt/nvme-1/servers/taco-backend/approved-images")
+
+# Generation history
+HISTORY_DB = Path("/mnt/nvme-1/servers/taco-backend/history.db")
+HISTORY_RETENTION_DAYS = 30
+THUMBNAIL_DIR = Path("/mnt/nvme-1/servers/taco-backend/thumbnails")
 
 # LoRA storage
 LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/loras")
@@ -69,5 +82,6 @@ PORT = 8090
 
 # PyTorch performance settings
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = False  # Full float32 precision for VAE decode
+torch.backends.cudnn.allow_tf32 = False         # Full float32 precision for VAE convolutions
+torch.backends.cudnn.deterministic = True        # Stable algorithm selection — no spatial artifacts from cuDNN
