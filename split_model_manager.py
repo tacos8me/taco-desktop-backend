@@ -225,8 +225,7 @@ DECODE_TILING = TilingConfig(
 # No tiling for short videos — single-pass decode, zero tile boundaries, zero artifacts
 SHORT_VIDEO_THRESHOLD = 120  # frames (5s @ 24fps)
 
-# Stage 2 sigma schedule — 5 steps for better refinement (original was 3)
-STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.8, 0.65, 0.45, 0.25, 0.0]
+# Stage 2 uses imported default: STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
 def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
