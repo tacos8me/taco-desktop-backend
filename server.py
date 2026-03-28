@@ -195,6 +195,7 @@ class KeyframeInput(BaseModel):
 class ImageToVideoRequest(BaseModel):
     prompt: str = Field(max_length=10000)
     image_uri: str | None = None
+    image_strength: float = Field(default=0.85, ge=0.0, le=1.0)
     keyframes: list[KeyframeInput] | None = None
     model: ModelName
     resolution: Resolution
@@ -303,7 +304,7 @@ def _resolve_keyframes(body: ImageToVideoRequest) -> list[dict] | JSONResponse:
         return keyframe_inputs
     elif body.image_uri:
         path = str(uploads.resolve(body.image_uri))
-        return [{"image_path": path, "frame_index": 0, "strength": 1.0}]
+        return [{"image_path": path, "frame_index": 0, "strength": body.image_strength}]
     else:
         return _error(422, "Either image_uri or keyframes is required")
 
