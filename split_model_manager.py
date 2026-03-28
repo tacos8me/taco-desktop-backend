@@ -180,6 +180,12 @@ class DenoiserWorker:
                 sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
             )
             checkpoint, loras = config.DEV_CHECKPOINT, (distilled_lora,)
+        elif state == "dev_lora_020":
+            distilled_lora = LoraPathStrengthAndSDOps(
+                path=config.DISTILLED_LORA, strength=0.2,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+            checkpoint, loras = config.DEV_CHECKPOINT, (distilled_lora,)
         else:
             raise ValueError(f"Unknown transformer state: {state}")
 
@@ -400,19 +406,14 @@ class SplitModelManager:
         dtype = torch.bfloat16
         is_fast = model == "ltx-2-3-fast"
 
-        worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
+        # For fast model: start with dev+low LoRA for first pass (Reddit audio fix)
+        worker.ensure_transformer("dev_lora_020" if is_fast else "dev", user_lora=user_lora)
 
-        # Text encoding on GPU:0 (shared encoder)
-        if is_fast:
-            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger)
-            (ctx_p,) = self._contexts_to_device([ctx_p], device)
-            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-            v_context_n, a_context_n = None, None
-        else:
-            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
-            ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
-            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-            v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        # Text encoding — always encode negative for CFG (fast model now uses CFG in first pass)
+        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+        ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -427,13 +428,32 @@ class SplitModelManager:
 
         if is_fast:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+            split_at = 4  # Reddit audio fix: split schedule at step 4
             s1_steps = len(sigmas) - 1
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
-                dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+                # Pass 1: dev + LoRA 0.2 with CFG=3 (first 4 steps)
+                sigmas_1 = sigmas[:split_at + 1]
+                params = _DEV_PARAMS
+                dfn_1 = multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                    audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
+                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
                 if on_progress:
-                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
+                    dfn_1 = self._wrap_denoise(dfn_1, on_progress, s1_steps, offset=0.0, scale=0.35)
+                video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_1)
+
+                # Swap to distilled for pass 2
+                nonlocal transformer
+                worker.ensure_transformer("distilled", user_lora=user_lora)
+                transformer = worker.ledger.transformer()
+
+                # Pass 2: distilled with simple denoise (last 4 steps)
+                sigmas_2 = sigmas[split_at:]
+                dfn_2 = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn_2 = self._wrap_denoise(dfn_2, on_progress, s1_steps, offset=0.35, scale=0.35)
+                return euler_denoising_loop(sigmas=sigmas_2, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_2)
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
