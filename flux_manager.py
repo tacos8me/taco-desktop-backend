@@ -39,7 +39,7 @@ class FluxManager:
         return self._pipe is not None
 
     def load(self, model_name: str = "flux2-dev") -> None:
-        """Load a Flux pipeline with FP8 transformer."""
+        """Load a Flux pipeline. Dev model uses fused Turbo LoRA + FP8 layerwise casting."""
         from diffusers.models import Flux2Transformer2DModel
 
         model_repo = config.FLUX_MODELS[model_name]
@@ -50,8 +50,6 @@ class FluxManager:
 
         if model_name == "flux2-klein":
             from diffusers import Flux2KleinPipeline
-            # Klein repo has single safetensors at root + sharded index in transformer/
-            # but shards are gated. Load transformer from the single file instead.
             klein_ckpt, klein_snap = self._resolve_klein_checkpoint()
             transformer = Flux2Transformer2DModel.from_single_file(
                 klein_ckpt, torch_dtype=torch.bfloat16,
@@ -67,15 +65,22 @@ class FluxManager:
             )
         else:
             from diffusers import Flux2Pipeline
-            transformer = Flux2Transformer2DModel.from_pretrained(
-                model_repo, subfolder="transformer", **_load_kw,
-            )
-            transformer.enable_layerwise_casting(
+            pipe = Flux2Pipeline.from_pretrained(model_repo, **_load_kw)
+            # Fuse Turbo LoRA into base weights, then apply FP8 casting
+            try:
+                pipe.load_lora_weights(
+                    config.FLUX_TURBO_LORA,
+                    weight_name=config.FLUX_TURBO_LORA_WEIGHT,
+                    cache_dir=config.HF_CACHE_DIR,
+                )
+                pipe.fuse_lora()
+                pipe.unload_lora_weights()
+                logger.info("Turbo LoRA fused into base weights")
+            except Exception:
+                logger.warning("Turbo LoRA not available", exc_info=True)
+            pipe.transformer.enable_layerwise_casting(
                 storage_dtype=torch.float8_e4m3fn,
                 compute_dtype=torch.bfloat16,
-            )
-            pipe = Flux2Pipeline.from_pretrained(
-                model_repo, transformer=transformer, **_load_kw,
             )
 
         pipe = pipe.to(self._device)
@@ -84,6 +89,15 @@ class FluxManager:
 
         elapsed = time.monotonic() - t0
         logger.info("%s loaded in %.1fs on %s", model_name, elapsed, self._device)
+
+    def _resolve_dev_snapshot(self):
+        """Find the FLUX.2-dev snapshot dir in HF cache (needed for transformer config)."""
+        from pathlib import Path
+        model_dir = Path(config.HF_CACHE_DIR) / "models--black-forest-labs--FLUX.2-dev" / "snapshots"
+        for snap_dir in model_dir.iterdir():
+            if (snap_dir / "transformer" / "config.json").exists():
+                return snap_dir
+        raise FileNotFoundError("FLUX.2-dev snapshot not found in HF cache")
 
     def _resolve_klein_checkpoint(self) -> tuple:
         """Find the Klein single-file checkpoint in the HF cache. Returns (ckpt_path, snapshot_dir)."""
@@ -125,7 +139,8 @@ class FluxManager:
     def _generate(
         self, prompt: str, width: int, height: int,
         num_inference_steps: int, guidance_scale: float, seed: int,
-        model: str = "flux2-dev", callback_on_step_end: object = None,
+        model: str = "flux2-dev", turbo: bool = False,
+        callback_on_step_end: object = None,
     ) -> bytes:
         """Generate an image (txt2img) and return WEBP bytes."""
         self.ensure_model(model)
@@ -136,8 +151,13 @@ class FluxManager:
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale, generator=generator,
         )
+        if turbo and model == "flux2-dev":
+            kwargs["sigmas"] = config.FLUX_TURBO_SIGMAS
+            kwargs["num_inference_steps"] = 8
+            kwargs["guidance_scale"] = 2.5
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
+            kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
         try:
             result = self._pipe(**kwargs)
@@ -152,7 +172,8 @@ class FluxManager:
     def _img2img(
         self, prompt: str, image_path: str, width: int, height: int,
         num_inference_steps: int, guidance_scale: float, seed: int,
-        model: str = "flux2-dev", callback_on_step_end: object = None,
+        model: str = "flux2-dev", turbo: bool = False,
+        callback_on_step_end: object = None,
     ) -> bytes:
         """Edit an image using single reference."""
         self.ensure_model(model)
@@ -164,8 +185,13 @@ class FluxManager:
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale, generator=generator,
         )
+        if turbo and model == "flux2-dev":
+            kwargs["sigmas"] = config.FLUX_TURBO_SIGMAS
+            kwargs["num_inference_steps"] = 8
+            kwargs["guidance_scale"] = 2.5
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
+            kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
         try:
             result = self._pipe(**kwargs)

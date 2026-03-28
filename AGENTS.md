@@ -8,7 +8,7 @@ Identified via full codebase audit (2026-03-14). Items grouped by tier.
 
 1. **`CUDA_MODULE_LOADING=LAZY` in run.sh** — 20-40s faster cold start
 2. **CRF 18 + preset fast on encode_video** — patch media_io.py:205, current CRF 23/medium is slow and soft
-3. **Flux PNG → WEBP output** — flux_manager.py:116,156, 10-30x faster encoding, 4-8x smaller
+3. ~~**Flux PNG → WEBP output**~~ — DONE (quality 95)
 4. **FileResponse for v2 results** — server.py job result endpoint, saves ~300MB RAM per fetch
 5. **Cache detect_params at module level** — split_model_manager.py, eliminates 4 safetensors header reads/request
 6. **Atomic LoRA registry write** — lora_registry.py:60, write-to-temp-then-rename
@@ -21,7 +21,7 @@ Identified via full codebase audit (2026-03-14). Items grouped by tier.
 10. **Cache negative prompt embeddings** — cache ctx_n for DEFAULT_NEGATIVE_PROMPT, saves ~0.2s/request
 11. **Remove redundant cleanup_memory() after evict** — replace 5 post-evict cleanup_memory() with gc.collect()
 12. **AAC audio bitrate 128k → 192k** — media_io.py audio stream
-13. **TF32 + cudnn.allow_tf32 at startup** — explicit torch.backends settings
+13. ~~**TF32 + cudnn.allow_tf32 at startup**~~ — REVERSED: TF32 now DISABLED. Was degrading VAE decode quality on Blackwell (VAE uses force_upcast=True expecting real float32, TF32 reduced mantissa 23→10 bits)
 14. **BytesIO for encode_video** — eliminate temp file disk I/O in _video_to_bytes (~100ms/gen)
 
 ### Tier 3 — Experimental / Higher Effort
