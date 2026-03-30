@@ -145,7 +145,9 @@ app.add_middleware(
 async def check_api_key(request: Request, call_next):
     if not config.API_KEYS:
         return await call_next(request)
-    if request.url.path in ("/health", "/v1/approved-images/events"):
+    if request.url.path in ("/health", "/v1/approved-images/events",
+                              "/v1/system/pause", "/v1/system/resume",
+                              "/v1/flux/unload", "/v1/flux/reload"):
         return await call_next(request)
 
     auth = request.headers.get("Authorization", "")
@@ -396,6 +398,36 @@ async def system_resume() -> dict:
     except Exception:
         logger.exception("Resume failed — system remains paused")
         return JSONResponse(status_code=500, content={"error": "resume_failed", "status": "paused"})
+
+
+@app.post("/v1/flux/unload")
+async def flux_unload() -> dict:
+    """Unload Flux model from GPU0 to free VRAM for external vision models."""
+    if not flux.is_ready:
+        return {"status": "already_unloaded"}
+    try:
+        async with _inference_lock:
+            flux.unload()
+        logger.info("Flux unloaded from GPU0")
+        return {"status": "unloaded"}
+    except Exception:
+        logger.exception("Flux unload failed")
+        return JSONResponse(status_code=500, content={"error": "flux_unload_failed"})
+
+
+@app.post("/v1/flux/reload")
+async def flux_reload() -> dict:
+    """Reload Flux model to GPU0."""
+    if flux.is_ready:
+        return {"status": "already_loaded"}
+    try:
+        async with _inference_lock:
+            flux.load()
+        logger.info("Flux reloaded to GPU0")
+        return {"status": "loaded"}
+    except Exception:
+        logger.exception("Flux reload failed")
+        return JSONResponse(status_code=500, content={"error": "flux_reload_failed"})
 
 
 @app.post("/v1/text-to-video")

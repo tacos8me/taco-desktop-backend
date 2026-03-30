@@ -444,6 +444,12 @@ class SplitModelManager:
                     dfn_1 = self._wrap_denoise(dfn_1, on_progress, s1_steps, offset=0.0, scale=0.35)
                 video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_1)
 
+                # Free pass 1 model + activations before loading pass 2
+                del dfn_1
+                worker.evict_transformer()
+                gc.collect()
+                torch.cuda.empty_cache()
+
                 # Swap to distilled for pass 2
                 worker.ensure_transformer("distilled", user_lora=user_lora)
                 transformer = worker.ledger.transformer()
