@@ -243,12 +243,11 @@ class DenoiserWorker:
 # ---------------------------------------------------------------------------
 
 DECODE_TILING = TilingConfig(
-    spatial_config=SpatialTilingConfig(tile_size_in_pixels=512, tile_overlap_in_pixels=64),
+    spatial_config=None,
     temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=32),
 )
 
-# Always tile — at 1080p+ the Conv3d workspace allocation exceeds free VRAM without spatial tiling
-SHORT_VIDEO_THRESHOLD = 0  # always tile
+SHORT_VIDEO_THRESHOLD = 0  # always use tiling
 
 # Stage 2 uses imported default: STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 

@@ -6,8 +6,8 @@ cd "$(dirname "$0")"
 VENV_NVIDIA=".venv/lib/python3.13/site-packages/nvidia"
 export LD_LIBRARY_PATH="${VENV_NVIDIA}/cudnn/lib:${VENV_NVIDIA}/cu13/lib:${VENV_NVIDIA}/cuda_nvrtc/lib:${LD_LIBRARY_PATH:-}"
 
-# Reduce CUDA memory fragmentation
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Reduce CUDA memory fragmentation (PYTORCH_CUDA_ALLOC_CONF deprecated in torch 2.9+)
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Lazy-load CUDA modules (faster startup, lower memory)
 export CUDA_MODULE_LOADING=LAZY
