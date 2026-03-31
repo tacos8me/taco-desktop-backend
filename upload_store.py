@@ -4,7 +4,7 @@ from pathlib import Path
 
 _VALID_ID = re.compile(r"^[0-9a-f]{32}$")
 
-MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
 
 
 class UploadStore:

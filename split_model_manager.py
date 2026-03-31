@@ -83,12 +83,25 @@ class CachingModelLedger:
     When pipeline code calls ``ledger.transformer()`` then ``del transformer``,
     the cached reference keeps the model alive on GPU.  ``cleanup_memory()``
     frees allocator cache but not the weights themselves.
+
+    Models not pre-cached (decoders, upsampler, vocoder) are loaded on-demand
+    from ``_source_ledger`` to keep baseline VRAM low.
     """
 
-    def __init__(self, device: torch.device, cache: dict[str, object]) -> None:
+    def __init__(self, device: torch.device, cache: dict[str, object],
+                 source_ledger: object = None) -> None:
         self.device = device
         self.dtype = torch.bfloat16
         self._cache = cache
+        self._source_ledger = source_ledger
+
+    def _lazy(self, key: str, loader_name: str):
+        val = self._cache.get(key)
+        if val is None and self._source_ledger is not None:
+            logger.info("Lazy-loading %s on %s", key, self.device)
+            val = getattr(self._source_ledger, loader_name)()
+            self._cache[key] = val
+        return val
 
     def text_encoder(self):
         return self._cache["text_encoder"]
@@ -97,25 +110,25 @@ class CachingModelLedger:
         return self._cache["embeddings_processor"]
 
     def video_encoder(self):
-        return self._cache["video_encoder"]
+        return self._lazy("video_encoder", "video_encoder")
 
     def audio_encoder(self):
         return self._cache["audio_encoder"]
 
     def transformer(self):
-        return self._cache["transformer"]
+        return self._cache.get("transformer")
 
     def spatial_upsampler(self):
-        return self._cache["spatial_upsampler"]
+        return self._lazy("spatial_upsampler", "spatial_upsampler")
 
     def video_decoder(self):
-        return self._cache["video_decoder"]
+        return self._lazy("video_decoder", "video_decoder")
 
     def audio_decoder(self):
-        return self._cache["audio_decoder"]
+        return self._lazy("audio_decoder", "audio_decoder")
 
     def vocoder(self):
-        return self._cache["vocoder"]
+        return self._lazy("vocoder", "vocoder")
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +147,7 @@ class DenoiserWorker:
     _user_lora: tuple[str, float] | None = None
     transformer: object = None
     cache: dict[str, object] = field(default_factory=dict)
+    _model_ledger: object = None  # ModelLedger for lazy-loading decoders/upsampler
 
     def evict_transformer(self) -> None:
         """Remove transformer from GPU to free VRAM for heavy operations like VAE encode."""
@@ -141,8 +155,10 @@ class DenoiserWorker:
             logger.info("Worker %s: evicting transformer (%s) to free VRAM", self.device, self.transformer_state)
             self.transformer = None
             self.cache["transformer"] = None
+            self.ledger._cache["transformer"] = None
             self.transformer_state = ""
             self._user_lora = None
+            import gc; gc.collect()
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
 
@@ -198,11 +214,13 @@ class DenoiserWorker:
             ),)
 
         # Free old transformer BEFORE loading new one to avoid OOM
-        # (both ~22GB; GPU:0 has ~72GB baseline, can't hold two)
+        # Must clear BOTH self.transformer AND ledger._cache (separate dicts!)
         old = self.transformer
         self.transformer = None
         self.cache["transformer"] = None
+        self.ledger._cache["transformer"] = None
         del old
+        import gc; gc.collect()
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
 
@@ -214,6 +232,7 @@ class DenoiserWorker:
         new_transformer = ledger.transformer()
         self.transformer = new_transformer
         self.cache["transformer"] = new_transformer
+        self.ledger._cache["transformer"] = new_transformer
         self.transformer_state = state
         self._user_lora = user_lora
         logger.info("Worker %s: transformer now %s", self.device, state)
@@ -323,6 +342,9 @@ class SplitModelManager:
         self._encoder_ledger = CachingModelLedger(devices[0], encoder_cache)
 
         # --- Denoiser worker on each GPU ---
+        # Only pre-load transformer + video_encoder on GPU. Decoders/upsampler
+        # are loaded on-demand (after transformer is evicted, freeing ~44GB).
+        # This keeps baseline at ~50GB instead of ~70GB, leaving room for inference.
         for device in devices:
             logger.info("Loading denoiser worker on %s ...", device)
             den_ledger = ModelLedger(
@@ -338,14 +360,11 @@ class SplitModelManager:
             cache = {
                 "transformer": transformer,
                 "video_encoder": vid_enc,
-                "spatial_upsampler": den_ledger.spatial_upsampler(),
-                "video_decoder": den_ledger.video_decoder(),
-                "audio_decoder": den_ledger.audio_decoder(),
-                "vocoder": den_ledger.vocoder(),
             }
             worker = DenoiserWorker(
                 device=device,
-                ledger=CachingModelLedger(device, cache),
+                ledger=CachingModelLedger(device, cache, source_ledger=den_ledger),
+                _model_ledger=den_ledger,
                 components=PipelineComponents(dtype=torch.bfloat16, device=device),
                 transformer_state="dev",
                 transformer=transformer,
@@ -409,11 +428,17 @@ class SplitModelManager:
         # For fast model: start with dev+low LoRA for first pass (Reddit audio fix)
         worker.ensure_transformer("dev_lora_020" if is_fast else "dev", user_lora=user_lora)
 
-        # Text encoding — always encode negative for CFG (fast model now uses CFG in first pass)
-        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
-        ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
-        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        # Text encoding on GPU:0 (shared encoder)
+        if is_fast:
+            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger)
+            (ctx_p,) = self._contexts_to_device([ctx_p], device)
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = None, None
+        else:
+            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+            ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -433,19 +458,16 @@ class SplitModelManager:
 
             def denoising_loop(sigmas, video_state, audio_state, stepper):
                 nonlocal transformer
-                # Pass 1: dev + LoRA 0.2 with CFG=3 (first 4 steps)
+                # Pass 1: dev + LoRA 0.2, simple denoise (no CFG — saves 2-3x memory)
                 sigmas_1 = sigmas[:split_at + 1]
-                params = _DEV_PARAMS
-                dfn_1 = multi_modal_guider_factory_denoising_func(
-                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                    audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
-                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
+                dfn_1 = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
                 if on_progress:
                     dfn_1 = self._wrap_denoise(dfn_1, on_progress, s1_steps, offset=0.0, scale=0.35)
                 video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_1)
 
                 # Free pass 1 model + activations before loading pass 2
                 del dfn_1
+                transformer = None
                 worker.evict_transformer()
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -511,15 +533,19 @@ class SplitModelManager:
             initial_audio_latent=stage_1_audio_latent,
         )
 
-        # Free everything before decode — evict transformer to reclaim ~22GB VRAM
+        # Free everything before decode — evict transformer + cached models to reclaim VRAM
         video_latent = video_state.latent
         audio_latent = audio_state.latent
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
-        del transformer, stage2_loop, distilled_sigmas
+        del transformer, stage2_loop, distilled_sigmas, video_encoder
         worker.evict_transformer()
+        for k in ("spatial_upsampler", "video_encoder"):
+            worker.cache[k] = None
+            worker.ledger._cache[k] = None
         gc.collect()
+        torch.cuda.empty_cache()
 
-        # Decode
+        # Decode (decoders lazy-load here, with transformer/upsampler/encoder freed)
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
@@ -609,15 +635,19 @@ class SplitModelManager:
             initial_audio_latent=stage_1_audio_latent,
         )
 
-        # Free everything before decode — evict transformer to reclaim ~22GB VRAM
+        # Free everything before decode — evict transformer + cached models to reclaim VRAM
         video_latent = video_state.latent
         audio_latent = audio_state.latent
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
-        del transformer, stage2_loop, distilled_sigmas
+        del transformer, stage2_loop, distilled_sigmas, video_encoder
         worker.evict_transformer()
+        for k in ("spatial_upsampler", "video_encoder"):
+            worker.cache[k] = None
+            worker.ledger._cache[k] = None
         gc.collect()
+        torch.cuda.empty_cache()
 
-        # Decode
+        # Decode (decoders lazy-load here, with transformer/upsampler/encoder freed)
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)

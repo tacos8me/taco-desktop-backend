@@ -391,7 +391,8 @@ async def system_resume() -> dict:
     try:
         async with _inference_lock:
             manager.load_all()
-            flux.load()
+            if config.LOAD_FLUX:
+                flux.load()
             _paused = False
         logger.info("System resumed — all models reloaded")
         return {"status": "ready"}
