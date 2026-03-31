@@ -247,8 +247,9 @@ DECODE_TILING = TilingConfig(
     temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=32),
 )
 
-# No tiling for short videos — single-pass decode, zero tile boundaries, zero artifacts
-SHORT_VIDEO_THRESHOLD = 120  # frames (5s @ 24fps)
+# No tiling for short videos — but at high res (1080p+) the VAE decode needs ~61GB
+# which exceeds free VRAM after model load. Keep threshold low to avoid OOM.
+SHORT_VIDEO_THRESHOLD = 49  # frames (2s @ 24fps) — only skip tiling for very short clips
 
 # Stage 2 uses imported default: STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
