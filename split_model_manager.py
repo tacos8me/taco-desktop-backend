@@ -31,7 +31,7 @@ from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, decode_video as vae_decode_video, get_video_chunks_number
-from ltx_core.model.video_vae.tiling import TemporalTilingConfig
+from ltx_core.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig
 from ltx_core.tools import VideoLatentShape
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import ImageConditioningInput
@@ -243,13 +243,12 @@ class DenoiserWorker:
 # ---------------------------------------------------------------------------
 
 DECODE_TILING = TilingConfig(
-    spatial_config=None,
+    spatial_config=SpatialTilingConfig(tile_size_in_pixels=512, tile_overlap_in_pixels=64),
     temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=32),
 )
 
-# No tiling for short videos — but at high res (1080p+) the VAE decode needs ~61GB
-# which exceeds free VRAM after model load. Keep threshold low to avoid OOM.
-SHORT_VIDEO_THRESHOLD = 49  # frames (2s @ 24fps) — only skip tiling for very short clips
+# Always tile — at 1080p+ the Conv3d workspace allocation exceeds free VRAM without spatial tiling
+SHORT_VIDEO_THRESHOLD = 0  # always tile
 
 # Stage 2 uses imported default: STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
