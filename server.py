@@ -186,6 +186,7 @@ class TextToVideoRequest(BaseModel):
     generate_audio: bool = False
     camera_motion: str | None = Field(default=None, max_length=200)
     lora: LoRAInput | None = None
+    enhance_prompt: bool = False
 
 
 class KeyframeInput(BaseModel):
@@ -205,6 +206,7 @@ class ImageToVideoRequest(BaseModel):
     fps: float = Field(gt=0, le=60)
     generate_audio: bool = False
     lora: LoRAInput | None = None
+    enhance_prompt: bool = False
 
 
 class AudioToVideoRequest(BaseModel):
@@ -216,6 +218,7 @@ class AudioToVideoRequest(BaseModel):
     duration: float = Field(default=6.0, gt=0, le=30)
     fps: float = Field(default=24.0, gt=0, le=60)
     lora: LoRAInput | None = None
+    enhance_prompt: bool = False
 
 
 class RetakeRequest(BaseModel):
@@ -460,6 +463,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
                 generate_audio=body.generate_audio,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
+                enhance_prompt=body.enhance_prompt,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except Exception as exc:
@@ -499,6 +503,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
                 generate_audio=body.generate_audio,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
+                enhance_prompt=body.enhance_prompt,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except FileNotFoundError as exc:
@@ -542,6 +547,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
                 seed=seed,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
+                enhance_prompt=body.enhance_prompt,
             )
         return Response(content=video_bytes, media_type="video/mp4")
     except FileNotFoundError as exc:
@@ -853,7 +859,8 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
     seed = random.randint(0, 2**32 - 1)
     params = dict(prompt=prompt, model=body.model, width=width, height=height,
                   num_frames=num_frames, fps=body.fps, seed=seed, generate_audio=body.generate_audio,
-                  lora_path=lora_path, lora_strength=lora_strength)
+                  lora_path=lora_path, lora_strength=lora_strength,
+                  enhance_prompt=body.enhance_prompt)
     return _submit_job(JobType.TEXT_TO_VIDEO, params, request)
 
 
@@ -872,7 +879,8 @@ async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSON
     params = dict(prompt=body.prompt, keyframes=keyframe_inputs, model=body.model,
                   width=width, height=height, num_frames=num_frames, fps=body.fps,
                   seed=seed, generate_audio=body.generate_audio,
-                  lora_path=lora_path, lora_strength=lora_strength)
+                  lora_path=lora_path, lora_strength=lora_strength,
+                  enhance_prompt=body.enhance_prompt)
     return _submit_job(JobType.IMAGE_TO_VIDEO, params, request)
 
 
@@ -892,7 +900,8 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
     params = dict(prompt=body.prompt, audio_path=audio_path, image_path=image_path,
                   model=body.model, width=width, height=height, num_frames=num_frames,
                   fps=body.fps, seed=seed,
-                  lora_path=lora_path, lora_strength=lora_strength)
+                  lora_path=lora_path, lora_strength=lora_strength,
+                  enhance_prompt=body.enhance_prompt)
     return _submit_job(JobType.AUDIO_TO_VIDEO, params, request)
 
 

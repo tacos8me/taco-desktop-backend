@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import os
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -62,7 +63,13 @@ from ltx_pipelines.utils.media_io import (
     load_video_conditioning,
 )
 from ltx_pipelines.utils.model_ledger import ModelLedger
-from ltx_pipelines.utils.samplers import euler_denoising_loop, res2s_audio_video_denoising_loop
+from ltx_pipelines.utils.samplers import (
+    euler_denoising_loop,
+    gradient_estimating_euler_denoising_loop,
+    res2s_audio_video_denoising_loop,
+)
+
+_USE_GE_EULER = os.environ.get("USE_GE_EULER", "").lower() in ("1", "true", "yes")
 from ltx_pipelines.utils.types import PipelineComponents
 
 import config
@@ -249,6 +256,10 @@ DECODE_TILING = TilingConfig(
 
 SHORT_VIDEO_THRESHOLD = 0  # always use tiling
 
+# Gradient estimating euler: momentum-accelerated sampler, potentially 30→20 steps
+# Enable via USE_GE_EULER=1 in .env for A/B testing
+_euler_loop = gradient_estimating_euler_denoising_loop if _USE_GE_EULER else euler_denoising_loop
+
 # Stage 2 uses imported default: STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
@@ -418,7 +429,7 @@ class SplitModelManager:
     def _run_t2v(
         self, worker: DenoiserWorker, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
-        on_progress=None, user_lora=None,
+        on_progress=None, user_lora=None, enhance_prompt: bool = False,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -429,12 +440,12 @@ class SplitModelManager:
 
         # Text encoding on GPU:0 (shared encoder)
         if is_fast:
-            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger)
+            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -502,11 +513,14 @@ class SplitModelManager:
             components=worker.components, dtype=dtype, device=device,
         )
 
-        # Stage 2: upsample + refine
-        upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        # Free transformer (~22GB) before upsample — not needed for upsample_video
+        stage_1_latent = video_state.latent[:1]
         stage_1_audio_latent = audio_state.latent
         del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
         cleanup_memory()
+
+        upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
@@ -553,7 +567,7 @@ class SplitModelManager:
     def _run_t2v_hq(
         self, worker: DenoiserWorker, prompt: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
-        on_progress=None, user_lora=None,
+        on_progress=None, user_lora=None, enhance_prompt: bool = False,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -562,7 +576,7 @@ class SplitModelManager:
         worker.ensure_transformer("dev_lora_025", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
-        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -602,11 +616,14 @@ class SplitModelManager:
             components=worker.components, dtype=dtype, device=device,
         )
 
-        # Stage 2: upsample + refine with dev_lora@0.5
-        upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        # Free transformer before upsample — not needed for upsample_video
+        stage_1_latent = video_state.latent[:1]
         stage_1_audio_latent = audio_state.latent
         del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
         cleanup_memory()
+
+        upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
@@ -655,7 +672,7 @@ class SplitModelManager:
     def _run_i2v(
         self, worker: DenoiserWorker, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
-        on_progress=None, user_lora=None,
+        on_progress=None, user_lora=None, enhance_prompt: bool = False,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -669,12 +686,12 @@ class SplitModelManager:
 
         # Text encoding on GPU:0 (shared encoder)
         if is_fast:
-            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger)
+            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -719,11 +736,14 @@ class SplitModelManager:
             components=worker.components, dtype=dtype, device=device,
         )
 
-        # Stage 2
-        upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        # Free transformer before upsample — not needed for upsample_video
+        stage_1_latent = video_state.latent[:1]
         stage_1_audio_latent = audio_state.latent
         del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
         cleanup_memory()
+
+        upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
@@ -755,7 +775,11 @@ class SplitModelManager:
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
         del transformer, stage2_loop, distilled_sigmas
         worker.evict_transformer()
+        for k in ("spatial_upsampler", "video_encoder"):
+            worker.cache[k] = None
+            worker.ledger._cache[k] = None
         gc.collect()
+        torch.cuda.empty_cache()
 
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
@@ -765,7 +789,7 @@ class SplitModelManager:
     def _run_a2v(
         self, worker: DenoiserWorker, prompt: str, audio_path: str, image_path: str | None,
         width: int, height: int, num_frames: int, fps: float, seed: int,
-        on_progress=None, user_lora=None,
+        on_progress=None, user_lora=None, enhance_prompt: bool = False,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -773,7 +797,7 @@ class SplitModelManager:
         worker.ensure_transformer("dev", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
-        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -819,10 +843,13 @@ class SplitModelManager:
             initial_audio_latent=encoded_audio_latent,
         )
 
-        # Stage 2: refine with distilled LoRA
-        upscaled = upsample_video(latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        # Free transformer before upsample — not needed for upsample_video
+        stage_1_latent = video_state.latent[:1]
         del video_state, stage_1_cond, sigmas, transformer, stage1_loop
         cleanup_memory()
+
+        upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
+        del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
@@ -851,7 +878,11 @@ class SplitModelManager:
         del video_state, stage_2_cond, upscaled
         del transformer, stage2_loop, distilled_sigmas
         worker.evict_transformer()
+        for k in ("spatial_upsampler", "video_encoder"):
+            worker.cache[k] = None
+            worker.ledger._cache[k] = None
         gc.collect()
+        torch.cuda.empty_cache()
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
         decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
@@ -987,6 +1018,7 @@ class SplitModelManager:
         self, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
+        enhance_prompt: bool = False,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
@@ -996,10 +1028,12 @@ class SplitModelManager:
                 return await loop.run_in_executor(
                     None, self._run_t2v_hq, worker, prompt, width, height,
                     num_frames, fps, seed, generate_audio, on_progress, user_lora,
+                    enhance_prompt,
                 )
             return await loop.run_in_executor(
                 None, self._run_t2v, worker, prompt, model, width, height,
                 num_frames, fps, seed, generate_audio, on_progress, user_lora,
+                enhance_prompt,
             )
         finally:
             worker.lock.release()
@@ -1008,6 +1042,7 @@ class SplitModelManager:
         self, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
+        enhance_prompt: bool = False,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
@@ -1016,6 +1051,7 @@ class SplitModelManager:
             return await loop.run_in_executor(
                 None, self._run_i2v, worker, prompt, keyframes, model, width, height,
                 num_frames, fps, seed, generate_audio, on_progress, user_lora,
+                enhance_prompt,
             )
         finally:
             worker.lock.release()
@@ -1024,6 +1060,7 @@ class SplitModelManager:
         self, prompt: str, audio_path: str, image_path: str | None,
         model: str, width: int, height: int, num_frames: int, fps: float, seed: int,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
+        enhance_prompt: bool = False,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
@@ -1032,6 +1069,7 @@ class SplitModelManager:
             return await loop.run_in_executor(
                 None, self._run_a2v, worker, prompt, audio_path, image_path,
                 width, height, num_frames, fps, seed, on_progress, user_lora,
+                enhance_prompt,
             )
         finally:
             worker.lock.release()
