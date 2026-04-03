@@ -255,10 +255,12 @@ class DenoiserWorker:
 
 DECODE_TILING = TilingConfig(
     spatial_config=None,
-    temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=32),
+    temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=56),
 )
 
-SHORT_VIDEO_THRESHOLD = 0  # always use tiling
+# Videos ≤49 frames (~2s at 24fps) use single-pass decode — no tiling artifacts.
+# cuDNN 9.20 fixes the conv3d memory bug, so single-pass fits in VRAM for short videos.
+SHORT_VIDEO_THRESHOLD = 49
 
 # Gradient estimating euler: momentum-accelerated sampler, potentially 30→20 steps
 # Enable via USE_GE_EULER=1 in .env for A/B testing
