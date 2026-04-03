@@ -58,6 +58,7 @@ class FluxManager:
             transformer.enable_layerwise_casting(
                 storage_dtype=torch.float8_e4m3fn,
                 compute_dtype=torch.bfloat16,
+                skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
             )
             pipe = Flux2KleinKVPipeline.from_pretrained(
                 str(klein_snap), transformer=transformer,
