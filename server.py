@@ -590,8 +590,8 @@ async def retake(body: RetakeRequest) -> Response:
 async def text_to_image(body: TextToImageRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if not flux.is_ready:
-        return _error(500, "Flux pipeline not loaded")
+    if not config.LOAD_FLUX:
+        return _error(500, "Flux not enabled")
     try:
         width = (body.width // 16) * 16
         height = (body.height // 16) * 16
@@ -619,8 +619,8 @@ async def text_to_image(body: TextToImageRequest) -> Response:
 async def image_to_image(body: ImageToImageRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if not flux.is_ready:
-        return _error(500, "Flux pipeline not loaded")
+    if not config.LOAD_FLUX:
+        return _error(500, "Flux not enabled")
     try:
         image_path = str(uploads.resolve(body.image_uri))
         width = (body.width // 16) * 16
@@ -741,7 +741,8 @@ async def list_loras() -> JSONResponse:
     return JSONResponse(content={
         "loras": [
             {"id": l.id, "name": l.name, "filename": l.filename, "base_model": l.base_model,
-             "size_bytes": l.size_bytes, "uploaded_at": l.uploaded_at, "description": l.description}
+             "size_bytes": l.size_bytes, "uploaded_at": l.uploaded_at, "description": l.description,
+             "trigger_word": l.trigger_word, "strategy": l.strategy}
             for l in loras
         ],
         "count": len(loras),
@@ -762,6 +763,10 @@ async def upload_lora(request: Request) -> Response:
     name = form.get("name")
     description = str(form.get("description", ""))
     base_model = str(form.get("base_model", "ltx-2.3"))
+    trigger_word = form.get("trigger_word")
+    strategy = form.get("strategy")
+    trigger_word = str(trigger_word) if trigger_word else None
+    strategy = str(strategy) if strategy else None
 
     if not file or not hasattr(file, "read"):
         return _error(400, "Missing 'file' field")
@@ -777,7 +782,8 @@ async def upload_lora(request: Request) -> Response:
         return _error(413, f"File exceeds {config.MAX_LORA_SIZE_BYTES // (1024*1024)}MB limit")
 
     try:
-        info = lora_registry.add(name=str(name), filename=filename, data=data, description=description, base_model=base_model)
+        info = lora_registry.add(name=str(name), filename=filename, data=data, description=description,
+                                base_model=base_model, trigger_word=trigger_word, strategy=strategy)
     except ValueError as exc:
         return _error(400, str(exc))
 
@@ -785,7 +791,8 @@ async def upload_lora(request: Request) -> Response:
         status_code=201,
         content={"id": info.id, "name": info.name, "filename": info.filename,
                  "base_model": info.base_model, "size_bytes": info.size_bytes,
-                 "uploaded_at": info.uploaded_at, "description": info.description},
+                 "uploaded_at": info.uploaded_at, "description": info.description,
+                 "trigger_word": info.trigger_word, "strategy": info.strategy},
     )
 
 
@@ -937,7 +944,8 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
     seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, image_paths=image_paths, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
-                  guidance_scale=body.guidance_scale, seed=seed)
+                  guidance_scale=body.guidance_scale, seed=seed,
+                  model=body.model)
     return _submit_job(JobType.IMAGE_EDIT, params, request)
 
 

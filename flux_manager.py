@@ -49,7 +49,7 @@ class FluxManager:
         _load_kw = dict(torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR, local_files_only=True)
 
         if model_name == "flux2-klein":
-            from diffusers import Flux2KleinPipeline
+            from diffusers import Flux2KleinKVPipeline
             klein_ckpt, klein_snap = self._resolve_klein_checkpoint()
             transformer = Flux2Transformer2DModel.from_single_file(
                 klein_ckpt, torch_dtype=torch.bfloat16,
@@ -59,7 +59,7 @@ class FluxManager:
                 storage_dtype=torch.float8_e4m3fn,
                 compute_dtype=torch.bfloat16,
             )
-            pipe = Flux2KleinPipeline.from_pretrained(
+            pipe = Flux2KleinKVPipeline.from_pretrained(
                 str(klein_snap), transformer=transformer,
                 torch_dtype=torch.bfloat16, local_files_only=True,
             )
@@ -149,8 +149,13 @@ class FluxManager:
         kwargs: dict = dict(
             prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale, generator=generator,
+            generator=generator,
         )
+        if model == "flux2-klein":
+            # Klein KV pipeline doesn't accept guidance_scale (distilled, no CFG)
+            pass
+        else:
+            kwargs["guidance_scale"] = guidance_scale
         if turbo and model == "flux2-dev":
             kwargs["sigmas"] = config.FLUX_TURBO_SIGMAS
             kwargs["num_inference_steps"] = 8
@@ -165,6 +170,10 @@ class FluxManager:
             logger.exception("Flux generate OOM, unloading pipeline")
             self.unload()
             raise
+
+        if model == "flux2-klein":
+            gc.collect()
+            torch.cuda.empty_cache()
 
         return self._to_webp(result.images[0])
 
@@ -183,8 +192,12 @@ class FluxManager:
         kwargs: dict = dict(
             image=ref_image, prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale, generator=generator,
+            generator=generator,
         )
+        if model == "flux2-klein":
+            pass
+        else:
+            kwargs["guidance_scale"] = guidance_scale
         if turbo and model == "flux2-dev":
             kwargs["sigmas"] = config.FLUX_TURBO_SIGMAS
             kwargs["num_inference_steps"] = 8
@@ -199,6 +212,10 @@ class FluxManager:
             logger.exception("Flux img2img OOM, unloading pipeline")
             self.unload()
             raise
+
+        if model == "flux2-klein":
+            gc.collect()
+            torch.cuda.empty_cache()
 
         return self._to_webp(result.images[0])
 
@@ -216,10 +233,12 @@ class FluxManager:
         kwargs: dict = dict(
             image=images, prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale, generator=generator,
+            generator=generator,
         )
+        # Klein KV pipeline doesn't accept guidance_scale
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
+            kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
         try:
             result = self._pipe(**kwargs)
@@ -227,6 +246,9 @@ class FluxManager:
             logger.exception("Flux edit OOM, unloading pipeline")
             self.unload()
             raise
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         return self._to_webp(result.images[0])
 
