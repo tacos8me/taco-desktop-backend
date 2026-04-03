@@ -79,6 +79,10 @@ logger = logging.getLogger(__name__)
 # Pre-compute dev checkpoint params once at import time (avoids repeated disk I/O)
 _DEV_PARAMS = detect_params(config.DEV_CHECKPOINT)
 
+# Override skip_step=1: skips STG on alternating steps for 33% fewer NFE with minimal quality loss
+from dataclasses import replace as _replace
+_DEV_PARAMS = _replace(_DEV_PARAMS, video_guider_params=_replace(_DEV_PARAMS.video_guider_params, skip_step=1))
+
 # ---------------------------------------------------------------------------
 # CachingModelLedger — returns pre-loaded models instead of disk I/O
 # ---------------------------------------------------------------------------
