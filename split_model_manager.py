@@ -79,9 +79,9 @@ logger = logging.getLogger(__name__)
 # Pre-compute dev checkpoint params once at import time (avoids repeated disk I/O)
 _DEV_PARAMS = detect_params(config.DEV_CHECKPOINT)
 
-# Override skip_step=1: skips STG on alternating steps for 33% fewer NFE with minimal quality loss
+# skip_step=0: full STG on every step. skip_step=1 saved 33% NFE but created
+# temporal oscillation in guidance signal, contributing to ghost trails during fast motion.
 from dataclasses import replace as _replace
-_DEV_PARAMS = _replace(_DEV_PARAMS, video_guider_params=_replace(_DEV_PARAMS.video_guider_params, skip_step=1))
 
 # ---------------------------------------------------------------------------
 # CachingModelLedger — returns pre-loaded models instead of disk I/O
@@ -266,12 +266,25 @@ SHORT_VIDEO_THRESHOLD = 49
 # Enable via USE_GE_EULER=1 in .env for A/B testing
 _euler_loop = gradient_estimating_euler_denoising_loop if _USE_GE_EULER else euler_denoising_loop
 
-# Stage 2 uses imported default: STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+# Stage 2: 5 steps instead of upstream's 3. More steps resolve fast motion better —
+# 3 steps from 91% noise can't fully reconstruct temporal detail during fast motion.
+# Original: [0.909375, 0.725, 0.421875, 0.0] (3 steps)
+_STAGE_2_SIGMAS = [0.909375, 0.727, 0.546, 0.364, 0.182, 0.0]  # 5 steps
 
 
 def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
     """Skip tiling for short videos to avoid temporal boundary artifacts."""
     return None if num_frames <= SHORT_VIDEO_THRESHOLD else DECODE_TILING
+
+
+def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iterator[torch.Tensor]:
+    """Decode video with float32 precision for better skip-connection accuracy."""
+    decoder.to(torch.float32)
+    latent_fp32 = latent.to(torch.float32)
+    try:
+        yield from vae_decode_video(latent_fp32, decoder, tiling, generator)
+    finally:
+        decoder.to(torch.bfloat16)
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
@@ -535,7 +548,7 @@ class SplitModelManager:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -565,7 +578,7 @@ class SplitModelManager:
         torch.cuda.empty_cache()
 
         # Decode (decoders lazy-load here, with transformer/upsampler/encoder freed)
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
+        decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -636,7 +649,7 @@ class SplitModelManager:
 
         worker.ensure_transformer("dev_lora_050", user_lora=user_lora)
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         # res2s stage 2: 2 NFE per step + 1 final (3 distilled steps = 2 actual steps)
         s2_nfe = 2 * (len(distilled_sigmas) - 1) + 1
 
@@ -670,7 +683,7 @@ class SplitModelManager:
         torch.cuda.empty_cache()
 
         # Decode (decoders lazy-load here, with transformer/upsampler/encoder freed)
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
+        decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -758,7 +771,7 @@ class SplitModelManager:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -787,7 +800,7 @@ class SplitModelManager:
         gc.collect()
         torch.cuda.empty_cache()
 
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
+        decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
@@ -862,7 +875,7 @@ class SplitModelManager:
 
         worker.ensure_transformer("dev_lora", user_lora=user_lora)
         transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         def stage2_loop(sigmas, video_state, audio_state, stepper):
@@ -891,7 +904,7 @@ class SplitModelManager:
         torch.cuda.empty_cache()
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
-        decoded_video = vae_decode_video(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
+        decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
@@ -1014,7 +1027,7 @@ class SplitModelManager:
         worker.evict_transformer()
         gc.collect()
 
-        decoded_video = vae_decode_video(video_state.latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
+        decoded_video = _decode_video_fp32(video_state.latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
 
