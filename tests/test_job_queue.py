@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from server import app, job_store, _job_queue  # noqa: E402
+from server import app, job_store, _flux_queue, _ltx_queue  # noqa: E402
 from job_queue import Job, JobStatus, JobType, make_job_id  # noqa: E402
 
 client = TestClient(app)
@@ -27,12 +27,13 @@ def _with_no_auth():
 
 
 def _cleanup_queue():
-    """Drain the queue and clear the store."""
-    while not _job_queue.empty():
-        try:
-            _job_queue.get_nowait()
-        except Exception:
-            break
+    """Drain both queues and clear the store."""
+    for q in (_flux_queue, _ltx_queue):
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except Exception:
+                break
     job_store._jobs.clear()
 
 

@@ -32,7 +32,6 @@ class FluxManager:
         self._pipe = None
         self._current_model: str | None = None
         self._device = config.FLUX_DEVICE
-        self._lock = asyncio.Lock()
 
     @property
     def is_ready(self) -> bool:
@@ -256,22 +255,19 @@ class FluxManager:
     # --- Async API ---
 
     async def generate_text_to_image(self, *, model: str = "flux2-dev", **kwargs) -> bytes:
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, lambda: self._generate(model=model, **kwargs),
-            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._generate(model=model, **kwargs),
+        )
 
     async def generate_image_to_image(self, *, model: str = "flux2-dev", **kwargs) -> bytes:
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, lambda: self._img2img(model=model, **kwargs),
-            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._img2img(model=model, **kwargs),
+        )
 
     async def generate_image_edit(self, *, model: str = "flux2-klein", **kwargs) -> bytes:
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None, lambda: self._edit(**kwargs),
-            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._edit(**kwargs),
+        )

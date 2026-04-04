@@ -1,7 +1,7 @@
 """Async job queue for generation requests.
 
 Submit-poll-fetch pattern to work around Cloudflare's 100s timeout.
-Single asyncio.Queue + one background worker (serialized by _inference_lock).
+Dual queues with per-device workers for concurrent Flux + LTX inference.
 """
 
 from __future__ import annotations
@@ -156,7 +156,7 @@ def make_flux_callback(job: Job, total_steps: int) -> Callable:
 async def worker_loop(
     job_store: JobStore,
     queue: asyncio.Queue[str],
-    inference_lock: asyncio.Lock,
+    device_lock: asyncio.Lock,
     dispatch_fn: Callable,
     uploads: UploadStore,
     history: "HistoryStore | None" = None,
@@ -176,7 +176,7 @@ async def worker_loop(
 
         result_bytes: bytes | None = None
         try:
-            async with inference_lock:
+            async with device_lock:
                 result_bytes = await dispatch_fn(job)
 
             upload_id, storage_uri = uploads.create()

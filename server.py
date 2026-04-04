@@ -42,14 +42,16 @@ lora_registry = LoRARegistry(config.LORAS_DIR)
 chat = ChatManager()
 history = HistoryStore()
 
-# Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
-# when Flux and LTX run CUDA inference concurrently in the same process.
-_inference_lock = asyncio.Lock()
+# Per-device inference locks: allow Flux (cuda:0) and LTX (cuda:1) to run concurrently.
+_flux_lock = asyncio.Lock()
+_ltx_lock = asyncio.Lock()
 _paused = False
 
-# Job queue
+# Dual job queues — one per GPU, each with its own worker
 job_store = JobStore()
-_job_queue: asyncio.Queue[str] = asyncio.Queue()
+_flux_queue: asyncio.Queue[str] = asyncio.Queue()
+_ltx_queue: asyncio.Queue[str] = asyncio.Queue()
+_FLUX_JOB_TYPES = frozenset({JobType.TEXT_TO_IMAGE, JobType.IMAGE_TO_IMAGE, JobType.IMAGE_EDIT})
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -115,19 +117,24 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     chat.load()
     logger.info("Chat proxy ready.")
 
-    worker_task = asyncio.create_task(
-        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history),
-        name="queue-worker",
+    flux_worker = asyncio.create_task(
+        worker_loop(job_store, _flux_queue, _flux_lock, _dispatch_job, uploads, history),
+        name="queue-worker-flux",
+    )
+    ltx_worker = asyncio.create_task(
+        worker_loop(job_store, _ltx_queue, _ltx_lock, _dispatch_job, uploads, history),
+        name="queue-worker-ltx",
     )
     cleanup_task = asyncio.create_task(
         cleanup_loop(job_store, uploads),
         name="queue-cleanup",
     )
-    logger.info("Job queue started.")
+    logger.info("Job queues started (flux + ltx workers).")
 
     yield
 
-    worker_task.cancel()
+    flux_worker.cancel()
+    ltx_worker.cancel()
     cleanup_task.cancel()
 
 
@@ -276,6 +283,12 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = Field(default=512, ge=1, le=8192)
 
 
+class CharRankRequest(BaseModel):
+    rank_image_uri: str
+    generated_image_uri: str
+    prompt: str = Field(max_length=10000)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -363,11 +376,13 @@ async def system_pause() -> dict:
     if _paused:
         return {"status": "already_paused"}
     try:
-        async with _inference_lock:
+        async with _flux_lock:
+          async with _ltx_lock:
             # Cancel queued (not yet processing) jobs
-            while not _job_queue.empty():
+            for q in (_flux_queue, _ltx_queue):
+              while not q.empty():
                 try:
-                    job_id = _job_queue.get_nowait()
+                    job_id = q.get_nowait()
                     job = job_store.get(job_id)
                     if job and job.status == JobStatus.QUEUED:
                         job.status = JobStatus.FAILED
@@ -392,7 +407,8 @@ async def system_resume() -> dict:
     if not _paused:
         return {"status": "already_running"}
     try:
-        async with _inference_lock:
+        async with _flux_lock:
+          async with _ltx_lock:
             manager.load_all()
             if config.LOAD_FLUX:
                 flux.load()
@@ -410,7 +426,7 @@ async def flux_unload() -> dict:
     if not flux.is_ready:
         return {"status": "already_unloaded"}
     try:
-        async with _inference_lock:
+        async with _flux_lock:
             flux.unload()
         logger.info("Flux unloaded from GPU0")
         return {"status": "unloaded"}
@@ -425,7 +441,7 @@ async def flux_reload() -> dict:
     if flux.is_ready:
         return {"status": "already_loaded"}
     try:
-        async with _inference_lock:
+        async with _flux_lock:
             flux.load()
         logger.info("Flux reloaded to GPU0")
         return {"status": "loaded"}
@@ -451,7 +467,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _inference_lock:
+        async with _ltx_lock:
             video_bytes = await manager.generate_text_to_video(
                 prompt=prompt,
                 model=body.model,
@@ -490,7 +506,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _inference_lock:
+        async with _ltx_lock:
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
                 keyframes=keyframe_inputs,
@@ -534,7 +550,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _inference_lock:
+        async with _ltx_lock:
             video_bytes = await manager.generate_audio_to_video(
                 prompt=body.prompt,
                 audio_path=audio_path,
@@ -573,7 +589,7 @@ async def retake(body: RetakeRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _inference_lock:
+        async with _ltx_lock:
             video_bytes = await manager.retake(
                 video_path=video_path,
                 start_time=body.start_time,
@@ -604,7 +620,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.FLUX_DEVICE)
-        async with _inference_lock:
+        async with _flux_lock:
             image_bytes = await flux.generate_text_to_image(
                 prompt=body.prompt,
                 width=width,
@@ -634,7 +650,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.FLUX_DEVICE)
-        async with _inference_lock:
+        async with _flux_lock:
             image_bytes = await flux.generate_image_to_image(
                 prompt=body.prompt,
                 image_path=image_path,
@@ -667,7 +683,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.FLUX_DEVICE)
-        async with _inference_lock:
+        async with _flux_lock:
             image_bytes = await flux.generate_image_edit(
                 prompt=body.prompt,
                 image_paths=image_paths,
@@ -834,7 +850,8 @@ def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONRespon
 
     job = Job(id=make_job_id(), type=job_type, params=params, api_key=api_key)
     job_store.add(job)
-    _job_queue.put_nowait(job.id)
+    target_queue = _flux_queue if job_type in _FLUX_JOB_TYPES else _ltx_queue
+    target_queue.put_nowait(job.id)
 
     return JSONResponse(
         status_code=202,
@@ -971,6 +988,7 @@ async def v2_job_status(job_id: str) -> JSONResponse:
         "queue_position": job_store.queue_position(job.id) if job.status == JobStatus.QUEUED else None,
         "error": {"code": job.error_code or "generation_failed", "message": job.error} if job.error else None,
         "result_url": f"/v2/jobs/{job.id}/result" if job.status == JobStatus.COMPLETED else None,
+        "result_storage_uri": job.result_uri if job.status == JobStatus.COMPLETED else None,
         "result_media_type": job.result_media_type,
     })
 
@@ -1183,6 +1201,99 @@ async def get_approved_image_file(image_id: str, request: Request) -> Response:
     if not path.exists():
         return _error(404, "Image file not found")
     return FileResponse(path=str(path), media_type="image/webp")
+
+
+# ---------------------------------------------------------------------------
+# Char Mode — Vision Ranking
+# ---------------------------------------------------------------------------
+
+CHAR_RANKING_PROMPT = """You are a character consistency evaluator for AI image generation. You compare a REFERENCE character image against a GENERATED image to assess how well the generated image preserves the character's identity.
+
+Focus specifically on:
+- Facial structure: jaw shape, cheekbones, chin, nose bridge
+- Eyes: shape, size, spacing, color, eyelid characteristics
+- Head proportions: forehead height, face width-to-height ratio, head size relative to body
+- Overall likeness: would someone recognize this as the same person?
+
+Rate each criterion from 1-10 where:
+- 1-3: Poor match, clearly different person
+- 4-6: Some resemblance but noticeable differences
+- 7-8: Good match with minor discrepancies
+- 9-10: Excellent match, clearly the same character
+
+Return ONLY valid JSON with no additional text:
+{
+  "score": <float, average of all criteria>,
+  "analysis": {
+    "face_match": <int 1-10>,
+    "eyes": <int 1-10>,
+    "proportions": <int 1-10>,
+    "overall_likeness": <int 1-10>
+  },
+  "edits": {
+    "add": ["specific description to append to the generation prompt"],
+    "remove": ["specific words/phrases to remove from the prompt"],
+    "modify": {"aspect_name": "improved description"}
+  }
+}
+
+Rules for edits:
+- Only suggest edits if score < 9
+- Keep edits SMALL and SPECIFIC (1-3 items max)
+- Focus on the biggest discrepancy between reference and generated
+- Use concrete terms: "narrower jawline" not "better face"
+- If score >= 9, return empty edits: {"add": [], "remove": [], "modify": {}}"""
+
+
+@app.post("/v2/char/rank")
+async def v2_char_rank(body: CharRankRequest, request: Request) -> JSONResponse:
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    if not chat.is_ready:
+        return _error(500, "Chat model not loaded")
+
+    try:
+        import base64
+
+        rank_path = uploads.resolve(body.rank_image_uri)
+        gen_path = uploads.resolve(body.generated_image_uri)
+
+        rank_b64 = base64.b64encode(rank_path.read_bytes()).decode()
+        gen_b64 = base64.b64encode(gen_path.read_bytes()).decode()
+
+        messages = [
+            {"role": "system", "content": CHAR_RANKING_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": f'Original prompt: "{body.prompt}"\n\nFirst image is the REFERENCE character. Second image is the GENERATED result. Evaluate character consistency.'},
+                {"type": "image_url", "image_url": {"url": f"data:image/webp;base64,{rank_b64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/webp;base64,{gen_b64}"}},
+            ]}
+        ]
+
+        result = await chat.generate_chat_completion(
+            messages=messages,
+            temperature=0.1,
+            max_tokens=1024,
+            model=config.CHAR_VISION_MODEL,
+        )
+
+        import json as _json, re as _re
+        text = result["choices"][0]["message"]["content"]
+        json_match = _re.search(r'\{[\s\S]*\}', text)
+        if not json_match:
+            return _error(500, "Vision model did not return valid JSON")
+
+        ranking = _json.loads(json_match.group())
+        return JSONResponse(content=ranking)
+
+    except FileNotFoundError as exc:
+        return _error(404, str(exc))
+    except ValueError:
+        return _error(500, "Failed to parse vision model response")
+    except Exception as exc:
+        logger.exception("char/rank failed")
+        return _error(500, str(exc))
 
 
 # ---------------------------------------------------------------------------
