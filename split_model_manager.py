@@ -278,13 +278,9 @@ def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
 
 
 def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iterator[torch.Tensor]:
-    """Decode video with float32 precision for better skip-connection accuracy."""
-    decoder.to(torch.float32)
-    latent_fp32 = latent.to(torch.float32)
-    try:
-        yield from vae_decode_video(latent_fp32, decoder, tiling, generator)
-    finally:
-        decoder.to(torch.bfloat16)
+    """Decode video in bfloat16 (standard). Float32 was tested but the dtype
+    conversion on every call added minutes of overhead."""
+    yield from vae_decode_video(latent, decoder, tiling, generator)
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
