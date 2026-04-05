@@ -70,6 +70,7 @@ class ChatManager:
         messages: list[dict],
         temperature: float = 0.7,
         max_tokens: int = 512,
+        model: str | None = None,
     ) -> dict:
         """Forward chat completion to external server and return OpenAI-format response."""
         clean_messages = [
@@ -78,7 +79,7 @@ class ChatManager:
         ]
 
         payload = {
-            "model": config.CHAT_MODEL,
+            "model": model or config.CHAT_MODEL,
             "messages": clean_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,

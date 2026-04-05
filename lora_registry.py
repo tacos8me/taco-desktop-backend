@@ -24,6 +24,8 @@ class LoRAInfo:
     size_bytes: int
     uploaded_at: str
     description: str = ""
+    trigger_word: str | None = None
+    strategy: str | None = None
 
 
 class LoRARegistry:
@@ -54,6 +56,7 @@ class LoRARegistry:
                     "id": l.id, "name": l.name, "filename": l.filename,
                     "base_model": l.base_model, "size_bytes": l.size_bytes,
                     "uploaded_at": l.uploaded_at, "description": l.description,
+                    "trigger_word": l.trigger_word, "strategy": l.strategy,
                 }
                 for l in self._loras.values()
             ]
@@ -74,7 +77,8 @@ class LoRARegistry:
             raise FileNotFoundError(f"LoRA not found: {lora_id}")
         return self._dir / f"{lora_id}.safetensors"
 
-    def add(self, name: str, filename: str, data: bytes, description: str = "", base_model: str = "ltx-2.3") -> LoRAInfo:
+    def add(self, name: str, filename: str, data: bytes, description: str = "", base_model: str = "ltx-2.3",
+            trigger_word: str | None = None, strategy: str | None = None) -> LoRAInfo:
         """Validate and store a LoRA file. Returns the new LoRAInfo."""
         _validate_safetensors(data)
 
@@ -90,6 +94,8 @@ class LoRARegistry:
             size_bytes=len(data),
             uploaded_at=datetime.now(timezone.utc).isoformat(),
             description=description,
+            trigger_word=trigger_word,
+            strategy=strategy,
         )
         self._loras[lora_id] = info
         self._save()

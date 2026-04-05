@@ -1,5 +1,8 @@
 uploads/
 loras/
+thumbnails/
+history.db
+approved-images/
 .venv/
 __pycache__/
 *.pyc
@@ -7,3 +10,4 @@ uv.lock
 .pytest_cache/
 .env
 .api_keys
+.gstack/

@@ -41,6 +41,7 @@ FLUX_DEVICE = "cuda:0"   # Flux 2 image generation (not loaded by default)
 LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
 CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
+CHAR_VISION_MODEL = "gemma-4-31b-it"       # Vision model for Char mode ranking
 
 # SplitModelManager: encoder hub + denoiser on single GPU
 GPU_DEVICES = [LTX_DEVICE]
