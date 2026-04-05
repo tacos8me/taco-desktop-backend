@@ -255,12 +255,13 @@ class DenoiserWorker:
 
 DECODE_TILING = TilingConfig(
     spatial_config=None,
-    temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=56),
+    temporal_config=TemporalTilingConfig(tile_size_in_frames=128, tile_overlap_in_frames=32),
 )
 
-# Videos ≤49 frames (~2s at 24fps) use single-pass decode — no tiling artifacts.
-# cuDNN 9.20 fixes the conv3d memory bug, so single-pass fits in VRAM for short videos.
-SHORT_VIDEO_THRESHOLD = 49
+# Skip tiling for videos ≤257 frames (~10s at 24fps). Single-pass decode = no tile
+# boundary artifacts at all. cuDNN 9.20 fixes the conv3d workspace bug so this fits
+# in ~90GB available after transformer eviction. Only videos >10s need tiling.
+SHORT_VIDEO_THRESHOLD = 257
 
 # Gradient estimating euler: momentum-accelerated sampler, potentially 30→20 steps
 # Enable via USE_GE_EULER=1 in .env for A/B testing
@@ -278,8 +279,7 @@ def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
 
 
 def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iterator[torch.Tensor]:
-    """Decode video in bfloat16 (standard). Float32 was tested but the dtype
-    conversion on every call added minutes of overhead."""
+    """Decode video in bfloat16 (standard)."""
     yield from vae_decode_video(latent, decoder, tiling, generator)
 
 
@@ -805,17 +805,25 @@ class SplitModelManager:
         self, worker: DenoiserWorker, prompt: str, audio_path: str, image_path: str | None,
         width: int, height: int, num_frames: int, fps: float, seed: int,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
+        model: str = "ltx-2-3-pro",
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
+        is_fast = model == "ltx-2-3-fast"
 
-        worker.ensure_transformer("dev", user_lora=user_lora)
+        worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder)
-        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
-        ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
-        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        if is_fast:
+            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            (ctx_p,) = self._contexts_to_device([ctx_p], device)
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = None, None
+        else:
+            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
+            v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+            v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Audio encoding on GPU:0, then transfer to worker device
         decoded_audio = decode_audio_from_file(audio_path, self._encoder_device, max_duration=num_frames / fps)
@@ -830,7 +838,6 @@ class SplitModelManager:
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
-        params = _DEV_PARAMS
 
         # Stage 1: video-only denoising (audio frozen)
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
@@ -838,18 +845,29 @@ class SplitModelManager:
         stage_1_cond = combined_image_conditionings(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
         transformer = worker.ledger.transformer()
 
-        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
-        s1_steps = len(sigmas) - 1
+        if is_fast:
+            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+            s1_steps = len(sigmas) - 1
 
-        def stage1_loop(sigmas, video_state, audio_state, stepper):
-            dfn = multi_modal_guider_factory_denoising_func(
-                video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                audio_guider_factory=create_multimodal_guider_factory(params=MultiModalGuiderParams(), negative_context=None),
-                v_context=v_context_p, a_context=a_context_p, transformer=transformer)
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
+            def stage1_loop(sigmas, video_state, audio_state, stepper):
+                dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
+        else:
+            params = _DEV_PARAMS
+            empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
+            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            s1_steps = len(sigmas) - 1
+
+            def stage1_loop(sigmas, video_state, audio_state, stepper):
+                dfn = multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                    audio_guider_factory=create_multimodal_guider_factory(params=MultiModalGuiderParams(), negative_context=None),
+                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
+                if on_progress:
+                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
+                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
 
         video_state = denoise_video_only(
             output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
@@ -869,7 +887,8 @@ class SplitModelManager:
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
         stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
-        worker.ensure_transformer("dev_lora", user_lora=user_lora)
+        if not is_fast:
+            worker.ensure_transformer("dev_lora", user_lora=user_lora)
         transformer = worker.ledger.transformer()
         distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
@@ -1084,7 +1103,7 @@ class SplitModelManager:
             return await loop.run_in_executor(
                 None, self._run_a2v, worker, prompt, audio_path, image_path,
                 width, height, num_frames, fps, seed, on_progress, user_lora,
-                enhance_prompt,
+                enhance_prompt, model,
             )
         finally:
             worker.lock.release()
