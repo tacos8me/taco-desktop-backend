@@ -271,6 +271,8 @@ class ImageEditRequest(BaseModel):
     num_inference_steps: int = Field(default=4, ge=1, le=100)
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
+    num_images: int = Field(default=1, ge=1, le=8)
+    seed: int | None = None
     num_images: int = Field(default=1, ge=1, le=4)
 
 
