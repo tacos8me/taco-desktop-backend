@@ -246,6 +246,7 @@ class TextToImageRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
     turbo: bool = False
+    num_images: int = Field(default=1, ge=1, le=4)
 
 
 class ImageToImageRequest(BaseModel):
@@ -258,6 +259,7 @@ class ImageToImageRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
     turbo: bool = False
+    num_images: int = Field(default=1, ge=1, le=4)
 
 
 class ImageEditRequest(BaseModel):
@@ -269,6 +271,7 @@ class ImageEditRequest(BaseModel):
     num_inference_steps: int = Field(default=4, ge=1, le=100)
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
+    num_images: int = Field(default=1, ge=1, le=4)
 
 
 class ChatMessage(BaseModel):
@@ -631,7 +634,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 model=body.model,
                 turbo=body.turbo,
             )
-        return Response(content=image_bytes, media_type="image/webp")
+        return Response(content=image_bytes[0], media_type="image/webp")
     except Exception as exc:
         logger.exception("text-to-image failed")
         return _error(500, str(exc))
@@ -662,7 +665,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 model=body.model,
                 turbo=body.turbo,
             )
-        return Response(content=image_bytes, media_type="image/webp")
+        return Response(content=image_bytes[0], media_type="image/webp")
     except FileNotFoundError as exc:
         return _error(404, str(exc))
     except Exception as exc:
@@ -693,7 +696,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
                 guidance_scale=body.guidance_scale,
                 seed=seed,
             )
-        return Response(content=image_bytes, media_type="image/webp")
+        return Response(content=image_bytes[0], media_type="image/webp")
     except FileNotFoundError as exc:
         return _error(404, str(exc))
     except Exception as exc:
@@ -945,7 +948,8 @@ async def v2_text_to_image(body: TextToImageRequest, request: Request) -> JSONRe
     params = dict(prompt=body.prompt, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model, turbo=body.turbo)
+                  model=body.model, turbo=body.turbo,
+                  num_images_per_prompt=body.num_images)
     return _submit_job(JobType.TEXT_TO_IMAGE, params, request)
 
 
@@ -958,7 +962,8 @@ async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSON
     params = dict(prompt=body.prompt, image_path=image_path, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model, turbo=body.turbo)
+                  model=body.model, turbo=body.turbo,
+                  num_images_per_prompt=body.num_images)
     return _submit_job(JobType.IMAGE_TO_IMAGE, params, request)
 
 
@@ -971,7 +976,8 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
     params = dict(prompt=body.prompt, image_paths=image_paths, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model)
+                  model=body.model,
+                  num_images_per_prompt=body.num_images)
     return _submit_job(JobType.IMAGE_EDIT, params, request)
 
 
@@ -988,7 +994,8 @@ async def v2_job_status(job_id: str) -> JSONResponse:
         "queue_position": job_store.queue_position(job.id) if job.status == JobStatus.QUEUED else None,
         "error": {"code": job.error_code or "generation_failed", "message": job.error} if job.error else None,
         "result_url": f"/v2/jobs/{job.id}/result" if job.status == JobStatus.COMPLETED else None,
-        "result_storage_uri": job.result_uri if job.status == JobStatus.COMPLETED else None,
+        "result_urls": [f"/v2/jobs/{job.id}/result/{i}" for i in range(len(job.result_uris))] if job.status == JobStatus.COMPLETED else None,
+        "num_images": len(job.result_uris) if job.status == JobStatus.COMPLETED else None,
         "result_media_type": job.result_media_type,
     })
 
@@ -1005,13 +1012,22 @@ async def v2_job_preview(job_id: str) -> Response:
 
 @app.get("/v2/jobs/{job_id}/result")
 async def v2_job_result(job_id: str) -> Response:
+    """Serve first result image (backward compatible)."""
+    return await v2_job_result_by_index(job_id, 0)
+
+
+@app.get("/v2/jobs/{job_id}/result/{index}")
+async def v2_job_result_by_index(job_id: str, index: int) -> Response:
+    """Serve Nth result image from a batch."""
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
-    if job.status != JobStatus.COMPLETED or not job.result_uri:
+    if job.status != JobStatus.COMPLETED or not job.result_uris:
         return _error(409, "Job result not ready")
+    if index < 0 or index >= len(job.result_uris):
+        return _error(400, f"Index {index} out of range (0-{len(job.result_uris) - 1})")
     try:
-        path = uploads.resolve(job.result_uri)
+        path = uploads.resolve(job.result_uris[index])
         if not path.exists():
             raise FileNotFoundError()
         return FileResponse(

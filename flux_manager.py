@@ -140,15 +140,21 @@ class FluxManager:
         self, prompt: str, width: int, height: int,
         num_inference_steps: int, guidance_scale: float, seed: int,
         model: str = "flux2-dev", turbo: bool = False,
+        num_images_per_prompt: int = 1,
         callback_on_step_end: object = None,
-    ) -> bytes:
-        """Generate an image (txt2img) and return WEBP bytes."""
+    ) -> list[bytes]:
+        """Generate image(s) and return list of WEBP bytes."""
         self.ensure_model(model)
-        generator = torch.Generator(device=self._device).manual_seed(seed)
+        if num_images_per_prompt > 1:
+            generator = [torch.Generator(device=self._device).manual_seed(seed + i)
+                         for i in range(num_images_per_prompt)]
+        else:
+            generator = torch.Generator(device=self._device).manual_seed(seed)
 
         kwargs: dict = dict(
             prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
+            num_images_per_prompt=num_images_per_prompt,
             generator=generator,
         )
         if model == "flux2-klein":
@@ -175,23 +181,29 @@ class FluxManager:
             gc.collect()
             torch.cuda.empty_cache()
 
-        return self._to_webp(result.images[0])
+        return [self._to_webp(img) for img in result.images]
 
     @torch.inference_mode()
     def _img2img(
         self, prompt: str, image_path: str, width: int, height: int,
         num_inference_steps: int, guidance_scale: float, seed: int,
         model: str = "flux2-dev", turbo: bool = False,
+        num_images_per_prompt: int = 1,
         callback_on_step_end: object = None,
-    ) -> bytes:
+    ) -> list[bytes]:
         """Edit an image using single reference."""
         self.ensure_model(model)
-        generator = torch.Generator(device=self._device).manual_seed(seed)
+        if num_images_per_prompt > 1:
+            generator = [torch.Generator(device=self._device).manual_seed(seed + i)
+                         for i in range(num_images_per_prompt)]
+        else:
+            generator = torch.Generator(device=self._device).manual_seed(seed)
         ref_image = Image.open(image_path).convert("RGB")
 
         kwargs: dict = dict(
             image=ref_image, prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
+            num_images_per_prompt=num_images_per_prompt,
             generator=generator,
         )
         if model == "flux2-klein":
@@ -217,22 +229,28 @@ class FluxManager:
             gc.collect()
             torch.cuda.empty_cache()
 
-        return self._to_webp(result.images[0])
+        return [self._to_webp(img) for img in result.images]
 
     @torch.inference_mode()
     def _edit(
         self, prompt: str, image_paths: list[str], width: int, height: int,
         num_inference_steps: int = 4, guidance_scale: float = 4.0,
-        seed: int = 0, callback_on_step_end: object = None,
-    ) -> bytes:
+        seed: int = 0, num_images_per_prompt: int = 1,
+        callback_on_step_end: object = None,
+    ) -> list[bytes]:
         """Multi-reference image editing via Klein."""
         self.ensure_model("flux2-klein")
-        generator = torch.Generator(device=self._device).manual_seed(seed)
+        if num_images_per_prompt > 1:
+            generator = [torch.Generator(device=self._device).manual_seed(seed + i)
+                         for i in range(num_images_per_prompt)]
+        else:
+            generator = torch.Generator(device=self._device).manual_seed(seed)
         images = [Image.open(p).convert("RGB") for p in image_paths]
 
         kwargs: dict = dict(
             image=images, prompt=prompt, height=height, width=width,
             num_inference_steps=num_inference_steps,
+            num_images_per_prompt=num_images_per_prompt,
             generator=generator,
         )
         # Klein KV pipeline doesn't accept guidance_scale
@@ -250,23 +268,23 @@ class FluxManager:
         gc.collect()
         torch.cuda.empty_cache()
 
-        return self._to_webp(result.images[0])
+        return [self._to_webp(img) for img in result.images]
 
     # --- Async API ---
 
-    async def generate_text_to_image(self, *, model: str = "flux2-dev", **kwargs) -> bytes:
+    async def generate_text_to_image(self, *, model: str = "flux2-dev", **kwargs) -> list[bytes]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self._generate(model=model, **kwargs),
         )
 
-    async def generate_image_to_image(self, *, model: str = "flux2-dev", **kwargs) -> bytes:
+    async def generate_image_to_image(self, *, model: str = "flux2-dev", **kwargs) -> list[bytes]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self._img2img(model=model, **kwargs),
         )
 
-    async def generate_image_edit(self, *, model: str = "flux2-klein", **kwargs) -> bytes:
+    async def generate_image_edit(self, *, model: str = "flux2-klein", **kwargs) -> list[bytes]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self._edit(**kwargs),

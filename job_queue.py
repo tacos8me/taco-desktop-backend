@@ -64,7 +64,7 @@ class Job:
     progress: float = 0.0
     current_step: int = 0
     total_steps: int = 0
-    result_uri: str | None = None
+    result_uris: list[str] = field(default_factory=list)
     result_media_type: str | None = None
     error: str | None = None
     error_code: str | None = None
@@ -175,14 +175,22 @@ async def worker_loop(
         logger.info("Processing job %s (%s)", job.id, job.type)
 
         result_bytes: bytes | None = None
+        result_list: list[bytes] = []
         try:
             async with device_lock:
-                result_bytes = await dispatch_fn(job)
+                raw_result = await dispatch_fn(job)
 
-            upload_id, storage_uri = uploads.create()
-            uploads.save(upload_id, result_bytes)
+            # Normalize to list (FluxManager returns list[bytes], LTX returns bytes)
+            result_list = raw_result if isinstance(raw_result, list) else [raw_result]
+            result_bytes = result_list[0] if result_list else None
 
-            job.result_uri = storage_uri
+            uris = []
+            for img_bytes in result_list:
+                uid, uri = uploads.create()
+                uploads.save(uid, img_bytes)
+                uris.append(uri)
+
+            job.result_uris = uris
             job.result_media_type = _MEDIA_TYPES.get(job.type, "application/octet-stream")
             job.status = JobStatus.COMPLETED
             job.progress = 1.0
@@ -211,7 +219,7 @@ async def worker_loop(
                         height=params.get("height", 0),
                         turbo=params.get("turbo", False),
                         status=job.status,
-                        result_uri=job.result_uri,
+                        result_uri=job.result_uris[0] if job.result_uris else None,
                         result_bytes=result_bytes,
                         created_at=time.time(),
                         completed_at=time.time() if job.completed_at else None,
@@ -237,11 +245,12 @@ async def cleanup_loop(job_store: JobStore, uploads: UploadStore) -> None:
 
         for job_id in to_remove:
             job = job_store.get(job_id)
-            if job and job.result_uri and job.status != JobStatus.COMPLETED:
+            if job and job.result_uris and job.status != JobStatus.COMPLETED:
                 # Only delete result files for failed/cancelled jobs — completed results are managed by history
-                upload_id = job.result_uri.removeprefix("storage://")
-                path = uploads.base_dir / upload_id
-                path.unlink(missing_ok=True)
+                for uri in job.result_uris:
+                    upload_id = uri.removeprefix("storage://")
+                    path = uploads.base_dir / upload_id
+                    path.unlink(missing_ok=True)
             job_store.remove(job_id)
 
         if to_remove:

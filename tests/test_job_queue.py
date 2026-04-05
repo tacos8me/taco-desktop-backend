@@ -119,7 +119,7 @@ def test_v2_result_completed_returns_binary():
         from server import uploads
         uid, uri = uploads.create()
         uploads.save(uid, b"fake-webp-data")
-        job.result_uri = uri
+        job.result_uris = [uri]
         job_store.add(job)
 
         resp = client.get(f"/v2/jobs/{job.id}/result")
