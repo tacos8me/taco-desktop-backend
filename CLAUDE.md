@@ -53,6 +53,15 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - Accepts 1-10 images via `image_uris` list
 - Always uses Klein (model defaults to flux2-klein)
 
+### Batch generation (v2 only)
+- `num_images: int` field on TextToImageRequest (max 4), ImageToImageRequest (max 4), ImageEditRequest (max 8)
+- v1 sync endpoints always return single image regardless of num_images
+- v2: each image stored separately, served via `/v2/jobs/{id}/result/{index}`
+- `/v2/jobs/{id}/result` serves first image (backward compat)
+- FluxManager always returns `list[bytes]` — worker_loop handles multi-file storage
+- Each image gets seed+i for different variations
+- Klein edit max 8 (only ~400MB marginal per image on 96GB GPU)
+
 ## LTX pipeline details
 
 ### Models

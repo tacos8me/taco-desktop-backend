@@ -22,6 +22,8 @@ Identified via full codebase audit (2026-03-14), updated 2026-04-05. Items group
 14. ~~**Free transformer before upsample**~~ — DONE (all 4 pipelines)
 15. ~~**Consistent cache cleanup**~~ — DONE (i2v/a2v now match t2v/hq)
 16. ~~**Stage 2: 5 steps**~~ — DONE (was 3, better motion resolution)
+17. ~~**Batch image generation**~~ — DONE (num_images up to 4 for txt2img/img2img, up to 8 for Klein edit)
+18. ~~**Fast mode a2v**~~ — DONE (distilled transformer, 8 steps, same as t2v/i2v fast)
 
 ### Tier 2 — Remaining
 
