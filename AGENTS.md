@@ -43,6 +43,13 @@ ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temp
 16. **FlashAttention3** — install flash_attn_interface for sm_100 Blackwell, auto-detected by existing code
 17. **Streaming uploads** — request.stream() instead of request.body() for large files
 18. **torch.compile cache** — TORCHINDUCTOR_CACHE_DIR + FX_GRAPH_CACHE for persistent compilation
+21. **Retake distilled mode** — upstream supports `distilled=True` for fast retake
+22. **ComfyUI last_frame_fix** — append/trim last latent frame to fix end-of-video causal conv artifacts
+23. **IC-LoRA pipeline** — motion anchoring for temporal coherence (upstream `ICLoraPipeline`)
+
+## Audit Reports
+
+- [2026-04-06 ComfyUI Comparison](docs/audit-2026-04-06-comfyui-comparison.md) — 5-agent full codebase audit
 
 ### Key Files for Each Change
 
