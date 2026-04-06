@@ -314,7 +314,7 @@ def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int = 0) -> list[d
                 fi = num_frames - 1
             elif isinstance(fi, int) and fi < 0:
                 fi = num_frames + fi
-            if isinstance(fi, int) and fi < 0:
+            if isinstance(fi, int) and (fi < 0 or (num_frames > 0 and fi >= num_frames)):
                 return _error(422, f"Resolved frame_index {fi} is out of range for {num_frames} frames")
             path = str(uploads.resolve(kf.image_uri))
             keyframe_inputs.append({"image_path": path, "frame_index": fi, "strength": kf.strength})
