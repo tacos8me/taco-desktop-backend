@@ -42,16 +42,14 @@ lora_registry = LoRARegistry(config.LORAS_DIR)
 chat = ChatManager()
 history = HistoryStore()
 
-# Per-device inference locks: allow Flux (cuda:0) and LTX (cuda:1) to run concurrently.
-_flux_lock = asyncio.Lock()
-_ltx_lock = asyncio.Lock()
+# Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
+# when Flux and LTX run CUDA inference concurrently in the same process.
+_inference_lock = asyncio.Lock()
 _paused = False
 
-# Dual job queues — one per GPU, each with its own worker
+# Job queue
 job_store = JobStore()
-_flux_queue: asyncio.Queue[str] = asyncio.Queue()
-_ltx_queue: asyncio.Queue[str] = asyncio.Queue()
-_FLUX_JOB_TYPES = frozenset({JobType.TEXT_TO_IMAGE, JobType.IMAGE_TO_IMAGE, JobType.IMAGE_EDIT})
+_job_queue: asyncio.Queue[str] = asyncio.Queue()
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -117,24 +115,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     chat.load()
     logger.info("Chat proxy ready.")
 
-    flux_worker = asyncio.create_task(
-        worker_loop(job_store, _flux_queue, _flux_lock, _dispatch_job, uploads, history),
-        name="queue-worker-flux",
-    )
-    ltx_worker = asyncio.create_task(
-        worker_loop(job_store, _ltx_queue, _ltx_lock, _dispatch_job, uploads, history),
-        name="queue-worker-ltx",
+    worker_task = asyncio.create_task(
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history),
+        name="queue-worker",
     )
     cleanup_task = asyncio.create_task(
         cleanup_loop(job_store, uploads),
         name="queue-cleanup",
     )
-    logger.info("Job queues started (flux + ltx workers).")
+    logger.info("Job queue started.")
 
     yield
 
-    flux_worker.cancel()
-    ltx_worker.cancel()
+    worker_task.cancel()
     cleanup_task.cancel()
 
 
@@ -198,7 +191,7 @@ class TextToVideoRequest(BaseModel):
 
 class KeyframeInput(BaseModel):
     image_uri: str
-    frame_index: int = Field(default=0, ge=0)
+    frame_index: int | Literal["first", "middle", "last"] = Field(default=0)
     strength: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
@@ -301,8 +294,8 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
     return prompt
 
 
-def _resolve_keyframes(body: ImageToVideoRequest) -> list[dict] | JSONResponse:
-    """Resolve keyframes from an ImageToVideoRequest. Returns list of dicts or JSONResponse on error."""
+def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int = 0) -> list[dict] | JSONResponse:
+    """Resolve keyframes, converting symbolic/negative frame indices to absolute values."""
     if body.keyframes and body.image_uri:
         return _error(422, "Cannot specify both image_uri and keyframes")
     if body.keyframes:
@@ -310,15 +303,26 @@ def _resolve_keyframes(body: ImageToVideoRequest) -> list[dict] | JSONResponse:
             return _error(422, "keyframes list must not be empty")
         if len(body.keyframes) > 8:
             return _error(422, "At most 8 keyframes are allowed")
-        frame_indices = [kf.frame_index for kf in body.keyframes]
-        if len(frame_indices) != len(set(frame_indices)):
-            return _error(422, "Duplicate frame_index values are not allowed")
-        if frame_indices.count(0) > 1:
-            return _error(422, "At most one keyframe can have frame_index 0")
         keyframe_inputs = []
         for kf in body.keyframes:
+            fi = kf.frame_index
+            if fi == "first":
+                fi = 0
+            elif fi == "middle":
+                fi = num_frames // 2
+            elif fi == "last":
+                fi = num_frames - 1
+            elif isinstance(fi, int) and fi < 0:
+                fi = num_frames + fi
+            if isinstance(fi, int) and fi < 0:
+                return _error(422, f"Resolved frame_index {fi} is out of range for {num_frames} frames")
             path = str(uploads.resolve(kf.image_uri))
-            keyframe_inputs.append({"image_path": path, "frame_index": kf.frame_index, "strength": kf.strength})
+            keyframe_inputs.append({"image_path": path, "frame_index": fi, "strength": kf.strength})
+        frame_indices = [kf["frame_index"] for kf in keyframe_inputs]
+        if len(frame_indices) != len(set(frame_indices)):
+            return _error(422, "Duplicate frame_index values after resolution")
+        if frame_indices.count(0) > 1:
+            return _error(422, "At most one keyframe can have frame_index 0")
         return keyframe_inputs
     elif body.image_uri:
         path = str(uploads.resolve(body.image_uri))
@@ -376,13 +380,11 @@ async def system_pause() -> dict:
     if _paused:
         return {"status": "already_paused"}
     try:
-        async with _flux_lock:
-          async with _ltx_lock:
+        async with _inference_lock:
             # Cancel queued (not yet processing) jobs
-            for q in (_flux_queue, _ltx_queue):
-              while not q.empty():
+            while not _job_queue.empty():
                 try:
-                    job_id = q.get_nowait()
+                    job_id = _job_queue.get_nowait()
                     job = job_store.get(job_id)
                     if job and job.status == JobStatus.QUEUED:
                         job.status = JobStatus.FAILED
@@ -407,8 +409,7 @@ async def system_resume() -> dict:
     if not _paused:
         return {"status": "already_running"}
     try:
-        async with _flux_lock:
-          async with _ltx_lock:
+        async with _inference_lock:
             manager.load_all()
             if config.LOAD_FLUX:
                 flux.load()
@@ -426,7 +427,7 @@ async def flux_unload() -> dict:
     if not flux.is_ready:
         return {"status": "already_unloaded"}
     try:
-        async with _flux_lock:
+        async with _inference_lock:
             flux.unload()
         logger.info("Flux unloaded from GPU0")
         return {"status": "unloaded"}
@@ -441,7 +442,7 @@ async def flux_reload() -> dict:
     if flux.is_ready:
         return {"status": "already_loaded"}
     try:
-        async with _flux_lock:
+        async with _inference_lock:
             flux.load()
         logger.info("Flux reloaded to GPU0")
         return {"status": "loaded"}
@@ -467,7 +468,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _ltx_lock:
+        async with _inference_lock:
             video_bytes = await manager.generate_text_to_video(
                 prompt=prompt,
                 model=body.model,
@@ -489,7 +490,8 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
 
 @app.post("/v1/image-to-video")
 async def image_to_video(body: ImageToVideoRequest) -> Response:
-    keyframe_inputs = _resolve_keyframes(body)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    keyframe_inputs = _resolve_keyframes(body, num_frames)
     if isinstance(keyframe_inputs, JSONResponse):
         return keyframe_inputs
     if _paused:
@@ -502,7 +504,6 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
     lora_path, lora_strength = lora_result
     try:
         width, height = _resolution_to_dims(body.resolution)
-        num_frames = _duration_to_frames(body.duration, body.fps)
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
@@ -550,7 +551,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _ltx_lock:
+        async with _inference_lock:
             video_bytes = await manager.generate_audio_to_video(
                 prompt=body.prompt,
                 audio_path=audio_path,
@@ -589,7 +590,7 @@ async def retake(body: RetakeRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _ltx_lock:
+        async with _inference_lock:
             video_bytes = await manager.retake(
                 video_path=video_path,
                 start_time=body.start_time,
@@ -620,7 +621,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.FLUX_DEVICE)
-        async with _flux_lock:
+        async with _inference_lock:
             image_bytes = await flux.generate_text_to_image(
                 prompt=body.prompt,
                 width=width,
@@ -650,7 +651,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.FLUX_DEVICE)
-        async with _flux_lock:
+        async with _inference_lock:
             image_bytes = await flux.generate_image_to_image(
                 prompt=body.prompt,
                 image_path=image_path,
@@ -683,7 +684,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.FLUX_DEVICE)
-        async with _flux_lock:
+        async with _inference_lock:
             image_bytes = await flux.generate_image_edit(
                 prompt=body.prompt,
                 image_paths=image_paths,
@@ -850,8 +851,7 @@ def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONRespon
 
     job = Job(id=make_job_id(), type=job_type, params=params, api_key=api_key)
     job_store.add(job)
-    target_queue = _flux_queue if job_type in _FLUX_JOB_TYPES else _ltx_queue
-    target_queue.put_nowait(job.id)
+    _job_queue.put_nowait(job.id)
 
     return JSONResponse(
         status_code=202,
@@ -883,15 +883,15 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
 
 @app.post("/v2/image-to-video")
 async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSONResponse:
-    keyframe_inputs = _resolve_keyframes(body)
+    width, height = _resolution_to_dims(body.resolution)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    keyframe_inputs = _resolve_keyframes(body, num_frames)
     if isinstance(keyframe_inputs, JSONResponse):
         return keyframe_inputs
     lora_result = _resolve_lora(body)
     if isinstance(lora_result, JSONResponse):
         return lora_result
     lora_path, lora_strength = lora_result
-    width, height = _resolution_to_dims(body.resolution)
-    num_frames = _duration_to_frames(body.duration, body.fps)
     seed = random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, keyframes=keyframe_inputs, model=body.model,
                   width=width, height=height, num_frames=num_frames, fps=body.fps,

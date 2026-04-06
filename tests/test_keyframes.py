@@ -82,9 +82,35 @@ def test_too_many_keyframes_rejected():
     assert resp.status_code == 422
 
 
-def test_negative_frame_index_rejected():
-    """Pydantic ge=0 should reject negative frame_index."""
+def test_negative_frame_index_accepted():
+    """Negative frame_index is now supported (Python-style: -1 = last)."""
     resp = _post({"keyframes": [{"image_uri": _uri_1, "frame_index": -1}]})
+    # Should pass validation (500 = no GPU, not 422)
+    assert resp.status_code in (500, 202)
+
+
+def test_symbolic_first_last():
+    """Symbolic 'first' and 'last' frame indices."""
+    resp = _post({"keyframes": [
+        {"image_uri": _uri_1, "frame_index": "first", "strength": 1.0},
+        {"image_uri": _uri_2, "frame_index": "last", "strength": 1.0},
+    ]})
+    assert resp.status_code in (500, 202)
+
+
+def test_symbolic_first_mid_last():
+    """Symbolic 'first', 'middle', 'last' frame indices."""
+    resp = _post({"keyframes": [
+        {"image_uri": _uri_1, "frame_index": "first"},
+        {"image_uri": _uri_2, "frame_index": "middle", "strength": 0.5},
+        {"image_uri": _uri_1, "frame_index": "last"},
+    ]})
+    assert resp.status_code in (500, 202)
+
+
+def test_symbolic_invalid_rejected():
+    """Invalid symbolic value should be rejected."""
+    resp = _post({"keyframes": [{"image_uri": _uri_1, "frame_index": "center"}]})
     assert resp.status_code == 422
 
 
