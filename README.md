@@ -128,11 +128,42 @@ Same as text-to-video, plus:
 | Field | Type | Default | Constraints |
 |-------|------|---------|-------------|
 | `image_uri` | string | `null` | Single reference image (use this OR keyframes) |
-| `keyframes` | array | `null` | `[{"image_uri": "...", "frame_index": 0, "strength": 1.0}]` |
+| `keyframes` | array | `null` | See keyframe format below |
 
 - Either `image_uri` or `keyframes`, not both
-- Max 8 keyframes, at most one with `frame_index: 0`
-- `strength`: 0.0 (ignore) to 1.0 (exact match)
+- Max 8 keyframes, at most one at frame 0
+- `strength`: 0.0 (fully denoised) to 1.0 (fully constrained)
+
+**Keyframe format**:
+```json
+{"image_uri": "storage://uuid", "frame_index": 0, "strength": 1.0}
+```
+
+`frame_index` accepts:
+- **Integers**: `0`, `30`, `60` — absolute frame position
+- **Negative integers**: `-1` (last frame), `-12` (12 frames before end, recommended "landing room")
+- **Symbolic**: `"first"` (frame 0), `"middle"` (num_frames/2), `"last"` (num_frames-1)
+
+**First/mid/last example** (recommended for music video transitions):
+```json
+{
+  "keyframes": [
+    {"image_uri": "storage://start", "frame_index": "first", "strength": 1.0},
+    {"image_uri": "storage://mid", "frame_index": "middle", "strength": 0.5},
+    {"image_uri": "storage://end", "frame_index": "last", "strength": 1.0}
+  ]
+}
+```
+
+**First + last only**:
+```json
+{
+  "keyframes": [
+    {"image_uri": "storage://start", "frame_index": "first", "strength": 1.0},
+    {"image_uri": "storage://end", "frame_index": -1, "strength": 1.0}
+  ]
+}
+```
 
 #### Audio-to-Video
 
