@@ -294,7 +294,7 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
     return prompt
 
 
-def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int = 0) -> list[dict] | JSONResponse:
+def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int) -> list[dict] | JSONResponse:
     """Resolve keyframes, converting symbolic/negative frame indices to absolute values."""
     if body.keyframes and body.image_uri:
         return _error(422, "Cannot specify both image_uri and keyframes")
@@ -321,8 +321,6 @@ def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int = 0) -> list[d
         frame_indices = [kf["frame_index"] for kf in keyframe_inputs]
         if len(frame_indices) != len(set(frame_indices)):
             return _error(422, "Duplicate frame_index values after resolution")
-        if frame_indices.count(0) > 1:
-            return _error(422, "At most one keyframe can have frame_index 0")
         return keyframe_inputs
     elif body.image_uri:
         path = str(uploads.resolve(body.image_uri))
@@ -507,7 +505,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         torch.cuda.set_device(config.LTX_DEVICE)
-        async with _ltx_lock:
+        async with _inference_lock:
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
                 keyframes=keyframe_inputs,

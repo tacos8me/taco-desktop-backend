@@ -5,7 +5,7 @@ Multi-GPU inference server for AI video and image generation. Powers [noodle-i](
 - **Video**: LTX-2.3 (22B transformer) on cuda:1 — text-to-video, image-to-video, audio-to-video, temporal retake
 - **Image**: Flux 2 Dev/Klein KV on cuda:0 — text-to-image, image-to-image, multi-reference editing
 - **Chat**: Gemma 3 12B via llama-swap proxy
-- **Concurrent**: Flux and LTX run in parallel on separate GPUs
+- **Serialized**: Flux and LTX share a single inference lock (FP8 cuBLAS constraint)
 
 ## Quick Start
 
@@ -389,7 +389,7 @@ For `image-edit`:
 | cuda:1 | RTX PRO 6000 | 96GB | LTX-2.3 | ~69GB |
 | cuda:2 | RTX PRO 4000 | 24GB | Unused | — |
 
-Flux and LTX run **concurrently** on separate GPUs via per-device locks.
+Flux and LTX share a single inference lock (FP8 layerwise casting causes cuBLAS crashes with concurrent multi-GPU inference).
 
 ---
 
@@ -407,7 +407,7 @@ uv run --no-sync pytest tests/ -q -p no:cacheprovider
 
 | File | Purpose |
 |------|---------|
-| `server.py` | FastAPI app, all endpoints, dual job queues |
+| `server.py` | FastAPI app, all endpoints, job queue |
 | `split_model_manager.py` | LTX-2 pipeline, transformer swapping, VAE decode |
 | `flux_manager.py` | Flux 2 pipeline, model swapping (Dev/Klein), FP8 |
 | `job_queue.py` | Async job queues with per-device workers |

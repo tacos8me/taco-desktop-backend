@@ -27,7 +27,7 @@ def _with_no_auth():
 
 
 def _cleanup_queue():
-    """Drain both queues and clear the store."""
+    """Drain the queue and clear the store."""
     while not _job_queue.empty():
         try:
             _job_queue.get_nowait()
