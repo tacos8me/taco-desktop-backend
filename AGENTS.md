@@ -24,6 +24,19 @@ Identified via full codebase audit (2026-03-14). Items grouped by tier.
 13. ~~**TF32 + cudnn.allow_tf32 at startup**~~ — REVERSED: TF32 now DISABLED. Was degrading VAE decode quality on Blackwell (VAE uses force_upcast=True expecting real float32, TF32 reduced mantissa 23→10 bits)
 14. **BytesIO for encode_video** — eliminate temp file disk I/O in _video_to_bytes (~100ms/gen)
 
+### v1.1 Features (SHIPPED)
+
+19. ~~**First/mid/last keyframes**~~ — DONE. Symbolic frame_index ("first", "middle", "last") + negative integers (-1 = last, -12 = landing room). Resolved server-side after num_frames computed.
+20. ~~**Bounds checking**~~ — DONE. frame_index >= num_frames → 422.
+
+### VAE Tiling Notes (from ComfyUI comparison)
+
+ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temporal tiling). Our approach:
+- SHORT_VIDEO_THRESHOLD=257 — no tiling for ≤10s videos (best quality, single-pass)
+- Temporal-only tiling (128/32) for longer videos
+- Spatial tiling disabled (caused grid seams)
+- If re-enabling spatial tiling: use 512/64 with cosine S-curve blending (already in ltx-core)
+
 ### Tier 3 — Experimental / Higher Effort
 
 15. **torch.compile on transformer** — 20-40% denoising speedup, needs careful testing with weight swaps

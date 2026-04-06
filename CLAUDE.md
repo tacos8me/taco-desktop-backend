@@ -65,6 +65,15 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Frame count must be 8k+1; resolution multiples of 64
 - Port 8090, auth via `.api_keys` file (disabled when empty)
 
+## Keyframe symbolic indices (v1.1)
+- `KeyframeInput.frame_index` accepts `int | "first" | "middle" | "last"`
+- Negative integers supported: -1 = last frame, -12 = 12 frames before end
+- Symbolic values resolved in `_resolve_keyframes(body, num_frames)` after num_frames computed
+- "first"=0, "middle"=num_frames//2, "last"=num_frames-1
+- Duplicate detection on resolved integer values (e.g., "first" and 0 conflict → 422)
+- Bounds check: frame_index >= num_frames → 422
+- Recommended strengths: first=1.0, middle=0.5, last=1.0
+
 ## Generation history (history_store.py)
 - SQLite DB at `/mnt/nvme-1/servers/taco-backend/history.db`
 - Saves every completed v2 job with prompt, model, dimensions, result_uri, thumbnail
