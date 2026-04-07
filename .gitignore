@@ -11,3 +11,4 @@ uv.lock
 .env
 .api_keys
 .gstack/
+resume.md
