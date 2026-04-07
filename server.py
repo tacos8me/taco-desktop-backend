@@ -145,9 +145,7 @@ app.add_middleware(
 async def check_api_key(request: Request, call_next):
     if not config.API_KEYS:
         return await call_next(request)
-    if request.url.path in ("/health", "/v1/approved-images/events",
-                              "/v1/system/pause", "/v1/system/resume",
-                              "/v1/flux/unload", "/v1/flux/reload"):
+    if request.url.path in ("/health", "/v1/approved-images/events"):
         return await call_next(request)
 
     auth = request.headers.get("Authorization", "")
