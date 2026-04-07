@@ -128,6 +128,7 @@ Same as text-to-video, plus:
 | Field | Type | Default | Constraints |
 |-------|------|---------|-------------|
 | `image_uri` | string | `null` | Single reference image (use this OR keyframes) |
+| `image_strength` | float | `0.85` | Strength for single `image_uri` (0.0-1.0) |
 | `keyframes` | array | `null` | See keyframe format below |
 
 - Either `image_uri` or `keyframes`, not both
@@ -340,17 +341,56 @@ For `image-edit`:
 
 ## System & Management
 
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/health` | GET | No | Server status |
+| `/v1/system/pause` | POST | No | Free GPU VRAM for training |
+| `/v1/system/resume` | POST | No | Reload all models |
+| `/v1/flux/unload` | POST | No | Unload Flux from cuda:0 |
+| `/v1/flux/reload` | POST | No | Reload Flux to cuda:0 |
+| `/v1/loras` | GET | Yes | List LoRAs |
+| `/v1/loras` | POST | Yes | Upload LoRA (multipart: `file`, `name`, `description`) |
+| `/v1/loras/{id}` | DELETE | Yes | Delete LoRA |
+| `/v1/chat/completions` | POST | Yes | Chat/vision proxy to llama-swap (OpenAI-compatible) |
+
+### History
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Server status (no auth) |
-| `/v1/system/pause` | POST | Free GPU VRAM for training |
-| `/v1/system/resume` | POST | Reload all models |
-| `/v1/loras` | GET | List LoRAs |
-| `/v1/loras` | POST | Upload LoRA (multipart form) |
-| `/v1/loras/{id}` | DELETE | Delete LoRA |
-| `/v2/history` | GET | List past generations |
-| `/v2/history/{id}/image` | GET | Download generation result |
+| `/v2/history` | GET | List past generations (`?limit=50&offset=0&type=text-to-video`) |
+| `/v2/history/{id}/image` | GET | Download generation result (MP4/WEBP) |
 | `/v2/history/{id}/thumbnail` | GET | 256px JPEG thumbnail |
+
+Per-API-key scoped. 30-day retention.
+
+### Approved Images (noodle-i → noodle-v pipeline)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/approved-images` | POST | Submit image for approval |
+| `/v1/approved-images` | GET | List approved images (`?limit=50&offset=0`) |
+| `/v1/approved-images/{id}/file` | GET | Download approved image |
+| `/v1/approved-images/events` | GET | SSE stream of new approvals (use `?token=` from `/v1/sse-token`) |
+| `/v1/sse-token` | POST | Get 5-minute disposable token for SSE connections |
+
+### Compositions (video editing)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v2/compositions` | POST | Create composition |
+| `/v2/compositions` | GET | List compositions |
+| `/v2/compositions/{id}` | GET | Get composition |
+| `/v2/compositions/{id}` | PUT | Update composition |
+| `/v2/compositions/{id}` | DELETE | Delete composition |
+| `/v2/compositions/{id}/export` | POST | Export as video (async job) |
+
+### Character Ranking (vision)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v2/char/rank` | POST | Rank character consistency between reference and generated image |
+
+Request: `{"rank_image_uri": "storage://...", "generated_image_uri": "storage://...", "prompt": "..."}`
 
 ---
 
@@ -365,6 +405,7 @@ For `image-edit`:
 | 401 | Invalid API key | Check `Authorization: Bearer` header |
 | 404 | Not found | Check ID; results expire after 10min |
 | 409 | Not ready | Job still processing — keep polling |
+| 413 | Upload too large | Max 1GB per upload |
 | 422 | Validation error | Check request field constraints |
 | 429 | Queue full (10 jobs) | Wait 30s, retry |
 | 500 | GPU OOM or generation failed | Reduce resolution or wait |
