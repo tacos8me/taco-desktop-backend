@@ -344,10 +344,10 @@ For `image-edit`:
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Server status |
-| `/v1/system/pause` | POST | No | Free GPU VRAM for training |
-| `/v1/system/resume` | POST | No | Reload all models |
-| `/v1/flux/unload` | POST | No | Unload Flux from cuda:0 |
-| `/v1/flux/reload` | POST | No | Reload Flux to cuda:0 |
+| `/v1/system/pause` | POST | Yes | Free GPU VRAM for training |
+| `/v1/system/resume` | POST | Yes | Reload all models |
+| `/v1/flux/unload` | POST | Yes | Unload Flux from cuda:0 |
+| `/v1/flux/reload` | POST | Yes | Reload Flux to cuda:0 |
 | `/v1/loras` | GET | Yes | List LoRAs |
 | `/v1/loras` | POST | Yes | Upload LoRA (multipart: `file`, `name`, `description`) |
 | `/v1/loras/{id}` | DELETE | Yes | Delete LoRA |
