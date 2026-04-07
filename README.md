@@ -425,7 +425,8 @@ uv run --no-sync pytest tests/ -q -p no:cacheprovider
 ### Dependencies
 
 - Python 3.13+, uv package manager
-- PyTorch 2.9+ (cu130 for Blackwell sm_100)
-- diffusers from git main (required for Flux2KleinKVPipeline)
+- PyTorch 2.11.0+cu130 (Blackwell sm_120, FlexAttention/FA4)
+- diffusers 0.38.0.dev0 from git main (required for Flux2KleinKVPipeline)
 - LTX-2 repo at `/mnt/nvme-1/repos/LTX-2` (editable install)
-- cuDNN >=9.20, cuBLAS >=13.2 (manually pinned, revert on `uv sync`)
+- cuDNN 9.20+, cuBLAS 13.2+ (manually pinned — revert on `uv sync`)
+- comfy-kitchen (NVFP4 dequantization for Sikaworld text encoder)

@@ -105,8 +105,12 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Sikaworld path: `/mnt/nvme-1/huggingface/gemma-3-12b-sikaworld/`
 
 ## Dependencies
-- LTX-2 repo: `/mnt/nvme-1/repos/LTX-2` (editable install)
+- **PyTorch 2.11.0+cu130** — FlexAttention/FA4 on Blackwell sm_120, SDPA auto-selects cuDNN FlashAttention
+- **diffusers 0.38.0.dev0** (git main) — required for Flux2KleinKVPipeline (not in any stable release)
+- LTX-2 repo: `/mnt/nvme-1/repos/LTX-2` (editable install, `torch~=2.7` pin is PEP 440 compatible with 2.11)
 - Checkpoints: `/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/`
-- cuDNN >=9.15 required (fixes conv3d memory bug in VAE decode)
-- nvidia-cublas 13.2+ (20% BF16/FP8 speedup on Blackwell)
+- cuDNN >=9.20 (fixes conv3d memory bug) — currently 9.20.0.48
+- cuBLAS >=13.2 (BF16/FP8 Blackwell speedup) — currently 13.3.0.5
+- nvidia packages revert on `uv sync` — use `--no-sync` for runtime, manual pip for upgrades
 - peft (required for LoRA loading via diffusers)
+- comfy-kitchen (required for NVFP4 dequantization of Sikaworld text encoder)
