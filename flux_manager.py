@@ -238,8 +238,23 @@ class FluxManager:
                 pass
 
     def _to_webp(self, image: Image.Image) -> bytes:
+        """Encode PIL image as LOSSLESS WEBP (VP8L).
+
+        Lossy WEBP (VP8) uses YUV 4:2:0 chroma subsampling by default, which
+        introduces grid/screendoor patterns on smooth gradients and flat color
+        regions — exactly where users notice them first on Flux outputs (glass
+        reflections, wood grain, sky). VP8L encodes RGB directly with no color
+        space conversion, preserving the exact pixels the transformer produced.
+
+        File size is ~2-3x larger than VP8 quality=95, but still smaller than
+        PNG in most cases and acceptable for an image generation API.
+
+        `method=6` selects the slowest/highest-compression encoding path;
+        lossless WEBP encoding speed scales with image size but is still
+        dominated by the ~20-step denoising work anyway.
+        """
         buf = io.BytesIO()
-        image.save(buf, format="WEBP", quality=95)
+        image.save(buf, format="WEBP", lossless=True, quality=100, method=6)
         return buf.getvalue()
 
     @torch.inference_mode()
