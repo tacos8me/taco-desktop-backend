@@ -65,6 +65,28 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Frame count must be 8k+1; resolution multiples of 64
 - Port 8090, auth via `.api_keys` file (disabled when empty)
 
+## Flux LoRA (v1.1 — folder-drop discovery)
+- Storage: `/mnt/nvme-1/servers/taco-backend/flux_loras/` (filesystem is source of truth, no registry.json)
+- ID = slugified filename stem (`MyStyle.safetensors` → `mystyle`)
+- Optional sidecar `.json` next to `.safetensors` for name/description/trigger_word/model_compat
+- Endpoints: `GET /v1/flux-loras` (list), `POST /v1/flux-loras/rescan` (re-scan folder)
+- Request field: `lora: {id, strength}` on `TextToImageRequest` / `ImageToImageRequest` / `ImageEditRequest`
+- Reuses the existing `LoRAInput` pydantic model (same `{id, strength}` shape as LTX)
+- No upload endpoint by design — files managed via `cp`/`rm`
+
+### LoRA fusion sequence (critical — FP8 + LoRA ordering)
+LoRA fusion MUST happen BEFORE `enable_layerwise_casting(float8_e4m3fn)`. PEFT cannot inject adapters into an already-FP8-cast transformer — the quantized state dict uses `_data`/`_scale` tensors (diffusers issues #9514, #11648). In `flux_manager.py::load()`:
+1. Build base pipeline (`Flux2Pipeline.from_pretrained` or `Flux2KleinKVPipeline.from_pretrained(transformer=...)`)
+2. `pipe.load_lora_weights(path, adapter_name="user_lora")` + `pipe.fuse_lora(adapter_names=["user_lora"], lora_scale=strength)` + `pipe.unload_lora_weights()`
+3. `pipe.transformer.enable_layerwise_casting(storage_dtype=float8_e4m3fn, compute_dtype=bfloat16, skip_modules_pattern=["x_embedder","context_embedder","proj_out"])`
+4. `pipe.to(device)`
+
+### FluxManager cache key
+- `(self._current_model, self._current_lora)` where `_current_lora = (path, strength) | None`
+- `ensure_model(model_name, user_lora)` cache-hits iff both match
+- Any change → full pipeline unload + reload (~10-15s). Same LoRA reused = zero overhead.
+- LoRA fusion is permanent (same as LTX) — different strength requires reload
+
 ## Keyframe symbolic indices (v1.1)
 - `KeyframeInput.frame_index` accepts `int | "first" | "middle" | "last"`
 - Negative integers supported: -1 = last frame, -12 = 12 frames before end

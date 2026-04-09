@@ -23,6 +23,7 @@ from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
 from lora_registry import LoRARegistry
+from flux_lora_registry import FluxLoRARegistry
 from job_queue import (
     Job, JobStatus, JobType, JobStore, make_job_id, make_flux_callback,
     worker_loop, cleanup_loop,
@@ -39,6 +40,7 @@ manager = SplitModelManager()
 flux = FluxManager()
 uploads = UploadStore(config.UPLOAD_DIR)
 lora_registry = LoRARegistry(config.LORAS_DIR)
+flux_lora_registry = FluxLoRARegistry(config.FLUX_LORAS_DIR)
 chat = ChatManager()
 history = HistoryStore()
 
@@ -237,6 +239,7 @@ class TextToImageRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
     turbo: bool = False
+    lora: LoRAInput | None = None
 
 
 class ImageToImageRequest(BaseModel):
@@ -249,6 +252,7 @@ class ImageToImageRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
     turbo: bool = False
+    lora: LoRAInput | None = None
 
 
 class ImageEditRequest(BaseModel):
@@ -260,6 +264,7 @@ class ImageEditRequest(BaseModel):
     num_inference_steps: int = Field(default=4, ge=1, le=100)
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
+    lora: LoRAInput | None = None
 
 
 class ChatMessage(BaseModel):
@@ -335,6 +340,16 @@ def _resolve_lora(body) -> tuple[str | None, float] | JSONResponse:
     if info is None:
         return _error(404, f"LoRA not found: {body.lora.id}")
     return str(lora_registry.resolve_path(body.lora.id)), body.lora.strength
+
+
+def _resolve_flux_lora(body) -> tuple[str | None, float] | JSONResponse:
+    """Resolve optional Flux LoRA from request. Returns (path, strength) or JSONResponse on error."""
+    if not getattr(body, "lora", None):
+        return None, 1.0
+    info = flux_lora_registry.get(body.lora.id)
+    if info is None:
+        return _error(404, f"Flux LoRA not found: {body.lora.id}")
+    return str(flux_lora_registry.resolve_path(body.lora.id)), body.lora.strength
 
 
 def _error(status: int, msg: str) -> JSONResponse:
@@ -611,6 +626,10 @@ async def text_to_image(body: TextToImageRequest) -> Response:
         return _error(503, "System is paused for maintenance")
     if not config.LOAD_FLUX:
         return _error(500, "Flux not enabled")
+    flux_lora_result = _resolve_flux_lora(body)
+    if isinstance(flux_lora_result, JSONResponse):
+        return flux_lora_result
+    lora_path, lora_strength = flux_lora_result
     try:
         width = (body.width // 16) * 16
         height = (body.height // 16) * 16
@@ -627,6 +646,8 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 seed=seed,
                 model=body.model,
                 turbo=body.turbo,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except Exception as exc:
@@ -640,6 +661,10 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         return _error(503, "System is paused for maintenance")
     if not config.LOAD_FLUX:
         return _error(500, "Flux not enabled")
+    flux_lora_result = _resolve_flux_lora(body)
+    if isinstance(flux_lora_result, JSONResponse):
+        return flux_lora_result
+    lora_path, lora_strength = flux_lora_result
     try:
         image_path = str(uploads.resolve(body.image_uri))
         width = (body.width // 16) * 16
@@ -658,6 +683,8 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 seed=seed,
                 model=body.model,
                 turbo=body.turbo,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FileNotFoundError as exc:
@@ -673,6 +700,10 @@ async def image_edit(body: ImageEditRequest) -> Response:
         return _error(503, "System is paused for maintenance")
     if not config.LOAD_FLUX:
         return _error(500, "Flux pipeline not loaded")
+    flux_lora_result = _resolve_flux_lora(body)
+    if isinstance(flux_lora_result, JSONResponse):
+        return flux_lora_result
+    lora_path, lora_strength = flux_lora_result
     try:
         image_paths = [str(uploads.resolve(uri)) for uri in body.image_uris]
         width = (body.width // 16) * 16
@@ -689,6 +720,8 @@ async def image_edit(body: ImageEditRequest) -> Response:
                 num_inference_steps=body.num_inference_steps,
                 guidance_scale=body.guidance_scale,
                 seed=seed,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FileNotFoundError as exc:
@@ -823,6 +856,31 @@ async def delete_lora(lora_id: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Flux LoRA endpoints (folder-drop — no upload, no delete)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/flux-loras")
+async def list_flux_loras() -> JSONResponse:
+    loras = flux_lora_registry.list_all()
+    return JSONResponse(content={
+        "loras": [
+            {"id": l.id, "name": l.name, "filename": l.filename,
+             "size_bytes": l.size_bytes, "model_compat": l.model_compat,
+             "description": l.description, "trigger_word": l.trigger_word}
+            for l in loras
+        ],
+        "count": len(loras),
+    })
+
+
+@app.post("/v1/flux-loras/rescan")
+async def rescan_flux_loras() -> JSONResponse:
+    count = flux_lora_registry.rescan()
+    return JSONResponse(content={"rescanned": True, "count": count})
+
+
+# ---------------------------------------------------------------------------
 # V2 Async Job Endpoints
 # ---------------------------------------------------------------------------
 
@@ -935,18 +993,27 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
 
 @app.post("/v2/text-to-image")
 async def v2_text_to_image(body: TextToImageRequest, request: Request) -> JSONResponse:
+    flux_lora_result = _resolve_flux_lora(body)
+    if isinstance(flux_lora_result, JSONResponse):
+        return flux_lora_result
+    lora_path, lora_strength = flux_lora_result
     width = (body.width // 16) * 16
     height = (body.height // 16) * 16
     seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model, turbo=body.turbo)
+                  model=body.model, turbo=body.turbo,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.TEXT_TO_IMAGE, params, request)
 
 
 @app.post("/v2/image-to-image")
 async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSONResponse:
+    flux_lora_result = _resolve_flux_lora(body)
+    if isinstance(flux_lora_result, JSONResponse):
+        return flux_lora_result
+    lora_path, lora_strength = flux_lora_result
     image_path = str(uploads.resolve(body.image_uri))
     width = (body.width // 16) * 16
     height = (body.height // 16) * 16
@@ -954,12 +1021,17 @@ async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSON
     params = dict(prompt=body.prompt, image_path=image_path, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model, turbo=body.turbo)
+                  model=body.model, turbo=body.turbo,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.IMAGE_TO_IMAGE, params, request)
 
 
 @app.post("/v2/image-edit")
 async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONResponse:
+    flux_lora_result = _resolve_flux_lora(body)
+    if isinstance(flux_lora_result, JSONResponse):
+        return flux_lora_result
+    lora_path, lora_strength = flux_lora_result
     image_paths = [str(uploads.resolve(uri)) for uri in body.image_uris]
     width = (body.width // 16) * 16
     height = (body.height // 16) * 16
@@ -967,7 +1039,8 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
     params = dict(prompt=body.prompt, image_paths=image_paths, width=width, height=height,
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
-                  model=body.model)
+                  model=body.model,
+                  lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.IMAGE_EDIT, params, request)
 
 

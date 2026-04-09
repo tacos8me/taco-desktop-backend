@@ -1,5 +1,6 @@
 uploads/
 loras/
+flux_loras/
 thumbnails/
 history.db
 approved-images/

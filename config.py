@@ -72,6 +72,7 @@ THUMBNAIL_DIR = Path("/mnt/nvme-1/servers/taco-backend/thumbnails")
 # LoRA storage
 LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/loras")
 MAX_LORA_SIZE_BYTES = 1024 * 1024 * 1024  # 1GB
+FLUX_LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/flux_loras")
 
 # Job queue
 MAX_QUEUE_DEPTH = 10

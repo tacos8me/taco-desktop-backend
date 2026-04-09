@@ -28,6 +28,7 @@ Identified via full codebase audit (2026-03-14). Items grouped by tier.
 
 19. ~~**First/mid/last keyframes**~~ — DONE. Symbolic frame_index ("first", "middle", "last") + negative integers (-1 = last, -12 = landing room). Resolved server-side after num_frames computed.
 20. ~~**Bounds checking**~~ — DONE. frame_index >= num_frames → 422.
+24. ~~**Flux 2 LoRA (folder-drop)**~~ — DONE (2026-04-09). `flux_lora_registry.py` scans `flux_loras/` for `.safetensors`; optional sidecar `.json` for metadata; `GET /v1/flux-loras` + `POST /v1/flux-loras/rescan`; `lora: {id, strength}` field on Flux image requests; fuse-before-FP8-cast with `(model, user_lora)` cache key. Works on both flux2-dev and flux2-klein.
 
 ### VAE Tiling Notes (from ComfyUI comparison)
 

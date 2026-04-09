@@ -293,6 +293,7 @@ Models swap on demand — first request to a different model adds ~5-10s swap ti
 | `guidance_scale` | float | `4.0` | 0-20. Ignored by Klein (distilled, no CFG) |
 | `seed` | int | random | For reproducibility. Same seed + params = same image |
 | `turbo` | bool | `false` | Dev only — forces 8 steps, guidance 2.5 |
+| `lora` | object | `null` | `{id, strength}` — see Flux LoRA section below |
 
 For `image-to-image`: add `"image_uri": "storage://uuid"`
 
@@ -308,6 +309,48 @@ For `image-edit`:
 - 1-10 reference images. All references condition every output (style/composition blending).
 
 **Response** (v1): raw WEBP bytes (`Content-Type: image/webp`, quality 95)
+
+### Flux LoRAs (folder-drop)
+
+Drop `.safetensors` files into `/mnt/nvme-1/servers/taco-backend/flux_loras/` — they're picked up on server start and via `POST /v1/flux-loras/rescan`. There is no upload endpoint by design; files are managed with `cp` / `rm`. The LoRA's `id` is the slugified filename stem (e.g., `My Style v2.safetensors` → `my-style-v2`).
+
+Optionally place a same-named `.json` sidecar alongside the `.safetensors` for display metadata:
+```json
+{
+  "name": "Painterly Style",
+  "description": "Oil-painting look, trained on 2000 steps",
+  "trigger_word": "inthestyleof",
+  "model_compat": ["flux2-dev"]
+}
+```
+
+**Endpoints:**
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/v1/flux-loras` | GET | Yes | List discovered Flux LoRAs |
+| `/v1/flux-loras/rescan` | POST | Yes | Re-scan the folder (after `cp`) |
+
+**Use in generation** — add `lora` to any text-to-image / image-to-image / image-edit request:
+```json
+{
+  "prompt": "a cyberpunk cat",
+  "model": "flux2-dev",
+  "lora": {"id": "my-style-v2", "strength": 0.8},
+  "seed": 42
+}
+```
+
+| Field | Type | Default | Constraints |
+|-------|------|---------|-------------|
+| `lora.id` | string | required | ID from `GET /v1/flux-loras` |
+| `lora.strength` | float | `1.0` | 0.0-2.0 |
+
+**Behavior:**
+- Works with both `flux2-dev` and `flux2-klein` (diffusers auto-converts Flux 1/2 LoRA formats).
+- Composable with `turbo: true` (Turbo is sigma-schedule-based, LoRA fusion is orthogonal).
+- LoRA is **fused** into the transformer before FP8 casting — this means changing LoRA or strength triggers a full pipeline reload (~10-15s first call). Subsequent calls with the same `(model, lora_id, strength)` hit the cache with zero swap overhead.
+- Discovery is case-insensitive via slugification. Renaming the file changes the ID.
 
 ---
 
@@ -348,9 +391,11 @@ For `image-edit`:
 | `/v1/system/resume` | POST | Yes | Reload all models |
 | `/v1/flux/unload` | POST | Yes | Unload Flux from cuda:0 |
 | `/v1/flux/reload` | POST | Yes | Reload Flux to cuda:0 |
-| `/v1/loras` | GET | Yes | List LoRAs |
-| `/v1/loras` | POST | Yes | Upload LoRA (multipart: `file`, `name`, `description`) |
-| `/v1/loras/{id}` | DELETE | Yes | Delete LoRA |
+| `/v1/loras` | GET | Yes | List LTX video LoRAs |
+| `/v1/loras` | POST | Yes | Upload LTX LoRA (multipart: `file`, `name`, `description`) |
+| `/v1/loras/{id}` | DELETE | Yes | Delete LTX LoRA |
+| `/v1/flux-loras` | GET | Yes | List Flux LoRAs (see Flux LoRAs section — folder-drop, no upload) |
+| `/v1/flux-loras/rescan` | POST | Yes | Re-scan `flux_loras/` directory |
 | `/v1/chat/completions` | POST | Yes | Chat/vision proxy to llama-swap (OpenAI-compatible) |
 
 ### History

@@ -1,7 +1,7 @@
 # Frontend API Changes
 
 > **Audience**: taco-desktop frontend team
-> **Date**: 2026-03-07
+> **Date**: 2026-03-07 (original) · 2026-04-09 (Flux 2 LoRA added)
 > **Server**: `http://<host>:8090`
 
 This document covers all recent backend changes that affect the frontend. Read it top to bottom before starting migration work.
@@ -17,6 +17,7 @@ This document covers all recent backend changes that affect the frontend. Read i
 5. [Temporal Retake (Now Functional)](#5-temporal-retake-now-functional)
 6. [TypeScript Definitions](#6-typescript-definitions)
 7. [Migration Checklist](#7-migration-checklist)
+8. [Flux 2 Image LoRAs (v1.1, 2026-04-09)](#8-flux-2-image-loras-v11-2026-04-09)
 
 ---
 
@@ -709,3 +710,83 @@ interface HealthResponse {
 - [ ] Add mode selector: `replace_audio_and_video`, `replace_video_only`, `replace_audio`
 - [ ] Show timeline scrubber for selecting retake region
 - [ ] Update `RetakeMode` type
+
+---
+
+## 8. Flux 2 Image LoRAs (v1.1, 2026-04-09)
+
+Flux 2 Dev and Flux 2 Klein now support **per-request LoRAs** via a **folder-drop discovery system**. This is a **separate** system from the existing LTX video LoRAs — distinct endpoints, distinct registry, distinct ID namespace.
+
+### 8.1 Discovery endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/v1/flux-loras` | GET | Yes | List discovered Flux LoRAs |
+| `/v1/flux-loras/rescan` | POST | Yes | Re-scan `flux_loras/` directory |
+
+There is intentionally **no upload/delete endpoint**. Files are managed server-side (operator drops `.safetensors` into `flux_loras/`, optionally with a same-named `.json` sidecar for display metadata).
+
+### 8.2 Response shape (`GET /v1/flux-loras`)
+
+```json
+{
+  "loras": [
+    {
+      "id": "my-style-v2",
+      "name": "My Style v2",
+      "filename": "MyStyleV2.safetensors",
+      "size_bytes": 201431592,
+      "model_compat": ["flux2-dev"],
+      "description": "Painterly style, 2000 steps",
+      "trigger_word": "inthestyleof"
+    }
+  ],
+  "count": 1
+}
+```
+
+- `id` is a slug of the filename stem (stable across restarts; changes if operator renames the file).
+- `model_compat` is advisory only — the backend does not enforce it. The frontend should filter the dropdown client-side by the currently selected model.
+
+### 8.3 Request shape (all three Flux endpoints)
+
+`TextToImageRequest`, `ImageToImageRequest`, and `ImageEditRequest` gain an optional `lora` field:
+
+```json
+{
+  "prompt": "a cyberpunk cat",
+  "model": "flux2-dev",
+  "lora": {"id": "my-style-v2", "strength": 0.8},
+  "seed": 42,
+  "turbo": true
+}
+```
+
+Shape is identical to the LTX `lora` field (`{id, strength}`, `strength` is 0.0–2.0, default 1.0). Omit the `lora` field or pass `null` to generate without a LoRA.
+
+### 8.4 Latency behavior (important)
+
+- **First request** with a new `(model, lora_id, strength)` triple → server does a full pipeline reload (~10–15 s extra). This is required because LoRA weights must be fused into the transformer before FP8 quantization.
+- **Subsequent requests** with the **same** triple → cache hit, normal generation speed.
+- Changing `strength` or `lora_id`, switching models, or removing the LoRA → cache invalidation → full reload again.
+
+Surface a "Loading LoRA…" indicator on the first call after a change so users understand the delay.
+
+### 8.5 Error cases
+
+- `404 {"error":"Flux LoRA not found: <id>"}` — the requested LoRA isn't in the registry (stale cache or operator deleted the file). Clear the client's selection and refetch `GET /v1/flux-loras`.
+- `500` during generation with a LoRA — usually a malformed LoRA file or key-format mismatch. Surface the error and suggest removing the LoRA.
+
+### 8.6 Migration checklist (Flux LoRA)
+
+- [ ] Add `FluxLoRAInfo` / `FluxLoRAListResponse` TypeScript types
+- [ ] Add `lora?: LoRAInput | null` to `TextToImageRequest`, `ImageToImageRequest`, `ImageEditRequest`
+- [ ] Fetch Flux LoRA list on form open (`GET /v1/flux-loras`)
+- [ ] LoRA dropdown in t2i / i2i / image-edit forms with strength slider (0.0–2.0, default 1.0)
+- [ ] Client-side filter dropdown by `model_compat` against currently selected model
+- [ ] "Refresh" button → `POST /v1/flux-loras/rescan` then refetch list
+- [ ] "Loading LoRA…" indicator on first request after a `(model, lora, strength)` change
+- [ ] Handle 404 by clearing selection and refetching
+- [ ] Empty-state copy explaining folder-drop (no upload UI)
+
+**Full integration details** (including UI flow and UX patterns): see `docs/frontend-lora-integration.md` section 10.

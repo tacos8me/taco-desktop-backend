@@ -1,10 +1,15 @@
 # Frontend LoRA Integration Guide
 
 > **Audience**: taco-desktop frontend team
-> **Date**: 2026-03-09
+> **Date**: 2026-03-09 (LTX) · 2026-04-09 (Flux 2 added)
 > **Server**: `http://<host>:8090`
 
-This document covers how to integrate LoRA adapter management and usage into the frontend. LoRAs are user-uploadable `.safetensors` files that modify video generation style or behavior.
+This document covers how to integrate LoRA adapter management and usage into the frontend. taco-backend supports **two separate LoRA systems**:
+
+- **LTX video LoRAs** (sections 1–9 below): user-uploadable `.safetensors` files that modify LTX video generation. Managed via `/v1/loras` (list / upload / delete). Applied to `TextToVideoRequest`, `ImageToVideoRequest`, `AudioToVideoRequest`, `RetakeRequest`.
+- **Flux 2 image LoRAs** (section 10): server-side folder-drop. Files are placed by an operator into `flux_loras/` on the server; **no upload UI**. Clients discover via `GET /v1/flux-loras` and apply to `TextToImageRequest`, `ImageToImageRequest`, `ImageEditRequest`.
+
+Both systems share the same `{id, strength}` request shape for consistency, but have **separate ID namespaces** and **distinct endpoints**.
 
 ---
 
@@ -19,6 +24,7 @@ This document covers how to integrate LoRA adapter management and usage into the
 7. [Upload Flow](#7-upload-flow)
 8. [Error Handling](#8-error-handling)
 9. [Integration Checklist](#9-integration-checklist)
+10. [Flux 2 Image LoRAs (v1.1)](#10-flux-2-image-loras-v11)
 
 ---
 
@@ -712,7 +718,7 @@ const supportsLora = model.startsWith("ltx-");
 - [ ] Display numeric strength value next to slider
 - [ ] Include `lora: { id, strength }` in request body when a LoRA is selected
 - [ ] Omit `lora` field when no LoRA is selected
-- [ ] Hide/disable LoRA selector when a Flux model is selected
+- [ ] For Flux image forms: use the **separate** `GET /v1/flux-loras` endpoint (see section 10). LTX and Flux LoRAs are distinct namespaces — do not mix the dropdowns.
 
 ### Error handling
 
@@ -724,3 +730,105 @@ const supportsLora = model.startsWith("ltx-");
 
 - [ ] Add `LoRAInfo`, `LoRAListResponse`, `LoRADeleteResponse`, `LoRAInput` interfaces
 - [ ] Add optional `lora?: LoRAInput | null` to `TextToVideoRequest`, `ImageToVideoRequest`, `RetakeRequest`
+
+---
+
+## 10. Flux 2 Image LoRAs (v1.1)
+
+Flux image LoRAs live in a **separate folder-drop system**. Operators place `.safetensors` files into `/mnt/nvme-1/servers/taco-backend/flux_loras/` on the server; the frontend has **no upload or delete UI**.
+
+### 10.1 TypeScript Definitions
+
+```typescript
+// Flux LoRA metadata returned by GET /v1/flux-loras
+interface FluxLoRAInfo {
+  id: string;                // slug from filename stem, e.g. "my-style-v2"
+  name: string;              // display name (sidecar .json or filename stem)
+  filename: string;          // on-disk filename
+  size_bytes: number;
+  model_compat: string[];    // e.g. ["flux2-dev"] or ["flux2-dev","flux2-klein"]
+  description: string;       // may be ""
+  trigger_word: string | null;
+}
+
+interface FluxLoRAListResponse {
+  loras: FluxLoRAInfo[];
+  count: number;
+}
+
+// The `lora` field on Flux request types reuses the same LoRAInput shape
+// as LTX, but the ID namespace is separate (different registry).
+interface TextToImageRequest {
+  prompt: string;
+  model?: "flux2-dev" | "flux2-klein";
+  width?: number;
+  height?: number;
+  num_inference_steps?: number;
+  guidance_scale?: number;
+  seed?: number | null;
+  turbo?: boolean;
+  lora?: LoRAInput | null;   // NEW in v1.1
+}
+
+// Same lora field added to ImageToImageRequest and ImageEditRequest.
+```
+
+### 10.2 Endpoints
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/v1/flux-loras` | GET | Yes | List discovered Flux LoRAs |
+| `/v1/flux-loras/rescan` | POST | Yes | Re-scan the folder (use after an operator drops new files) |
+
+**Note:** there is intentionally **no** upload or delete endpoint. Files are managed on the server side via `cp`/`rm`. A future version may add an upload UI; for now the frontend should treat the LoRA list as read-only.
+
+### 10.3 UI Flow
+
+- **Discovery**: on app init (or when the user opens the Flux image form), call `GET /v1/flux-loras`. Cache the list; offer a manual "Refresh" button that calls `POST /v1/flux-loras/rescan` followed by a fresh `GET`.
+- **Selection**: add a LoRA dropdown to text-to-image, image-to-image, and image-edit forms. Default to "None". Show `name` (fall back to `id`), `description`, and `trigger_word` if present.
+- **Model compatibility**: `model_compat` is advisory — the backend does **not** enforce it. Prefer to filter the dropdown client-side by the currently selected `model` (`flux2-dev` / `flux2-klein`) and grey out incompatible LoRAs with a tooltip. This prevents obvious mistakes like loading a Klein-only LoRA on Dev.
+- **Strength**: same `0.0 – 2.0` slider as LTX, default `1.0`.
+- **Empty state**: if `count === 0`, show "No Flux LoRAs available. Ask your server admin to drop `.safetensors` files into `flux_loras/`." (no upload button).
+
+### 10.4 Generation Flow
+
+```typescript
+const body: TextToImageRequest = {
+  prompt: "a cyberpunk cat",
+  model: "flux2-dev",
+  lora: selectedFluxLora
+    ? { id: selectedFluxLora.id, strength: loraStrength }
+    : undefined,
+  turbo: turboEnabled,
+  seed: userSeed,
+};
+
+const resp = await fetch(`${SERVER}/v1/text-to-image`, {
+  method: "POST",
+  headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+```
+
+**Latency note:** the first request with a new `(model, lora_id, strength)` combination triggers a ~10–15 s pipeline reload on the server. Subsequent requests with the **same** combination are cached and generate at normal speed. Changing `strength` or `lora_id` (or switching between `flux2-dev`/`flux2-klein`) invalidates the cache and forces another reload. Consider surfacing a subtle "Loading LoRA…" indicator on the first call after a change so users understand the delay.
+
+### 10.5 Error Handling
+
+| Status | Cause | UI Action |
+|--------|-------|-----------|
+| `404` `"Flux LoRA not found: {id}"` | `lora.id` not in registry (stale cache, or operator `rm`'d the file) | Clear selection, refetch `GET /v1/flux-loras`, notify user |
+| `500` during generation with LoRA | LoRA incompatible with model (e.g., malformed weights) | Surface error, suggest removing the LoRA or trying the other model |
+| `401` on `/v1/flux-loras*` | Missing/invalid API key | Redirect to auth flow |
+
+### 10.6 Integration Checklist (Flux)
+
+- [ ] Add `FluxLoRAInfo`, `FluxLoRAListResponse` TypeScript interfaces
+- [ ] Add `lora?: LoRAInput | null` to `TextToImageRequest`, `ImageToImageRequest`, `ImageEditRequest`
+- [ ] Fetch Flux LoRAs via `GET /v1/flux-loras` on form open (cache between sessions is fine)
+- [ ] Add LoRA dropdown to t2i, i2i, edit forms
+- [ ] Add "Refresh" button that calls `POST /v1/flux-loras/rescan`
+- [ ] Client-side filter by `model_compat` against the selected model
+- [ ] Show strength slider (0.0–2.0, step 0.05, default 1.0)
+- [ ] Show "Loading LoRA…" indicator on first request with a new `(model, lora, strength)` combo
+- [ ] Handle 404 by clearing selection and refetching the list
+- [ ] Empty-state message explaining folder-drop (no upload UI)
