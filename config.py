@@ -89,3 +89,10 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = False  # Full float32 precision for VAE decode
 torch.backends.cudnn.allow_tf32 = False         # Full float32 precision for VAE convolutions
 torch.backends.cudnn.deterministic = True  # Stable algorithm selection
+# Force float32 accumulation for bf16 matmul. Default in torch 2.11 is True
+# (reduced precision = bf16 accumulation, fast but loses mantissa through large K).
+# With 56 transformer layers × 20 denoising steps on Flux 2 Dev, bf16-accumulated
+# matmul error compounds into visible quality degradation. No speed benefit for
+# diffusion inference in practice (Draw Things engineering analysis, PyTorch
+# issue #100966). ComfyUI does not enable this flag either.
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False

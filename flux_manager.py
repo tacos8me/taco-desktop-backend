@@ -110,6 +110,11 @@ class FluxManager:
                 )
                 if user_lora_path:
                     self._load_user_lora_adapter(pipe, user_lora_path)
+                # VAE: force float32 — AutoencoderKLFlux2._decode() silently ignores
+                # its own force_upcast=True config flag. Decoder ResBlocks + GroupNorm
+                # + nearest-neighbor upsample accumulate visible precision artifacts
+                # in bf16. Extra VRAM cost is ~320 MB (the VAE's 321 MB params doubled).
+                self._force_vae_fp32(pipe)
                 # Klein fits in full bf16 on 96 GB — keep all components resident.
                 pipe = pipe.to(self._device)
             else:
@@ -117,6 +122,10 @@ class FluxManager:
                 pipe = Flux2Pipeline.from_pretrained(model_repo, **_load_kw)
                 if user_lora_path:
                     self._load_user_lora_adapter(pipe, user_lora_path)
+                # VAE: force float32 before the offload hooks attach, so the VAE
+                # component enters the offload manager already at fp32 and stays
+                # fp32 across every CPU↔GPU page.
+                self._force_vae_fp32(pipe)
                 # Dev bf16 is 105.9 GB all-resident; use model_cpu_offload to page
                 # text encoder, transformer, VAE between CPU and GPU as needed.
                 # NB: do NOT call pipe.to(device) before enable_model_cpu_offload —
@@ -143,6 +152,34 @@ class FluxManager:
 
         elapsed = time.monotonic() - t0
         logger.info("%s loaded in %.1fs on %s", model_name, elapsed, self._device)
+
+    @staticmethod
+    def _force_vae_fp32(pipe) -> None:
+        """Run the VAE in full float32 regardless of pipeline dtype.
+
+        Why: `AutoencoderKLFlux2._decode()` silently ignores the `force_upcast=True`
+        config flag. Its ResBlocks + GroupNorm + nearest-neighbor Upsample2D cascade
+        accumulates visible precision artifacts in bf16 (the fp32 fallback inside
+        `Upsample2D.forward` only triggers on `torch.__version__ < "2.1"` — we're on
+        2.11, so it's dead code). Running the VAE in fp32 is the correct fix.
+
+        The pipeline still produces bf16 latents from the transformer denoising
+        loop, so we also install a forward pre-hook on `post_quant_conv` — the
+        first Conv2d in the decode path — to upcast incoming latents to fp32.
+        Without that hook, the fp32 Conv2d rejects bf16 inputs with
+        "Input type and bias type should be the same".
+        """
+        pipe.vae.to(torch.float32)
+
+        def _upcast_input_hook(_module, args):
+            if args and isinstance(args[0], torch.Tensor) and args[0].dtype != torch.float32:
+                return (args[0].to(torch.float32),) + tuple(args[1:])
+            return None  # no modification
+
+        # post_quant_conv is the entry point of _decode; tiled_decode also
+        # routes through it (one hook covers both tiled and non-tiled paths).
+        if pipe.vae.post_quant_conv is not None:
+            pipe.vae.post_quant_conv.register_forward_pre_hook(_upcast_input_hook)
 
     @staticmethod
     def _load_user_lora_adapter(pipe, path: str) -> None:
