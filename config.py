@@ -53,9 +53,11 @@ FLUX_MODELS = {
 }
 HF_CACHE_DIR = "/mnt/nvme-1/huggingface/hub"
 
-# Turbo LoRA (fal.ai FLUX.2-dev-Turbo — 8-step distilled)
-FLUX_TURBO_LORA = "fal/FLUX.2-dev-Turbo"
-FLUX_TURBO_LORA_WEIGHT = "flux.2-turbo-lora.safetensors"
+# Turbo sigma schedule: 8-step distilled flow from fal.ai FLUX.2-dev-Turbo.
+# Used when `turbo: true` on Flux image requests. Composable with an explicit
+# `flux2-turbo` folder-drop LoRA (see flux_loras/) for the fully-fused turbo
+# behavior. Sigma schedule alone also works without the LoRA, at slightly
+# different quality.
 FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.00031]
 
 # Upload storage

@@ -254,11 +254,13 @@ curl https://i.noodlefinger.io/v2/jobs/$JOB/result --output musicvideo.mp4
 
 | Model | ID | Steps | Speed (1024x1024) | Notes |
 |-------|-----|-------|-------------------|-------|
-| Dev | `flux2-dev` | 50 | ~60s | Highest quality |
-| Dev Turbo | `flux2-dev` + `turbo:true` | 8 | ~10s | Fused Turbo LoRA |
-| Klein KV | `flux2-klein` | 4 | ~1.5s | Ultra-fast, editing |
+| Dev | `flux2-dev` | 20–50 | ~50–90s | Full bf16, highest quality, TE offloaded to CPU between requests |
+| Dev Turbo | `flux2-dev` + `turbo:true` | 8 | ~25–35s | 8-step sigma schedule; compose with `flux2-turbo` folder-drop LoRA for full distilled fidelity |
+| Klein KV | `flux2-klein` | 4 | ~3s | Ultra-fast, full bf16 resident, editing |
 
-Models swap on demand — first request to a different model adds ~5-10s swap time.
+Precision: **full bf16 throughout** (matches ComfyUI default). FP8 layerwise casting was dropped in v1.1.1 after diagnosing screendoor/grid artifacts traced to the FP8 + fused-LoRA interaction. Dev uses `enable_model_cpu_offload` because all components together exceed 96 GB in bf16; Klein fits comfortably and stays fully resident.
+
+Models swap on demand — first request to a different model adds ~20–30 s load time.
 
 ### Endpoints
 
@@ -347,9 +349,9 @@ Optionally place a same-named `.json` sidecar alongside the `.safetensors` for d
 | `lora.strength` | float | `1.0` | 0.0-2.0 |
 
 **Behavior:**
-- Works with both `flux2-dev` and `flux2-klein` (diffusers auto-converts Flux 1/2 LoRA formats).
-- Composable with `turbo: true` (Turbo is sigma-schedule-based, LoRA fusion is orthogonal).
-- LoRA is **fused** into the transformer before FP8 casting — this means changing LoRA or strength triggers a full pipeline reload (~10-15s first call). Subsequent calls with the same `(model, lora_id, strength)` hit the cache with zero swap overhead.
+- Works with both `flux2-dev` and `flux2-klein` (diffusers auto-converts Flux 1/2 LoRA formats). Dev-trained LoRAs applied to Klein return **422** with a clean error (different transformer dimensions).
+- Composable with `turbo: true` (Turbo is sigma-schedule-based, LoRA is orthogonal).
+- LoRAs are attached as **adapters** (not fused). Changing `lora.strength` is a **free runtime operation** — no reload. Only changing `lora.id` (or switching models) triggers a full pipeline reload (~30–60 s for Dev).
 - Discovery is case-insensitive via slugification. Renaming the file changes the ID.
 
 ---
@@ -471,11 +473,10 @@ Request: `{"rank_image_uri": "storage://...", "generated_image_uri": "storage://
 
 | Device | GPU | VRAM | Model | Memory |
 |--------|-----|------|-------|--------|
-| cuda:0 | RTX PRO 6000 | 96GB | Flux 2 | ~18GB (Klein) / ~77GB (Dev) |
-| cuda:1 | RTX PRO 6000 | 96GB | LTX-2.3 | ~69GB |
-| cuda:2 | RTX PRO 4000 | 24GB | Unused | — |
+| cuda:0 | RTX PRO 6000 Blackwell | 96GB | Flux 2 | ~32GB (Klein, resident) / ~60GB transformer + TE paged (Dev, bf16 + `enable_model_cpu_offload`) |
+| cuda:1 | RTX PRO 6000 Blackwell | 96GB | LTX-2.3 | ~69GB |
 
-Flux and LTX share a single inference lock (FP8 layerwise casting causes cuBLAS crashes with concurrent multi-GPU inference).
+Verified via `nvidia-smi -L`. Flux and LTX share a single inference lock — the offload hooks move Flux components CPU↔GPU around cuda:0, LTX stays resident on cuda:1 throughout.
 
 ---
 

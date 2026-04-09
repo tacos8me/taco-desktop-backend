@@ -764,13 +764,16 @@ There is intentionally **no upload/delete endpoint**. Files are managed server-s
 
 Shape is identical to the LTX `lora` field (`{id, strength}`, `strength` is 0.0–2.0, default 1.0). Omit the `lora` field or pass `null` to generate without a LoRA.
 
-### 8.4 Latency behavior (important)
+### 8.4 Latency behavior (important) — v1.1.1 update
 
-- **First request** with a new `(model, lora_id, strength)` triple → server does a full pipeline reload (~10–15 s extra). This is required because LoRA weights must be fused into the transformer before FP8 quantization.
-- **Subsequent requests** with the **same** triple → cache hit, normal generation speed.
-- Changing `strength` or `lora_id`, switching models, or removing the LoRA → cache invalidation → full reload again.
+- **First request** with a new `(model, lora_id)` pair → server does a full pipeline reload (~30–60 s extra on Dev, including CPU offload hook setup). This is required because the LoRA adapter has to be attached before the bf16 pipeline is handed to the offload manager.
+- **Subsequent requests** with the **same** `(model, lora_id)` pair → cache hit, normal generation speed.
+- **Changing `strength` is now FREE** (v1.1.1 change). Strength is applied at inference time via a runtime `set_adapters([...], [strength])` call — O(ms), no reload. Users can scrub the strength slider at will.
+- Changing `lora_id`, switching models (`flux2-dev` ↔ `flux2-klein`), or removing the LoRA field triggers the full reload path.
 
-Surface a "Loading LoRA…" indicator on the first call after a change so users understand the delay.
+**Backend change (v1.1.1):** FP8 layerwise casting was dropped; Flux 2 Dev now runs full bf16 with CPU offload. This eliminates a screendoor/grid artifact that was visible in v1.1 outputs, and also decouples strength from the cache key. The `lora: {id, strength}` request shape is unchanged — **no client-side code changes are required** to benefit from the strength-slider UX improvement. Clients that were hiding the strength slider due to the reload cost should now expose it freely.
+
+Surface a "Loading LoRA…" indicator on the first call after a `(model, lora_id)` change so users understand the ~30–60 s delay. Do **not** show the indicator for strength-only changes.
 
 ### 8.5 Error cases
 

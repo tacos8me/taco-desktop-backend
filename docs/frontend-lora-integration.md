@@ -810,7 +810,7 @@ const resp = await fetch(`${SERVER}/v1/text-to-image`, {
 });
 ```
 
-**Latency note:** the first request with a new `(model, lora_id, strength)` combination triggers a ~10–15 s pipeline reload on the server. Subsequent requests with the **same** combination are cached and generate at normal speed. Changing `strength` or `lora_id` (or switching between `flux2-dev`/`flux2-klein`) invalidates the cache and forces another reload. Consider surfacing a subtle "Loading LoRA…" indicator on the first call after a change so users understand the delay.
+**Latency note (v1.1.1 update):** the first request with a new `(model, lora_id)` **pair** triggers a ~30–60 s pipeline reload on the server (full bf16 load + CPU offload hook setup on Dev). Subsequent requests with the **same** pair are cached. **Changing `strength` is now free** — it's applied via a runtime `set_adapters([...], [strength])` call, no reload. The strength slider can be scrubbed freely without blocking the UI. Only `lora_id` changes, model switches (`flux2-dev` ↔ `flux2-klein`), or adding/removing the LoRA field trigger the full reload. Show the "Loading LoRA…" indicator only on `(model, lora_id)` changes, NOT on strength-only changes.
 
 ### 10.5 Error Handling
 

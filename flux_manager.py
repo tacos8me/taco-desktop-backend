@@ -3,6 +3,24 @@
 Supports FLUX.2-dev (text-to-image, img2img) and FLUX.2-klein-9b-kv
 (text-to-image, img2img, multi-reference editing). Models swap on demand
 — evicts current pipeline and loads requested model if different.
+
+Precision: full bf16 throughout (matches ComfyUI default). FP8 layerwise
+casting was dropped in v1.1.1 after diagnosing screendoor/dithering
+artifacts traced to the `fuse_lora → enable_layerwise_casting(fp8)`
+interaction (diffusers PR #10685, Flux issue #406).
+
+VRAM budget on a 96 GB Blackwell:
+- Flux 2 Dev: transformer ~60.4 GB + text encoder (Mistral-3.2-24B) ~45.2 GB
+  + VAE ~0.3 GB = ~105.9 GB bf16. Does NOT fit all-resident, so we
+  `enable_model_cpu_offload()` which pages components CPU↔GPU on demand.
+  Denoising peak: ~75 GB. Prompt encode peak: ~49 GB.
+- Flux 2 Klein KV: ~32 GB total bf16, fits comfortably. No offload.
+
+LoRA handling: adapter mode (NOT fused). `load_lora_weights(adapter_name=
+"user_lora")` attaches the adapter to the bf16 transformer; changing
+strength is a free runtime call `pipe.set_adapters(["user_lora"],
+[strength])` — no pipeline reload needed. Only LoRA file changes or
+model switches trigger a full reload.
 """
 
 from __future__ import annotations
@@ -27,11 +45,17 @@ logger = logging.getLogger(__name__)
 
 
 class FluxLoraError(ValueError):
-    """Raised when a user LoRA cannot be loaded/fused into the current model.
+    """Raised when a user LoRA cannot be attached as an adapter to the current model.
 
     Typically a client error — the LoRA's tensor shapes, keys, or format
     don't match the target pipeline. Handlers surface this as HTTP 422.
     """
+
+
+# LoRA adapter name used for the single user LoRA slot. Kept as a module-level
+# constant so generate methods can reference it when calling set_adapters /
+# disable_lora without magic-stringing "user_lora" in multiple places.
+USER_LORA_ADAPTER = "user_lora"
 
 
 class FluxManager:
@@ -40,7 +64,7 @@ class FluxManager:
     def __init__(self) -> None:
         self._pipe = None
         self._current_model: str | None = None
-        self._current_lora: tuple[str, float] | None = None  # (path, strength)
+        self._current_lora_path: str | None = None  # adapter identity only; strength is runtime
         self._device = config.FLUX_DEVICE
         self._lock = asyncio.Lock()
 
@@ -48,11 +72,16 @@ class FluxManager:
     def is_ready(self) -> bool:
         return self._pipe is not None
 
-    def load(self, model_name: str = "flux2-dev", user_lora: tuple[str, float] | None = None) -> None:
-        """Load a Flux pipeline with optional fused user LoRA + FP8 layerwise casting.
+    def load(self, model_name: str = "flux2-dev", user_lora_path: str | None = None) -> None:
+        """Load a Flux pipeline in full bf16 with optional adapter-mode user LoRA.
 
-        LoRA fusion MUST happen before enable_layerwise_casting — PEFT cannot inject
-        adapters into an already-FP8-cast transformer (diffusers issues #9514, #11648).
+        Dev uses `enable_model_cpu_offload` to page the text encoder CPU↔GPU around
+        prompt encoding (bf16 all-resident is 105.9 GB, exceeds 96 GB). Klein fits
+        fully resident in bf16 (~32 GB) and skips offload.
+
+        LoRAs are attached as adapters — NOT fused. Strength is applied at inference
+        time via `pipe.set_adapters([USER_LORA_ADAPTER], [strength])`, so the cache
+        key is `(model_name, user_lora_path)` and strength changes are free.
 
         On failure, leaves the manager in a clean unloaded state (self._pipe = None)
         and frees any partially allocated GPU/CPU memory so the next request can retry.
@@ -60,7 +89,7 @@ class FluxManager:
         from diffusers.models import Flux2Transformer2DModel
 
         model_repo = config.FLUX_MODELS[model_name]
-        lora_desc = f" + lora({Path(user_lora[0]).name}@{user_lora[1]:.2f})" if user_lora else ""
+        lora_desc = f" + adapter({Path(user_lora_path).name})" if user_lora_path else ""
         logger.info("Loading %s (%s)%s on %s ...", model_name, model_repo, lora_desc, self._device)
         t0 = time.monotonic()
 
@@ -79,35 +108,30 @@ class FluxManager:
                     str(klein_snap), transformer=transformer,
                     torch_dtype=torch.bfloat16, local_files_only=True,
                 )
-                if user_lora:
-                    self._fuse_user_lora(pipe, user_lora)
-                pipe.transformer.enable_layerwise_casting(
-                    storage_dtype=torch.float8_e4m3fn,
-                    compute_dtype=torch.bfloat16,
-                    skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
-                )
+                if user_lora_path:
+                    self._load_user_lora_adapter(pipe, user_lora_path)
+                # Klein fits in full bf16 on 96 GB — keep all components resident.
+                pipe = pipe.to(self._device)
             else:
                 from diffusers import Flux2Pipeline
                 pipe = Flux2Pipeline.from_pretrained(model_repo, **_load_kw)
-                if user_lora:
-                    self._fuse_user_lora(pipe, user_lora)
-                # Clean FP8 on base weights — skip precision-critical input/output layers
-                pipe.transformer.enable_layerwise_casting(
-                    storage_dtype=torch.float8_e4m3fn,
-                    compute_dtype=torch.bfloat16,
-                    skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
-                )
+                if user_lora_path:
+                    self._load_user_lora_adapter(pipe, user_lora_path)
+                # Dev bf16 is 105.9 GB all-resident; use model_cpu_offload to page
+                # text encoder, transformer, VAE between CPU and GPU as needed.
+                # NB: do NOT call pipe.to(device) before enable_model_cpu_offload —
+                # the offload hooks manage device placement themselves.
+                pipe.enable_model_cpu_offload(device=self._device)
 
-            pipe = pipe.to(self._device)
             self._pipe = pipe
             self._current_model = model_name
-            self._current_lora = user_lora
+            self._current_lora_path = user_lora_path
         except Exception:
             # Drop any partially loaded state so the next request can retry cleanly.
             logger.exception("Flux load failed for %s%s; releasing partial state", model_name, lora_desc)
             self._pipe = None
             self._current_model = None
-            self._current_lora = None
+            self._current_lora_path = None
             del pipe
             try:
                 gc.collect()
@@ -121,19 +145,17 @@ class FluxManager:
         logger.info("%s loaded in %.1fs on %s", model_name, elapsed, self._device)
 
     @staticmethod
-    def _fuse_user_lora(pipe, user_lora: tuple[str, float]) -> None:
-        """Load a user LoRA, fuse it into the transformer, and drop the adapter.
+    def _load_user_lora_adapter(pipe, path: str) -> None:
+        """Attach a user LoRA to the pipeline as a named adapter (no fusion).
 
-        Must be called BEFORE `enable_layerwise_casting` — see load() docstring.
-        Raises FluxLoraError (a ValueError subclass) when the LoRA is incompatible
-        with the target pipeline — wrong tensor dimensions (e.g. Dev LoRA on Klein),
-        missing keys, or malformed safetensors. Handlers surface this as HTTP 422.
+        The strength is applied at inference time via `set_adapters([name], [scale])`
+        — NOT at load time. Raises FluxLoraError (a ValueError subclass) when the
+        LoRA is incompatible with the target pipeline (wrong tensor dimensions,
+        e.g. Dev-trained LoRA applied to Klein; missing keys; malformed safetensors).
+        Handlers surface this as HTTP 422.
         """
-        path, strength = user_lora
         try:
-            pipe.load_lora_weights(path, adapter_name="user_lora")
-            pipe.fuse_lora(adapter_names=["user_lora"], lora_scale=strength)
-            pipe.unload_lora_weights()
+            pipe.load_lora_weights(path, adapter_name=USER_LORA_ADAPTER)
         except (RuntimeError, KeyError, ValueError) as exc:
             # RuntimeError: torch state_dict size mismatch (wrong dims for model)
             # KeyError:     missing/extra keys during PEFT adapter injection
@@ -168,23 +190,52 @@ class FluxManager:
             del self._pipe
             self._pipe = None
             self._current_model = None
-            self._current_lora = None
+            self._current_lora_path = None
             gc.collect()
             torch.cuda.synchronize(torch.device(self._device))
             torch.cuda.empty_cache()
             logger.info("Flux pipeline unloaded from %s", self._device)
 
-    def ensure_model(self, model_name: str, user_lora: tuple[str, float] | None = None) -> None:
-        """Swap model if needed. Cache key is (model_name, user_lora) — any change forces reload."""
-        if self._current_model == model_name and self._current_lora == user_lora:
+    def ensure_model(self, model_name: str, user_lora_path: str | None = None) -> None:
+        """Swap model if needed. Cache key is (model_name, user_lora_path).
+
+        Strength is NOT part of the cache key — it's applied at inference time
+        via `pipe.set_adapters([...], [strength])`, so changing strength never
+        triggers a reload. Only model changes or LoRA file changes reload.
+        """
+        if self._current_model == model_name and self._current_lora_path == user_lora_path:
             return
         if self._pipe is not None:
             logger.info(
                 "Swapping Flux pipeline: %s/%s → %s/%s",
-                self._current_model, self._current_lora, model_name, user_lora,
+                self._current_model, self._current_lora_path, model_name, user_lora_path,
             )
             self.unload()
-        self.load(model_name, user_lora=user_lora)
+        self.load(model_name, user_lora_path=user_lora_path)
+
+    def _apply_lora_strength(self, lora_path: str | None, lora_strength: float) -> None:
+        """Apply LoRA strength at inference time without reloading.
+
+        Called from every generate method AFTER ensure_model() but BEFORE the
+        pipeline __call__. Idempotent: safe to call with the same args across
+        multiple requests. When lora_path is None, disables any active adapter.
+        """
+        if self._pipe is None:
+            return
+        if lora_path:
+            # Adapter is guaranteed loaded by ensure_model() above.
+            try:
+                self._pipe.set_adapters([USER_LORA_ADAPTER], [lora_strength])
+            except Exception:
+                logger.exception("set_adapters failed for strength=%s", lora_strength)
+                raise
+        else:
+            # No LoRA requested — disable any stale adapter from a previous request.
+            try:
+                self._pipe.disable_lora()
+            except Exception:
+                # Pipelines without any loaded adapter raise — ignore.
+                pass
 
     def _to_webp(self, image: Image.Image) -> bytes:
         buf = io.BytesIO()
@@ -200,8 +251,8 @@ class FluxManager:
         callback_on_step_end: object = None,
     ) -> bytes:
         """Generate an image (txt2img) and return WEBP bytes."""
-        user_lora = (lora_path, lora_strength) if lora_path else None
-        self.ensure_model(model, user_lora=user_lora)
+        self.ensure_model(model, user_lora_path=lora_path)
+        self._apply_lora_strength(lora_path, lora_strength)
         generator = torch.Generator(device=self._device).manual_seed(seed)
 
         kwargs: dict = dict(
@@ -245,8 +296,8 @@ class FluxManager:
         callback_on_step_end: object = None,
     ) -> bytes:
         """Edit an image using single reference."""
-        user_lora = (lora_path, lora_strength) if lora_path else None
-        self.ensure_model(model, user_lora=user_lora)
+        self.ensure_model(model, user_lora_path=lora_path)
+        self._apply_lora_strength(lora_path, lora_strength)
         generator = torch.Generator(device=self._device).manual_seed(seed)
         ref_image = Image.open(image_path).convert("RGB")
 
@@ -290,8 +341,8 @@ class FluxManager:
         callback_on_step_end: object = None,
     ) -> bytes:
         """Multi-reference image editing via Klein."""
-        user_lora = (lora_path, lora_strength) if lora_path else None
-        self.ensure_model("flux2-klein", user_lora=user_lora)
+        self.ensure_model("flux2-klein", user_lora_path=lora_path)
+        self._apply_lora_strength(lora_path, lora_strength)
         generator = torch.Generator(device=self._device).manual_seed(seed)
         images = [Image.open(p).convert("RGB") for p in image_paths]
 
