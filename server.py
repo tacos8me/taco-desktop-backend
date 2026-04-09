@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 import config
 from split_model_manager import SplitModelManager
-from flux_manager import FluxManager
+from flux_manager import FluxManager, FluxLoraError
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
@@ -650,6 +650,8 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 lora_strength=lora_strength,
             )
         return Response(content=image_bytes, media_type="image/webp")
+    except FluxLoraError as exc:
+        return _error(422, str(exc))
     except Exception as exc:
         logger.exception("text-to-image failed")
         return _error(500, str(exc))
@@ -687,6 +689,8 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 lora_strength=lora_strength,
             )
         return Response(content=image_bytes, media_type="image/webp")
+    except FluxLoraError as exc:
+        return _error(422, str(exc))
     except FileNotFoundError as exc:
         return _error(404, str(exc))
     except Exception as exc:
@@ -724,6 +728,8 @@ async def image_edit(body: ImageEditRequest) -> Response:
                 lora_strength=lora_strength,
             )
         return Response(content=image_bytes, media_type="image/webp")
+    except FluxLoraError as exc:
+        return _error(422, str(exc))
     except FileNotFoundError as exc:
         return _error(404, str(exc))
     except Exception as exc:

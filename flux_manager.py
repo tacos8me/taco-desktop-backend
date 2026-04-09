@@ -26,6 +26,14 @@ os.environ.setdefault("HF_HOME", "/mnt/nvme-1/huggingface")
 logger = logging.getLogger(__name__)
 
 
+class FluxLoraError(ValueError):
+    """Raised when a user LoRA cannot be loaded/fused into the current model.
+
+    Typically a client error — the LoRA's tensor shapes, keys, or format
+    don't match the target pipeline. Handlers surface this as HTTP 422.
+    """
+
+
 class FluxManager:
     """Manages Flux pipelines with on-demand model swapping."""
 
@@ -45,6 +53,9 @@ class FluxManager:
 
         LoRA fusion MUST happen before enable_layerwise_casting — PEFT cannot inject
         adapters into an already-FP8-cast transformer (diffusers issues #9514, #11648).
+
+        On failure, leaves the manager in a clean unloaded state (self._pipe = None)
+        and frees any partially allocated GPU/CPU memory so the next request can retry.
         """
         from diffusers.models import Flux2Transformer2DModel
 
@@ -55,40 +66,56 @@ class FluxManager:
 
         _load_kw = dict(torch_dtype=torch.bfloat16, cache_dir=config.HF_CACHE_DIR, local_files_only=True)
 
-        if model_name == "flux2-klein":
-            from diffusers import Flux2KleinKVPipeline
-            klein_ckpt, klein_snap = self._resolve_klein_checkpoint()
-            transformer = Flux2Transformer2DModel.from_single_file(
-                klein_ckpt, torch_dtype=torch.bfloat16,
-                config=str(klein_snap / "transformer"),
-            )
-            pipe = Flux2KleinKVPipeline.from_pretrained(
-                str(klein_snap), transformer=transformer,
-                torch_dtype=torch.bfloat16, local_files_only=True,
-            )
-            if user_lora:
-                self._fuse_user_lora(pipe, user_lora)
-            pipe.transformer.enable_layerwise_casting(
-                storage_dtype=torch.float8_e4m3fn,
-                compute_dtype=torch.bfloat16,
-                skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
-            )
-        else:
-            from diffusers import Flux2Pipeline
-            pipe = Flux2Pipeline.from_pretrained(model_repo, **_load_kw)
-            if user_lora:
-                self._fuse_user_lora(pipe, user_lora)
-            # Clean FP8 on base weights — skip precision-critical input/output layers
-            pipe.transformer.enable_layerwise_casting(
-                storage_dtype=torch.float8_e4m3fn,
-                compute_dtype=torch.bfloat16,
-                skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
-            )
+        pipe = None
+        try:
+            if model_name == "flux2-klein":
+                from diffusers import Flux2KleinKVPipeline
+                klein_ckpt, klein_snap = self._resolve_klein_checkpoint()
+                transformer = Flux2Transformer2DModel.from_single_file(
+                    klein_ckpt, torch_dtype=torch.bfloat16,
+                    config=str(klein_snap / "transformer"),
+                )
+                pipe = Flux2KleinKVPipeline.from_pretrained(
+                    str(klein_snap), transformer=transformer,
+                    torch_dtype=torch.bfloat16, local_files_only=True,
+                )
+                if user_lora:
+                    self._fuse_user_lora(pipe, user_lora)
+                pipe.transformer.enable_layerwise_casting(
+                    storage_dtype=torch.float8_e4m3fn,
+                    compute_dtype=torch.bfloat16,
+                    skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
+                )
+            else:
+                from diffusers import Flux2Pipeline
+                pipe = Flux2Pipeline.from_pretrained(model_repo, **_load_kw)
+                if user_lora:
+                    self._fuse_user_lora(pipe, user_lora)
+                # Clean FP8 on base weights — skip precision-critical input/output layers
+                pipe.transformer.enable_layerwise_casting(
+                    storage_dtype=torch.float8_e4m3fn,
+                    compute_dtype=torch.bfloat16,
+                    skip_modules_pattern=["x_embedder", "context_embedder", "proj_out"],
+                )
 
-        pipe = pipe.to(self._device)
-        self._pipe = pipe
-        self._current_model = model_name
-        self._current_lora = user_lora
+            pipe = pipe.to(self._device)
+            self._pipe = pipe
+            self._current_model = model_name
+            self._current_lora = user_lora
+        except Exception:
+            # Drop any partially loaded state so the next request can retry cleanly.
+            logger.exception("Flux load failed for %s%s; releasing partial state", model_name, lora_desc)
+            self._pipe = None
+            self._current_model = None
+            self._current_lora = None
+            del pipe
+            try:
+                gc.collect()
+                torch.cuda.synchronize(torch.device(self._device))
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            raise
 
         elapsed = time.monotonic() - t0
         logger.info("%s loaded in %.1fs on %s", model_name, elapsed, self._device)
@@ -98,11 +125,22 @@ class FluxManager:
         """Load a user LoRA, fuse it into the transformer, and drop the adapter.
 
         Must be called BEFORE `enable_layerwise_casting` — see load() docstring.
+        Raises FluxLoraError (a ValueError subclass) when the LoRA is incompatible
+        with the target pipeline — wrong tensor dimensions (e.g. Dev LoRA on Klein),
+        missing keys, or malformed safetensors. Handlers surface this as HTTP 422.
         """
         path, strength = user_lora
-        pipe.load_lora_weights(path, adapter_name="user_lora")
-        pipe.fuse_lora(adapter_names=["user_lora"], lora_scale=strength)
-        pipe.unload_lora_weights()
+        try:
+            pipe.load_lora_weights(path, adapter_name="user_lora")
+            pipe.fuse_lora(adapter_names=["user_lora"], lora_scale=strength)
+            pipe.unload_lora_weights()
+        except (RuntimeError, KeyError, ValueError) as exc:
+            # RuntimeError: torch state_dict size mismatch (wrong dims for model)
+            # KeyError:     missing/extra keys during PEFT adapter injection
+            # ValueError:   safetensors parse error, metadata mismatch
+            raise FluxLoraError(
+                f"LoRA at {Path(path).name} is incompatible with the current model: {exc}"
+            ) from exc
 
     def _resolve_dev_snapshot(self):
         """Find the FLUX.2-dev snapshot dir in HF cache (needed for transformer config)."""
