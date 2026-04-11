@@ -40,12 +40,74 @@ def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-def _make_thumbnail(image_bytes: bytes, upload_id: str) -> str | None:
-    """Create a 256px-wide JPEG thumbnail. Returns the thumbnail upload_id or None."""
+def _is_mp4_bytes(data: bytes) -> bool:
+    """Heuristic MP4 detection via the ISO base media `ftyp` box.
+
+    Any ISO-BMFF container (MP4, MOV, M4A, etc.) has a 4-byte big-endian box
+    size followed by the 4-byte type `ftyp` at offset 4. We don't care about
+    the brand — just whether this is "a video-like container we should try
+    to decode with PyAV rather than PIL".
+    """
+    return len(data) >= 12 and data[4:8] == b"ftyp"
+
+
+def _first_video_frame_as_pil(video_bytes: bytes) -> Image.Image | None:
+    """Decode the first video frame of an MP4 as a PIL.Image in RGB.
+
+    Returns None on any failure — caller falls through to the warning path.
+    Uses PyAV (already a dependency via `media_io.encode_video`) with an
+    in-memory `io.BytesIO` container so we don't touch the filesystem.
+    """
     try:
-        img = Image.open(io.BytesIO(image_bytes))
+        import av  # local import keeps module load fast when only images are thumbnailed
+    except Exception:
+        return None
+    try:
+        with av.open(io.BytesIO(video_bytes), mode="r") as container:
+            if not container.streams.video:
+                return None
+            stream = container.streams.video[0]
+            # thread_type="AUTO" speeds up decode of short clips on multi-core CPUs
+            stream.thread_type = "AUTO"
+            for frame in container.decode(stream):
+                # to_image() returns a PIL.Image directly; PyAV does the RGB conversion
+                return frame.to_image()
+    except Exception:
+        return None
+    return None
+
+
+def _make_thumbnail(media_bytes: bytes, upload_id: str) -> str | None:
+    """Create a 256px-wide JPEG thumbnail for image OR video bytes.
+
+    - Images (WEBP/PNG/JPEG): loaded via `PIL.Image.open`
+    - Videos (MP4/MOV/etc., detected via `ftyp` box): first frame extracted
+      via `PyAV`, then thumbnailed the same way
+
+    Returns the thumbnail's storage id (under `config.THUMBNAIL_DIR`) or
+    `None` on any failure — callers must treat `None` as "no thumbnail,
+    show a placeholder".
+    """
+    try:
+        if _is_mp4_bytes(media_bytes):
+            img = _first_video_frame_as_pil(media_bytes)
+            if img is None:
+                logger.warning(
+                    "Failed to create thumbnail for %s: MP4-like container but first "
+                    "frame decode returned None", upload_id,
+                )
+                return None
+        else:
+            img = Image.open(io.BytesIO(media_bytes))
+            img.load()  # force decode so we catch errors here, not later
+
+        if img.width == 0 or img.height == 0:
+            return None
+        # Convert to RGB before JPEG save — handles RGBA from WEBP, palette
+        # modes from PNG, and the PyAV frame (which is already RGB but safe to force)
+        img = img.convert("RGB")
         ratio = 256 / img.width
-        img = img.resize((256, int(img.height * ratio)), Image.LANCZOS)
+        img = img.resize((256, max(1, int(img.height * ratio))), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=70)
         thumb_id = f"thumb_{upload_id}"

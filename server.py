@@ -1143,12 +1143,55 @@ async def v2_job_status(job_id: str) -> JSONResponse:
 
 @app.get("/v2/jobs/{job_id}/preview")
 async def v2_job_preview(job_id: str) -> Response:
+    """Return a low-res preview JPEG for a job in progress or completed.
+
+    Three paths:
+    1. Fast path — `job.preview_bytes` is already populated (Flux image jobs
+       via `make_flux_callback` step-end callback). Serve the cached JPEG.
+    2. Lazy video-frame path — the job is a completed video job and we
+       haven't extracted a preview yet. Read the MP4 result, decode the
+       first frame via PyAV, cache it on the job, and serve. Subsequent
+       polls hit the fast path.
+    3. No preview yet — job is queued / processing / failed without result
+       bytes. Return **204 No Content** (not 404). Frontends should keep
+       polling; 404 shows up red in browser dev tools and confuses users
+       into thinking the job is broken.
+    """
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
-    if not job.preview_bytes:
-        return _error(404, "No preview available")
-    return Response(content=job.preview_bytes, media_type="image/jpeg")
+
+    # Path 1: cached preview
+    if job.preview_bytes:
+        return Response(content=job.preview_bytes, media_type="image/jpeg")
+
+    # Path 2: lazy first-frame extraction for completed video jobs
+    if (
+        job.status == JobStatus.COMPLETED
+        and job.result_uri
+        and (job.result_media_type or "").startswith("video/")
+    ):
+        try:
+            result_path = uploads.resolve(job.result_uri)
+            if result_path.exists():
+                # Private import by design — the helper is shared between
+                # history_store and the preview endpoint. Stable two-caller
+                # API; no need to promote it to a module yet.
+                from history_store import _first_video_frame_as_pil
+                video_bytes = result_path.read_bytes()
+                frame = _first_video_frame_as_pil(video_bytes)
+                if frame is not None:
+                    import io as _io
+                    buf = _io.BytesIO()
+                    frame.convert("RGB").save(buf, format="JPEG", quality=80)
+                    preview = buf.getvalue()
+                    job.preview_bytes = preview  # cache for subsequent polls
+                    return Response(content=preview, media_type="image/jpeg")
+        except Exception:
+            logger.exception("Failed to extract video preview for job %s", job_id)
+
+    # Path 3: no preview available — 204, not 404
+    return Response(status_code=204)
 
 
 @app.get("/v2/jobs/{job_id}/result")
