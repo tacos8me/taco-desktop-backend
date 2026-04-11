@@ -67,6 +67,10 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - `torch.backends.cudnn.allow_tf32 = False` — full float32 for VAE convolutions
 - TF32 was previously enabled but degraded VAE output quality on Blackwell GPUs (VAE uses `force_upcast=True` expecting real float32)
 
+## API contract
+- **`docs/API.md` is the canonical, client-facing API spec.** Any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes, auth requirements) MUST update `docs/API.md` in the **same commit**. Do not split "code change" from "doc change" across commits — the doc is the contract the other-side developer reads, and drift breaks them silently.
+- When touching `server.py` endpoints, re-read `docs/API.md` before writing code so you know what the external shape is supposed to be, then update both sides together.
+
 ## Conventions
 - All generation runs under `@torch.inference_mode()`
 - Flux output: WEBP quality 95
