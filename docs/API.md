@@ -5,6 +5,8 @@
 **Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
 
+> 🚀 **New to the API?** Start with **[docs/QUICKSTART.md](./QUICKSTART.md)** — a 5-minute guide for frontend devs. This doc is the exhaustive spec.
+
 > **Maintenance rule:** Any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes) MUST update this file in the same commit. This doc is the contract.
 
 ---
