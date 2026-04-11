@@ -91,8 +91,15 @@ async def _dispatch_job(job: Job) -> bytes:
         raise RuntimeError("System is paused for maintenance")
     p = job.params
 
-    def on_progress(progress: float) -> None:
+    def on_progress(progress: float, phase: str | None = None) -> None:
+        # Guard against stale callbacks firing after a DELETE /v2/jobs/{id}
+        # cancel — the denoiser runs in an executor and can tick one or two
+        # more times before it observes the cancelled flag.
+        if job.status == JobStatus.CANCELLED:
+            return
         job.progress = progress
+        if phase is not None:
+            job.phase = phase
 
     match job.type:
         case JobType.TEXT_TO_VIDEO:
@@ -115,17 +122,17 @@ async def _dispatch_job(job: Job) -> bytes:
             _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
-            return await flux.generate_text_to_image(**p, callback_on_step_end=cb)
+            return await flux.generate_text_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.IMAGE_TO_IMAGE:
             _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
-            return await flux.generate_image_to_image(**p, callback_on_step_end=cb)
+            return await flux.generate_image_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.IMAGE_EDIT:
             _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 4))
-            return await flux.generate_image_edit(**p, callback_on_step_end=cb)
+            return await flux.generate_image_edit(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.EXPORT_COMPOSITION:
             from export_handler import export_composition
             return await asyncio.get_running_loop().run_in_executor(
@@ -1133,6 +1140,7 @@ async def v2_job_status(job_id: str) -> JSONResponse:
         "status": job.status,
         "type": job.type,
         "progress": job.progress if job.status == JobStatus.PROCESSING else (1.0 if job.status == JobStatus.COMPLETED else None),
+        "phase": job.phase if job.status == JobStatus.PROCESSING else None,
         "queue_position": job_store.queue_position(job.id) if job.status == JobStatus.QUEUED else None,
         "error": {"code": job.error_code or "generation_failed", "message": job.error} if job.error else None,
         "result_url": f"/v2/jobs/{job.id}/result" if job.status == JobStatus.COMPLETED else None,
@@ -1145,27 +1153,38 @@ async def v2_job_status(job_id: str) -> JSONResponse:
 async def v2_job_preview(job_id: str) -> Response:
     """Return a low-res preview JPEG for a job in progress or completed.
 
-    Three paths:
-    1. Fast path — `job.preview_bytes` is already populated (Flux image jobs
-       via `make_flux_callback` step-end callback). Serve the cached JPEG.
-    2. Lazy video-frame path — the job is a completed video job and we
-       haven't extracted a preview yet. Read the MP4 result, decode the
-       first frame via PyAV, cache it on the job, and serve. Subsequent
-       polls hit the fast path.
-    3. No preview yet — job is queued / processing / failed without result
-       bytes. Return **204 No Content** (not 404). Frontends should keep
-       polling; 404 shows up red in browser dev tools and confuses users
+    Four paths:
+    1. Fast path — `job.preview_bytes` already populated (Flux step-end callback,
+       or history-save backfill on the worker). Serve the cached JPEG.
+    2. On-disk thumbnail path — `history.save()` has already written a thumbnail
+       to `config.THUMBNAIL_DIR / thumb_{upload_id}`. Serve it as a zero-copy
+       `FileResponse` (sendfile). Survives restart because it's on disk.
+    3. Fallback lazy extraction — completed video job with no thumbnail on disk
+       (e.g. no api_key so history.save was skipped, or the save task failed).
+       Read + decode the first frame via PyAV, but offload the 100+ MB read and
+       the PyAV call to a thread so the event loop isn't blocked.
+    4. 204 — queued / processing / failed without result bytes. Frontends should
+       keep polling; `404` shows up red in browser dev tools and confuses users
        into thinking the job is broken.
     """
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
 
-    # Path 1: cached preview
+    # Path 1: cached preview in RAM (Flux step-end, or worker backfill)
     if job.preview_bytes:
         return Response(content=job.preview_bytes, media_type="image/jpeg")
 
-    # Path 2: lazy first-frame extraction for completed video jobs
+    # Path 2: on-disk thumbnail from history.save() — zero-copy sendfile
+    if job.result_uri:
+        upload_id = job.result_uri.removeprefix("storage://")
+        thumb_path = config.THUMBNAIL_DIR / f"thumb_{upload_id}"
+        if thumb_path.exists():
+            return FileResponse(path=str(thumb_path), media_type="image/jpeg")
+
+    # Path 3: fallback lazy extraction for completed video jobs without an
+    # on-disk thumbnail. Offloaded to a thread so the 100+ MB read + PyAV
+    # decode don't block the event loop.
     if (
         job.status == JobStatus.COMPLETED
         and job.result_uri
@@ -1174,23 +1193,26 @@ async def v2_job_preview(job_id: str) -> Response:
         try:
             result_path = uploads.resolve(job.result_uri)
             if result_path.exists():
-                # Private import by design — the helper is shared between
-                # history_store and the preview endpoint. Stable two-caller
-                # API; no need to promote it to a module yet.
                 from history_store import _first_video_frame_as_pil
-                video_bytes = result_path.read_bytes()
-                frame = _first_video_frame_as_pil(video_bytes)
-                if frame is not None:
+
+                def _extract() -> bytes | None:
+                    video_bytes = result_path.read_bytes()
+                    frame = _first_video_frame_as_pil(video_bytes)
+                    if frame is None:
+                        return None
                     import io as _io
                     buf = _io.BytesIO()
                     frame.convert("RGB").save(buf, format="JPEG", quality=80)
-                    preview = buf.getvalue()
+                    return buf.getvalue()
+
+                preview = await asyncio.to_thread(_extract)
+                if preview is not None:
                     job.preview_bytes = preview  # cache for subsequent polls
                     return Response(content=preview, media_type="image/jpeg")
         except Exception:
             logger.exception("Failed to extract video preview for job %s", job_id)
 
-    # Path 3: no preview available — 204, not 404
+    # Path 4: no preview available — 204, not 404
     return Response(status_code=204)
 
 

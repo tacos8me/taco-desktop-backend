@@ -2,7 +2,7 @@ uploads/
 loras/
 flux_loras/
 thumbnails/
-history.db
+history.db*
 approved-images/
 .venv/
 __pycache__/

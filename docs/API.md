@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.1.5 (2026-04-09)
+**Server version:** v1.1.6 (2026-04-11)
 **Base URL:** `http://<host>:8090`
 **Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
@@ -379,6 +379,7 @@ All return `202` + submission envelope.
   "status": "queued" | "processing" | "completed" | "failed" | "cancelled",
   "type": "text-to-video" | ...,
   "progress": 0.42,
+  "phase": "denoising" | "decoding" | "encoding" | "saving" | null,
   "queue_position": 3,
   "error": {"code": "generation_failed", "message": "..."} | null,
   "result_url": "/v2/jobs/job_.../result" | null,
@@ -387,7 +388,8 @@ All return `202` + submission envelope.
 }
 ```
 
-- `progress` is only populated while `processing` (range `0.0–1.0`). Completed jobs report `1.0`.
+- `progress` is only populated while `processing` (range `0.0–1.0`). Denoising reports up to `0.90`; the top 10% is reserved for post-denoise phases. Completed jobs report `1.0`.
+- `phase` is only populated while `processing`. Typical sequence: `denoising` → `decoding` (LTX only, VAE decode) → `encoding` (ffmpeg or WEBP) → `saving` (upload-store write). Use this to render "Decoding video…" / "Encoding MP4…" / etc. instead of a frozen percentage during the silent post-denoise tail.
 - `queue_position` is only populated while `queued`.
 - `result_url` / `result_storage_uri` / `result_media_type` are only populated when `completed`.
 - `404` if the job id is unknown or expired (job store TTL applies).
@@ -869,6 +871,11 @@ curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
 
 ## Changelog
 
+- **v1.1.6** (2026-04-11)
+  - `/v2/jobs/{id}` status: new `phase` field ("denoising" / "decoding" / "encoding" / "saving" / null) so clients can render labels during the post-denoise tail instead of a frozen percentage. Denoising now reports progress up to `0.90` (was `0.99`); the top 10 % maps to the post-denoise phases.
+  - `/v2/jobs/{id}/preview`: reuses the on-disk thumbnail produced by `history.save()` via zero-copy `FileResponse`. Fallback lazy extraction still exists for jobs without api_key but is now offloaded via `asyncio.to_thread` so the event loop is never blocked.
+  - `history.save()` now runs in a background `asyncio.to_thread` task instead of on the queue worker's event loop. The worker dequeues the next job immediately; the previous ~300 ms thumbnail window no longer stalls the queue.
+  - SQLite history DB switched to WAL mode — readers no longer block behind the single writer. `/v2/history` list reads run concurrently with the worker's save.
 - **v1.1.5** (2026-04-09)
   - `/v2/jobs/{id}/preview`: returns `204` (not `404`) while no preview is available.
   - Lazy first-frame extraction for completed video jobs via PyAV; cached on job.

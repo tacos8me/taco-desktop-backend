@@ -14,7 +14,9 @@ import gc
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -278,6 +280,33 @@ def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
     return None if num_frames <= SHORT_VIDEO_THRESHOLD else DECODE_TILING
 
 
+@contextmanager
+def _timed(label: str):
+    """Log wall-clock elapsed for a block. Used at post-denoise phase boundaries
+    so we can measure where the v1.1.5 "stuck at 95%" tail actually goes —
+    previously the VAE decode + ffmpeg encode ran silently for 10+ seconds."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("%s: %.2fs", label, time.perf_counter() - t0)
+
+
+def _emit_phase(on_progress, progress: float, phase: str) -> None:
+    """Emit a (progress, phase) update if a callback is present.
+
+    Signature-flexible: our own `on_progress` closures accept `(float, str)`,
+    but upstream ltx-pipelines may pass float-only callbacks through our
+    `_wrap_denoise`. This helper only runs in taco-backend's own post-denoise
+    code paths, so we know the callback accepts the phase kwarg."""
+    if on_progress is not None:
+        try:
+            on_progress(progress, phase=phase)
+        except TypeError:
+            # Callback doesn't accept phase kwarg — degrade to progress-only.
+            on_progress(progress)
+
+
 def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iterator[torch.Tensor]:
     """Decode video in bfloat16 (standard)."""
     yield from vae_decode_video(latent, decoder, tiling, generator)
@@ -452,14 +481,21 @@ class SplitModelManager:
 
     @staticmethod
     def _wrap_denoise(denoise_fn, on_progress, total_steps, offset=0.0, scale=1.0):
-        """Wrap a denoise_fn to report progress on each step."""
+        """Wrap a denoise_fn to report progress on each step.
+
+        Cap is 0.90 (was 0.99 in v1.1.4): the top 10% of the progress bar is
+        reserved for post-denoise phases (decoding, encoding, saving) that are
+        emitted explicitly by the `_run_*` methods below. This makes the
+        previously-invisible 10–20 s VAE-decode-plus-ffmpeg-encode tail show up
+        as phase labels instead of a frozen 95%.
+        """
         step_count = [0]  # mutable counter for closure
 
         def wrapped(*args, **kwargs):
             result = denoise_fn(*args, **kwargs)
             step_count[0] += 1
             p = offset + min(step_count[0] / max(total_steps, 1), 1.0) * scale
-            on_progress(min(p, 0.99))
+            on_progress(min(p, 0.90))
             return result
         return wrapped
 
@@ -597,9 +633,13 @@ class SplitModelManager:
         torch.cuda.empty_cache()
 
         # Decode (decoders lazy-load here, with transformer/upsampler/encoder freed)
+        _emit_phase(on_progress, 0.90, "decoding")
         decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
-        decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
-        return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+        with _timed(f"audio_vae_decode job=t2v"):
+            decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        _emit_phase(on_progress, 0.95, "encoding")
+        with _timed(f"video_decode+encode job=t2v"):
+            return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
     @torch.inference_mode()
     def _run_t2v_hq(
@@ -702,9 +742,13 @@ class SplitModelManager:
         torch.cuda.empty_cache()
 
         # Decode (decoders lazy-load here, with transformer/upsampler/encoder freed)
+        _emit_phase(on_progress, 0.90, "decoding")
         decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
-        decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
-        return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+        with _timed("audio_vae_decode job=t2v_hq"):
+            decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        _emit_phase(on_progress, 0.95, "encoding")
+        with _timed("video_decode+encode job=t2v_hq"):
+            return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
     @torch.inference_mode()
     def _run_i2v(
@@ -819,9 +863,13 @@ class SplitModelManager:
         gc.collect()
         torch.cuda.empty_cache()
 
+        _emit_phase(on_progress, 0.90, "decoding")
         decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
-        decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
-        return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+        with _timed("audio_vae_decode job=i2v"):
+            decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        _emit_phase(on_progress, 0.95, "encoding")
+        with _timed("video_decode+encode job=i2v"):
+            return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
     @torch.inference_mode()
     def _run_a2v(
@@ -942,9 +990,12 @@ class SplitModelManager:
         torch.cuda.empty_cache()
 
         # Decode video but return ORIGINAL audio (a2v passthrough)
+        _emit_phase(on_progress, 0.90, "decoding")
         decoded_video = _decode_video_fp32(video_latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
-        return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
+        _emit_phase(on_progress, 0.95, "encoding")
+        with _timed("video_decode+encode job=a2v"):
+            return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
     @torch.inference_mode()
     def _run_retake(
@@ -1065,9 +1116,13 @@ class SplitModelManager:
         worker.evict_transformer()
         gc.collect()
 
+        _emit_phase(on_progress, 0.90, "decoding")
         decoded_video = _decode_video_fp32(video_state.latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
-        decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
-        return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
+        with _timed("audio_vae_decode job=retake"):
+            decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
+        _emit_phase(on_progress, 0.95, "encoding")
+        with _timed("video_decode+encode job=retake"):
+            return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
 
     # --- Async API (matches PipelineManager interface) ---
 

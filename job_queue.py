@@ -1,7 +1,7 @@
 """Async job queue for generation requests.
 
 Submit-poll-fetch pattern to work around Cloudflare's 100s timeout.
-Dual queues with per-device workers for concurrent Flux + LTX inference.
+Single asyncio.Queue + one background worker (serialized by _inference_lock).
 """
 
 from __future__ import annotations
@@ -62,6 +62,11 @@ class Job:
     started_at: float | None = None
     completed_at: float | None = None
     progress: float = 0.0
+    # Coarse post-denoise phase: "denoising" | "decoding" | "encoding" | "saving" | None.
+    # Progress alone cannot convey what's happening in the invisible 0.90→1.0 tail
+    # (VAE decode + ffmpeg encode + thumbnail write), so clients can render a phase
+    # label instead of a frozen percentage.
+    phase: str | None = None
     current_step: int = 0
     total_steps: int = 0
     result_uri: str | None = None
@@ -114,39 +119,16 @@ def make_job_id() -> str:
     return secrets.token_urlsafe(16)
 
 
-def update_progress(job: Job, step: int, total_steps: int) -> None:
-    """Update job progress from a denoising step callback."""
-    job.current_step = step
-    job.total_steps = total_steps
-    job.progress = min(step / max(total_steps, 1), 0.99)
-
-
-def make_progress_callback(job: Job, total_steps: int, stage_offset: float = 0.0, stage_scale: float = 1.0) -> Callable:
-    """Create a step-counting wrapper for LTX denoise functions.
-
-    Returns a function that wraps a denoise_fn call and updates job progress.
-    For multi-stage pipelines, use stage_offset/stage_scale to map to 0-1 range.
-    """
-    call_count = 0
-
-    def wrapper(original_fn: Callable) -> Callable:
-        def counting_fn(*args: Any, **kwargs: Any) -> Any:
-            nonlocal call_count
-            result = original_fn(*args, **kwargs)
-            call_count += 1
-            raw_progress = min(call_count / max(total_steps, 1), 1.0)
-            job.progress = min(stage_offset + raw_progress * stage_scale, 0.99)
-            job.current_step = call_count
-            job.total_steps = total_steps
-            return result
-        return counting_fn
-    return wrapper
-
-
 def make_flux_callback(job: Job, total_steps: int) -> Callable:
-    """Create a diffusers callback_on_step_end for Flux progress tracking."""
+    """Create a diffusers callback_on_step_end for Flux progress tracking.
+
+    Denoising is capped at 0.90 — the remaining 0.10 is reserved for post-denoise
+    phases (encoding, saving) that are emitted by the dispatch layer.
+    """
     def callback(pipe: Any, step: int, timestep: Any, callback_kwargs: dict) -> dict:
-        job.progress = min(step / max(total_steps, 1), 0.99)
+        if job.status == JobStatus.CANCELLED:
+            return callback_kwargs
+        job.progress = min((step / max(total_steps, 1)) * 0.9, 0.90)
         job.current_step = step
         job.total_steps = total_steps
         return callback_kwargs
@@ -156,7 +138,7 @@ def make_flux_callback(job: Job, total_steps: int) -> Callable:
 async def worker_loop(
     job_store: JobStore,
     queue: asyncio.Queue[str],
-    device_lock: asyncio.Lock,
+    inference_lock: asyncio.Lock,
     dispatch_fn: Callable,
     uploads: UploadStore,
     history: "HistoryStore | None" = None,
@@ -172,13 +154,19 @@ async def worker_loop(
 
         job.status = JobStatus.PROCESSING
         job.started_at = time.monotonic()
+        job.phase = "denoising"
         logger.info("Processing job %s (%s)", job.id, job.type)
 
         result_bytes: bytes | None = None
         try:
-            async with device_lock:
+            async with inference_lock:
                 result_bytes = await dispatch_fn(job)
 
+            # Dispatch returned bytes; the final step is moving them into the
+            # upload store and flipping status. Surface this as "saving" so
+            # the progress bar keeps advancing while the disk write runs.
+            job.phase = "saving"
+            job.progress = 0.99
             upload_id, storage_uri = uploads.create()
             uploads.save(upload_id, result_bytes)
 
@@ -186,39 +174,67 @@ async def worker_loop(
             job.result_media_type = _MEDIA_TYPES.get(job.type, "application/octet-stream")
             job.status = JobStatus.COMPLETED
             job.progress = 1.0
+            job.phase = None
             elapsed = time.monotonic() - (job.started_at or job.created_at)
             logger.info("Job %s completed in %.1fs", job.id, elapsed)
 
         except Exception as exc:
             job.status = JobStatus.FAILED
+            job.phase = None
             job.error = str(exc)[:500]
             job.error_code = "cuda_oom" if "out of memory" in str(exc).lower() else "generation_failed"
             logger.exception("Job %s failed", job.id)
 
         finally:
             job.completed_at = time.monotonic()
-            # Persist to history DB
-            if history and job.api_key:
-                try:
-                    params = job.params or {}
-                    history.save(
-                        job_id=job.id,
-                        api_key=job.api_key,
-                        job_type=job.type,
-                        prompt=params.get("prompt", ""),
-                        model=params.get("model"),
-                        width=params.get("width", 0),
-                        height=params.get("height", 0),
-                        turbo=params.get("turbo", False),
-                        status=job.status,
-                        result_uri=job.result_uri,
-                        result_bytes=result_bytes,
-                        created_at=time.time(),
-                        completed_at=time.time() if job.completed_at else None,
-                        error=job.error,
-                    )
-                except Exception:
-                    logger.warning("Failed to save job %s to history", job.id, exc_info=True)
+            # Fire-and-forget history save: PyAV first-frame decode + JPEG encode
+            # + SQLite commit together take 130–430 ms for a 1080p video, which
+            # would otherwise block the worker from dequeuing the next job. The
+            # task also backfills job.preview_bytes from the on-disk thumbnail so
+            # /v2/jobs/{id}/preview hits the fast path on the next poll.
+            if history and job.api_key and result_bytes is not None:
+                _params = job.params or {}
+                _captured = dict(
+                    job_id=job.id,
+                    api_key=job.api_key,
+                    job_type=job.type,
+                    prompt=_params.get("prompt", ""),
+                    model=_params.get("model"),
+                    width=_params.get("width", 0),
+                    height=_params.get("height", 0),
+                    turbo=_params.get("turbo", False),
+                    status=job.status,
+                    result_uri=job.result_uri,
+                    result_bytes=result_bytes,
+                    created_at=time.time(),
+                    completed_at=time.time(),
+                    error=job.error,
+                )
+                _job_id_for_log = job.id
+                _result_uri = job.result_uri
+                _job_ref = job
+
+                async def _save_and_populate(
+                    captured: dict = _captured,
+                    jid: str = _job_id_for_log,
+                    result_uri: str | None = _result_uri,
+                    j: Job = _job_ref,
+                ) -> None:
+                    try:
+                        t0 = time.perf_counter()
+                        await asyncio.to_thread(history.save, **captured)
+                        logger.info("history.save: %.2fs (job %s)", time.perf_counter() - t0, jid)
+                        # Backfill preview_bytes from the thumbnail we just wrote,
+                        # so the /preview endpoint's fast path hits on next poll.
+                        if result_uri and not j.preview_bytes:
+                            upload_id = result_uri.removeprefix("storage://")
+                            thumb_path = config.THUMBNAIL_DIR / f"thumb_{upload_id}"
+                            if thumb_path.exists():
+                                j.preview_bytes = thumb_path.read_bytes()
+                    except Exception:
+                        logger.warning("Failed to save job %s to history", jid, exc_info=True)
+
+                asyncio.create_task(_save_and_populate())
             queue.task_done()
 
 

@@ -31,7 +31,9 @@ import io
 import logging
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 import torch
 from PIL import Image
@@ -42,6 +44,25 @@ import config
 os.environ.setdefault("HF_HOME", "/mnt/nvme-1/huggingface")
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _timed(label: str):
+    """Log wall-clock elapsed for a block (phase-boundary timing)."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("%s: %.2fs", label, time.perf_counter() - t0)
+
+
+def _emit_phase(phase_sink: Callable | None, progress: float, phase: str) -> None:
+    """Emit a (progress, phase) update to a caller-supplied callback."""
+    if phase_sink is not None:
+        try:
+            phase_sink(progress, phase=phase)
+        except TypeError:
+            phase_sink(progress)
 
 
 class FluxLoraError(ValueError):
@@ -301,6 +322,7 @@ class FluxManager:
         model: str = "flux2-dev", turbo: bool = False,
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
+        phase_sink: Callable | None = None,
     ) -> bytes:
         """Generate an image (txt2img) and return WEBP bytes."""
         self.ensure_model(model, user_lora_path=lora_path)
@@ -337,7 +359,10 @@ class FluxManager:
             gc.collect()
             torch.cuda.empty_cache()
 
-        return self._to_webp(result.images[0])
+        # Pipeline returns with VAE decode already done — only WEBP encode remains.
+        _emit_phase(phase_sink, 0.95, "encoding")
+        with _timed("flux_webp_encode model=%s" % model):
+            return self._to_webp(result.images[0])
 
     @torch.inference_mode()
     def _img2img(
@@ -346,6 +371,7 @@ class FluxManager:
         model: str = "flux2-dev", turbo: bool = False,
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
+        phase_sink: Callable | None = None,
     ) -> bytes:
         """Edit an image using single reference."""
         self.ensure_model(model, user_lora_path=lora_path)
@@ -382,7 +408,9 @@ class FluxManager:
             gc.collect()
             torch.cuda.empty_cache()
 
-        return self._to_webp(result.images[0])
+        _emit_phase(phase_sink, 0.95, "encoding")
+        with _timed("flux_webp_encode model=%s" % model):
+            return self._to_webp(result.images[0])
 
     @torch.inference_mode()
     def _edit(
@@ -391,6 +419,7 @@ class FluxManager:
         seed: int = 0,
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
+        phase_sink: Callable | None = None,
     ) -> bytes:
         """Multi-reference image editing via Klein."""
         self.ensure_model("flux2-klein", user_lora_path=lora_path)
@@ -418,7 +447,9 @@ class FluxManager:
         gc.collect()
         torch.cuda.empty_cache()
 
-        return self._to_webp(result.images[0])
+        _emit_phase(phase_sink, 0.95, "encoding")
+        with _timed("flux_webp_encode model=flux2-klein-edit"):
+            return self._to_webp(result.images[0])
 
     # --- Async API ---
 

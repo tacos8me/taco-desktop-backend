@@ -125,6 +125,12 @@ class HistoryStore:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        # WAL mode: readers never block the single writer. Without this, the
+        # /v2/history list endpoint stalls behind the queue worker's thumbnail
+        # write. WAL is persisted in the DB header — running it on an existing
+        # DELETE-journal DB performs an online conversion. Creates .db-wal and
+        # .db-shm sidecar files (see .gitignore).
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.commit()
         logger.info("History DB opened at %s", self._db_path)
 
