@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.1.6 (2026-04-11)
+**Server version:** v1.1.7 (2026-04-11)
 **Base URL:** `http://<host>:8090`
 **Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
@@ -419,6 +419,61 @@ Returns a low-res preview JPEG at three possible states:
 - `409 Cannot cancel a finished job` if already completed / failed / cancelled.
 - `404 Job not found`.
 
+### `GET /v2/jobs/{job_id}/stream` — SSE live updates
+
+Server-Sent Events stream for live job state. **Use this instead of polling `/v2/jobs/{id}`** — one long-lived connection replaces the entire poll loop.
+
+**Auth**: `EventSource` can't set custom headers, so the endpoint accepts either a bearer `Authorization` header (for programmatic clients) or a `?token=<sse-token>` query param (for browsers). Get a short-lived token via `POST /v1/sse-token`.
+
+**Event shape**: each `data:` line contains the same JSON as `GET /v2/jobs/{id}` (status, progress, phase, queue_position, error, result_url, …). Drop it into your existing polling parser as-is.
+
+**Delivery semantics**:
+- Emits one event immediately on connect with the current state.
+- Emits again every time `(status, progress, phase, error_code)` changes. Progress is rounded to 3 decimals to avoid flooding on micro-ticks.
+- Emits a `: keepalive` comment every 15 s during idle periods (queued with no position change) to prevent intermediate proxies from closing the connection.
+- Emits one final event on terminal state (completed / failed / cancelled), then closes the stream.
+- Emits `event: error` with `{"error": "job_expired"}` and closes if the job is evicted from the store mid-stream.
+
+**Status codes**:
+- `200 text/event-stream` — stream opened.
+- `404 Job not found` — unknown job id (before stream opens).
+- `401 Missing API key` — neither bearer nor valid token.
+
+**Browser example**:
+
+```js
+// 1. Submit the job (normal POST with bearer)
+const { job_id } = await fetch("/v2/text-to-video", { ... }).then(r => r.json());
+
+// 2. Get a disposable SSE token
+const { token } = await fetch("/v1/sse-token", { method: "POST", headers: { Authorization: `Bearer ${KEY}` } }).then(r => r.json());
+
+// 3. Open the live stream
+const es = new EventSource(`/v2/jobs/${job_id}/stream?token=${token}`);
+es.onmessage = (ev) => {
+  const { progress, phase, status, result_url } = JSON.parse(ev.data);
+  setProgress(progress);
+  setPhase(phase);
+  if (status === "completed") {
+    fetch(result_url, { headers: { Authorization: `Bearer ${KEY}` } })
+      .then(r => r.blob())
+      .then(showResult);
+    es.close();
+  } else if (status === "failed" || status === "cancelled") {
+    es.close();
+  }
+};
+es.addEventListener("error", (ev) => {
+  // connection dropped OR server emitted `event: error` — retry or fall back to polling
+});
+```
+
+**curl example**:
+
+```bash
+curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
+```
+
 ---
 
 ## Uploads
@@ -805,6 +860,7 @@ Codes the backend actively returns:
 | GET | `/v2/jobs/{job_id}` | yes | Poll job status |
 | GET | `/v2/jobs/{job_id}/preview` | yes | Preview JPEG (204 when empty) |
 | GET | `/v2/jobs/{job_id}/result` | yes | Download final media |
+| GET | `/v2/jobs/{job_id}/stream` | yes (bearer OR token) | SSE live status/progress/phase stream |
 | DELETE | `/v2/jobs/{job_id}` | yes | Cancel job |
 | POST | `/v1/sse-token` | yes | Issue 5-min SSE token |
 | POST | `/v1/approved-images` | yes | Approve an image |
@@ -822,7 +878,7 @@ Codes the backend actively returns:
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue composition export job |
 
-Total: 47 routes (46 HTTP handlers + `/health`).
+Total: 48 routes (47 HTTP handlers + `/health`).
 
 ---
 
@@ -871,6 +927,8 @@ curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
 
 ## Changelog
 
+- **v1.1.7** (2026-04-11)
+  - `GET /v2/jobs/{id}/stream` — SSE endpoint that was previously advertised in the submission envelope but never implemented. One long-lived connection replaces the 240-GET polling loop per video job. Emits on state change + keepalive every 15 s. Accepts bearer header or `?token=` query param (for browser `EventSource`).
 - **v1.1.6** (2026-04-11)
   - `/v2/jobs/{id}` status: new `phase` field ("denoising" / "decoding" / "encoding" / "saving" / null) so clients can render labels during the post-denoise tail instead of a frozen percentage. Denoising now reports progress up to `0.90` (was `0.99`); the top 10 % maps to the post-denoise phases.
   - `/v2/jobs/{id}/preview`: reuses the on-disk thumbnail produced by `history.save()` via zero-copy `FileResponse`. Fallback lazy extraction still exists for jobs without api_key but is now offloaded via `asyncio.to_thread` so the event loop is never blocked.

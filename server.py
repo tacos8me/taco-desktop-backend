@@ -190,6 +190,10 @@ async def check_api_key(request: Request, call_next):
         return await call_next(request)
     if request.url.path in ("/health", "/v1/approved-images/events"):
         return await call_next(request)
+    # SSE job streams: EventSource can't set custom headers, so these endpoints
+    # accept a `?token=` query param and do their own auth inside the handler.
+    if request.url.path.startswith("/v2/jobs/") and request.url.path.endswith("/stream"):
+        return await call_next(request)
 
     auth = request.headers.get("Authorization", "")
     token = auth[7:] if auth.startswith("Bearer ") else ""
@@ -1245,6 +1249,103 @@ async def v2_cancel_job(job_id: str) -> JSONResponse:
         return _error(409, "Cannot cancel a finished job")
     job.status = JobStatus.CANCELLED
     return JSONResponse(content={"job_id": job.id, "status": "cancelled"})
+
+
+@app.get("/v2/jobs/{job_id}/stream")
+async def v2_job_stream(
+    job_id: str, request: Request, token: str | None = None,
+) -> Response:
+    """SSE stream for live job status + progress + phase updates.
+
+    Eliminates client-side polling: instead of hitting `/v2/jobs/{id}` every
+    500 ms for two minutes (240 GETs per video job), the client opens one
+    EventSource and receives push updates whenever (status, progress, phase)
+    changes. The stream closes itself with one final event on terminal state
+    (completed / failed / cancelled).
+
+    **Auth**: EventSource cannot set custom headers, so pass either a bearer
+    `Authorization` header (programmatic clients) or `?token=<sse-token>`
+    query param (browsers — get one via `POST /v1/sse-token`).
+
+    **Event format**: each event is a single `data:` line containing the same
+    JSON shape as `GET /v2/jobs/{id}`, so clients can reuse their existing
+    polling parser. Idle-period keepalive comments (`: keepalive`) are emitted
+    every 15 s to prevent intermediate proxies from closing the connection
+    during long queue waits.
+    """
+    # Match the middleware's "no keys configured = auth disabled" mode, since
+    # this endpoint bypasses the middleware to allow `?token=` query-param auth
+    # (EventSource can't set headers).
+    if config.API_KEYS:
+        api_key = _resolve_sse_token(token) or _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+
+    job = job_store.get(job_id)
+    if job is None:
+        return _error(404, "Job not found")
+
+    import json as _json
+    import time as _time
+
+    def _snapshot(j: Job) -> dict:
+        return {
+            "job_id": j.id,
+            "status": j.status,
+            "type": j.type,
+            "progress": j.progress,
+            "phase": j.phase,
+            "queue_position": (
+                job_store.queue_position(j.id) if j.status == JobStatus.QUEUED else None
+            ),
+            "error": (
+                {"code": j.error_code or "generation_failed", "message": j.error}
+                if j.error else None
+            ),
+            "result_url": f"/v2/jobs/{j.id}/result" if j.status == JobStatus.COMPLETED else None,
+            "result_storage_uri": j.result_uri if j.status == JobStatus.COMPLETED else None,
+            "result_media_type": j.result_media_type,
+        }
+
+    async def event_stream():
+        # Dedup key — only emit when something observable changes.
+        # Round progress to 3 decimals so micro-fluctuations don't flood the stream.
+        last_key: tuple | None = None
+        last_keepalive = _time.monotonic()
+        terminal = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    return
+                j = job_store.get(job_id)
+                if j is None:
+                    # Job expired from the store (cleanup TTL). Surface it and close.
+                    yield f"event: error\ndata: {_json.dumps({'error': 'job_expired'})}\n\n"
+                    return
+                key = (j.status, round(j.progress, 3), j.phase, j.error_code)
+                if key != last_key:
+                    yield f"data: {_json.dumps(_snapshot(j))}\n\n"
+                    last_key = key
+                    last_keepalive = _time.monotonic()
+                if j.status in terminal:
+                    return
+                now = _time.monotonic()
+                if now - last_keepalive > 15:
+                    yield ": keepalive\n\n"
+                    last_keepalive = now
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering if ever proxied
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

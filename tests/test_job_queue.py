@@ -193,3 +193,48 @@ def test_health_includes_queue_stats():
         resp = client.get("/health")
         assert resp.status_code == 200
         assert "queue" in resp.json()
+
+
+def test_v2_stream_unknown_job_returns_404():
+    with _with_no_auth():
+        resp = client.get("/v2/jobs/nonexistent-id/stream")
+        assert resp.status_code == 404
+
+
+def test_v2_stream_requires_auth_when_enabled():
+    from tests.test_auth import _with_keys, TEST_KEYS
+    with _with_keys(TEST_KEYS):
+        # No bearer, no token — middleware lets it through but handler returns 401
+        resp = client.get("/v2/jobs/anything/stream")
+        assert resp.status_code == 401
+        _cleanup_queue()
+
+
+def test_v2_stream_terminal_completed_job_emits_final_event_then_closes():
+    """A job already in COMPLETED state should yield one data: event and close."""
+    with _with_no_auth():
+        job = Job(
+            id=make_job_id(),
+            type=JobType.TEXT_TO_IMAGE,
+            status=JobStatus.COMPLETED,
+            progress=1.0,
+            result_uri="storage://fake-id",
+            result_media_type="image/webp",
+        )
+        job_store.add(job)
+        try:
+            with client.stream("GET", f"/v2/jobs/{job.id}/stream") as resp:
+                assert resp.status_code == 200
+                assert resp.headers["content-type"].startswith("text/event-stream")
+                body = resp.read().decode()
+            # At least one data: line with a completed-status snapshot.
+            # Parse the first data line to avoid JSON whitespace flakiness.
+            import json as _json
+            data_lines = [ln for ln in body.splitlines() if ln.startswith("data: ")]
+            assert data_lines, f"no data: line in stream body: {body!r}"
+            payload = _json.loads(data_lines[0].removeprefix("data: "))
+            assert payload["status"] == "completed"
+            assert payload["progress"] == 1.0
+            assert payload["result_media_type"] == "image/webp"
+        finally:
+            _cleanup_queue()
