@@ -326,16 +326,39 @@ class SplitModelManager:
         return len(self._workers) > 0
 
     def evict_all(self) -> None:
-        """Free all GPU memory — evict transformer + encoder hub on all workers."""
+        """Free all GPU memory — evict transformer + encoder hub on all workers.
+
+        Previously this left ~22 GB of encoder-hub weights resident on the LTX
+        device after a pause/unload, because each `DenoiserWorker` holds TWO
+        strong references to its source `ModelLedger` (one on `worker._model_ledger`
+        directly, and one indirectly via `worker.ledger._source_ledger` on the
+        `CachingModelLedger` wrapper). The ledger's internal registry and builders
+        then keep the loaded weight tensors pinned on the GPU, and no amount of
+        `gc.collect()` + `empty_cache()` can reclaim them while those references
+        exist. Explicitly setting both to `None` per worker breaks the chain so
+        the ledger, its registry, and the underlying weights can actually be
+        garbage collected.
+        """
         for worker in self._workers:
             worker.evict_transformer()
-            # Also evict decoders/encoders in worker cache
+            # Drop all cached models (worker.cache and worker.ledger._cache are
+            # the SAME dict object by reference — clearing one clears both).
             for key in list(worker.cache.keys()):
                 worker.cache[key] = None
+            # CRITICAL: clear both strong refs to the source ModelLedger. Without
+            # these, the ledger's registry + weight builders pin ~22 GB of
+            # encoder-hub weights (Gemma text encoder + VAE + spatial upsampler)
+            # on the worker's device indefinitely.
+            worker._model_ledger = None
+            worker.ledger._source_ledger = None
         self._workers.clear()
         if self._encoder_ledger is not None:
             for key in list(self._encoder_ledger._cache.keys()):
                 self._encoder_ledger._cache[key] = None
+            # The encoder-hub wrapper was constructed without source_ledger so
+            # this is usually None already, but zero it defensively in case the
+            # constructor changes or a future refactor adds one.
+            self._encoder_ledger._source_ledger = None
             self._encoder_ledger = None
         gc.collect()
         for device_name in config.GPU_DEVICES:
