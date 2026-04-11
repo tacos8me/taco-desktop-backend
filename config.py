@@ -35,9 +35,13 @@ _GEMMA_VARIANTS = {
 GEMMA_VARIANT = os.environ.get("GEMMA_VARIANT", "default")
 GEMMA_ROOT = _GEMMA_VARIANTS.get(GEMMA_VARIANT, _GEMMA_VARIANTS["default"])
 
-# GPU devices
-LTX_DEVICE = "cuda:1"    # LTX-2 video generation (~69GB) — moved to free cuda:0
-FLUX_DEVICE = "cuda:0"   # Flux 2 image generation (not loaded by default)
+# GPU devices — SINGLE-GPU SWAP MODE
+# Both LTX and Flux live on cuda:0 but are mutually exclusive (LTX active ~79 GB
+# + Flux active ~81 GB > 96 GB). The server dispatcher auto-swaps by evicting
+# LTX before any Flux forward pass and (re)loading LTX before any video request.
+# cuda:1 is reserved for external training runs — taco-backend never touches it.
+LTX_DEVICE = "cuda:0"
+FLUX_DEVICE = "cuda:0"
 LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
 CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server

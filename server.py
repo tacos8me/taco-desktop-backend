@@ -58,6 +58,33 @@ _job_queue: asyncio.Queue[str] = asyncio.Queue()
 # ---------------------------------------------------------------------------
 
 
+def _ensure_ltx_resident() -> None:
+    """Single-GPU swap mode: ensure LTX is loaded on cuda:0 before a video request.
+
+    Caller MUST hold `_inference_lock` so no concurrent Flux forward pass is
+    already paging weights onto the same device. LTX and Flux share cuda:0 and
+    are mutually exclusive — this helper is the "swap in" direction.
+    """
+    if not manager.is_ready:
+        logger.info("Auto-swap: loading LTX on %s", config.LTX_DEVICE)
+        manager.load_all()
+
+
+def _ensure_flux_ready() -> None:
+    """Single-GPU swap mode: ensure LTX is evicted before a Flux forward pass.
+
+    Caller MUST hold `_inference_lock`. Flux uses `enable_model_cpu_offload` so
+    its own pipeline doesn't hold cuda:0 when idle, but its forward pass peaks
+    at ~75 GB which collides with LTX's resident ~67 GB. This helper evicts
+    LTX to make room. LTX is NOT automatically reloaded afterwards — the next
+    video request triggers `_ensure_ltx_resident` which cold-loads it again
+    (~25–30 s).
+    """
+    if manager.is_ready:
+        logger.info("Auto-swap: evicting LTX from %s to free room for Flux", config.LTX_DEVICE)
+        manager.evict_all()
+
+
 async def _dispatch_job(job: Job) -> bytes:
     """Route a job to the correct manager and return result bytes."""
     if _paused:
@@ -69,26 +96,33 @@ async def _dispatch_job(job: Job) -> bytes:
 
     match job.type:
         case JobType.TEXT_TO_VIDEO:
+            _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_text_to_video(**p, on_progress=on_progress)
         case JobType.IMAGE_TO_VIDEO:
+            _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_image_to_video(**p, on_progress=on_progress)
         case JobType.AUDIO_TO_VIDEO:
+            _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_audio_to_video(**p, on_progress=on_progress)
         case JobType.RETAKE:
+            _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.retake(**p, on_progress=on_progress)
         case JobType.TEXT_TO_IMAGE:
+            _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_text_to_image(**p, callback_on_step_end=cb)
         case JobType.IMAGE_TO_IMAGE:
+            _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_image_to_image(**p, callback_on_step_end=cb)
         case JobType.IMAGE_EDIT:
+            _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 4))
             return await flux.generate_image_edit(**p, callback_on_step_end=cb)
@@ -434,28 +468,64 @@ async def system_resume() -> dict:
 
 @app.post("/v1/flux/unload")
 async def flux_unload() -> dict:
-    """Unload Flux model from GPU0 to free VRAM for external vision models."""
+    """Unload Flux model from the Flux device to free VRAM for training / vision models."""
     if not flux.is_ready:
         return {"status": "already_unloaded"}
     try:
         async with _inference_lock:
             flux.unload()
-        logger.info("Flux unloaded from GPU0")
+        logger.info("Flux unloaded from %s", config.FLUX_DEVICE)
         return {"status": "unloaded"}
     except Exception:
         logger.exception("Flux unload failed")
         return JSONResponse(status_code=500, content={"error": "flux_unload_failed"})
 
 
+@app.post("/v1/ltx/unload")
+async def ltx_unload() -> dict:
+    """Unload LTX from the LTX device to free VRAM (e.g. for a training run).
+
+    Unlike /v1/system/pause this touches ONLY LTX — the Flux pipeline stays
+    available for image generation. In single-GPU swap mode (LTX_DEVICE ==
+    FLUX_DEVICE), this also makes room on the GPU for a subsequent Flux
+    forward pass; the next video request will auto-swap LTX back in.
+    """
+    if not manager.is_ready:
+        return {"status": "already_unloaded"}
+    try:
+        async with _inference_lock:
+            manager.evict_all()
+        logger.info("LTX unloaded from %s", config.LTX_DEVICE)
+        return {"status": "unloaded"}
+    except Exception:
+        logger.exception("LTX unload failed")
+        return JSONResponse(status_code=500, content={"error": "ltx_unload_failed"})
+
+
+@app.post("/v1/ltx/reload")
+async def ltx_reload() -> dict:
+    """Reload LTX to the LTX device."""
+    if manager.is_ready:
+        return {"status": "already_loaded"}
+    try:
+        async with _inference_lock:
+            manager.load_all()
+        logger.info("LTX reloaded to %s", config.LTX_DEVICE)
+        return {"status": "loaded"}
+    except Exception:
+        logger.exception("LTX reload failed")
+        return JSONResponse(status_code=500, content={"error": "ltx_reload_failed"})
+
+
 @app.post("/v1/flux/reload")
 async def flux_reload() -> dict:
-    """Reload Flux model to GPU0."""
+    """Reload Flux model to the Flux device."""
     if flux.is_ready:
         return {"status": "already_loaded"}
     try:
         async with _inference_lock:
             flux.load()
-        logger.info("Flux reloaded to GPU0")
+        logger.info("Flux reloaded to %s", config.FLUX_DEVICE)
         return {"status": "loaded"}
     except Exception:
         logger.exception("Flux reload failed")
@@ -466,8 +536,7 @@ async def flux_reload() -> dict:
 async def text_to_video(body: TextToVideoRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if not manager.is_ready:
-        return _error(500, "No GPU workers loaded")
+    # Auto-swap handles manager.is_ready lazily inside the lock
     lora_result = _resolve_lora(body)
     if isinstance(lora_result, JSONResponse):
         return lora_result
@@ -478,8 +547,9 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
         prompt = _build_prompt(body.prompt, body.camera_motion)
         seed = random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
+            _ensure_ltx_resident()
+            torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.generate_text_to_video(
                 prompt=prompt,
                 model=body.model,
@@ -507,8 +577,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         return keyframe_inputs
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if not manager.is_ready:
-        return _error(500, "No GPU workers loaded")
+    # Auto-swap handles manager.is_ready lazily inside the lock
     lora_result = _resolve_lora(body)
     if isinstance(lora_result, JSONResponse):
         return lora_result
@@ -517,8 +586,9 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         width, height = _resolution_to_dims(body.resolution)
         seed = random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
+            _ensure_ltx_resident()
+            torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
                 keyframes=keyframe_inputs,
@@ -545,8 +615,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
 async def audio_to_video(body: AudioToVideoRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if not manager.is_ready:
-        return _error(500, "No GPU workers loaded")
+    # Auto-swap handles manager.is_ready lazily inside the lock
     lora_result = _resolve_lora(body)
     if isinstance(lora_result, JSONResponse):
         return lora_result
@@ -561,8 +630,9 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
         num_frames = _duration_to_frames(body.duration, body.fps)
         seed = random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
+            _ensure_ltx_resident()
+            torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.generate_audio_to_video(
                 prompt=body.prompt,
                 audio_path=audio_path,
@@ -589,8 +659,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
 async def retake(body: RetakeRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if not manager.is_ready:
-        return _error(500, "No GPU workers loaded")
+    # Auto-swap handles manager.is_ready lazily inside the lock
     lora_result = _resolve_lora(body)
     if isinstance(lora_result, JSONResponse):
         return lora_result
@@ -600,8 +669,9 @@ async def retake(body: RetakeRequest) -> Response:
         prompt = body.prompt or ""
         seed = random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.LTX_DEVICE)
         async with _inference_lock:
+            _ensure_ltx_resident()
+            torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.retake(
                 video_path=video_path,
                 start_time=body.start_time,
@@ -635,8 +705,9 @@ async def text_to_image(body: TextToImageRequest) -> Response:
         height = (body.height // 16) * 16
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.FLUX_DEVICE)
         async with _inference_lock:
+            _ensure_flux_ready()
+            torch.cuda.set_device(config.FLUX_DEVICE)
             image_bytes = await flux.generate_text_to_image(
                 prompt=body.prompt,
                 width=width,
@@ -673,8 +744,9 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         height = (body.height // 16) * 16
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.FLUX_DEVICE)
         async with _inference_lock:
+            _ensure_flux_ready()
+            torch.cuda.set_device(config.FLUX_DEVICE)
             image_bytes = await flux.generate_image_to_image(
                 prompt=body.prompt,
                 image_path=image_path,
@@ -714,8 +786,9 @@ async def image_edit(body: ImageEditRequest) -> Response:
         height = (body.height // 16) * 16
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
-        torch.cuda.set_device(config.FLUX_DEVICE)
         async with _inference_lock:
+            _ensure_flux_ready()
+            torch.cuda.set_device(config.FLUX_DEVICE)
             image_bytes = await flux.generate_image_edit(
                 prompt=body.prompt,
                 image_paths=image_paths,
