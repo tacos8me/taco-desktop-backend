@@ -38,13 +38,17 @@ All endpoints except `/health` require: `Authorization: Bearer <api-key>`
 Every generation endpoint has a sync `/v1/...` (blocks until done) and async `/v2/...` (returns immediately) variant. **Use v2 for production.**
 
 ```
-POST /v2/text-to-video  →  202 {"job_id": "xxx"}
-GET  /v2/jobs/xxx       →  {"status": "processing", "progress": 0.5}
-GET  /v2/jobs/xxx       →  {"status": "completed", "result_url": "/v2/jobs/xxx/result"}
-GET  /v2/jobs/xxx/result →  raw MP4 or WEBP bytes
+POST /v2/text-to-video        →  202 {"job_id": "xxx", "stream_url": "/v2/jobs/xxx/stream"}
+GET  /v2/jobs/xxx/stream      →  SSE: {"status":"processing","progress":0.45,"phase":"denoising"}
+                                  SSE: {"status":"processing","progress":0.90,"phase":"decoding"}
+                                  SSE: {"status":"processing","progress":0.95,"phase":"encoding"}
+                                  SSE: {"status":"completed","result_url":"/v2/jobs/xxx/result"}
+GET  /v2/jobs/xxx/result      →  raw MP4 or WEBP bytes
 ```
 
-Poll `/v2/jobs/{id}` every 2-5 seconds until `status` is `completed` or `failed`.
+**Prefer the SSE stream** at `GET /v2/jobs/{id}/stream` over polling `GET /v2/jobs/{id}` — one long-lived connection replaces 240+ GETs per video job. The event payload is the same JSON shape as the poll response, so the same parser works for both. Fall back to polling every 1–2 s only if your client can't do EventSource.
+
+Jobs report both `progress` (0.0–1.0, capped at 0.90 during denoising) and `phase` (`"denoising" | "decoding" | "encoding" | "saving" | null`). The top 10% of the progress bar maps to post-denoise work (VAE decode, ffmpeg/WEBP encode, upload) — render the `phase` label instead of a frozen percentage during that window.
 
 ### Upload Flow
 
@@ -360,17 +364,19 @@ Optionally place a same-named `.json` sidecar alongside the `.safetensors` for d
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v2/jobs/{id}` | GET | Poll status + progress |
+| `/v2/jobs/{id}/stream` | GET | **SSE live updates** — status / progress / phase. **Use this instead of polling.** |
+| `/v2/jobs/{id}` | GET | Poll status + progress (fallback if you can't do SSE) |
 | `/v2/jobs/{id}/result` | GET | Download result (MP4/WEBP) |
-| `/v2/jobs/{id}/preview` | GET | Preview JPEG (during processing) |
+| `/v2/jobs/{id}/preview` | GET | Preview JPEG (during processing, 204 if none yet) |
 | `/v2/jobs/{id}` | DELETE | Cancel job |
 
-**Status response**:
+**Status response** (identical shape for poll and SSE `data:` payload):
 ```json
 {
   "job_id": "unguessable_token",
   "status": "queued | processing | completed | failed | cancelled",
   "progress": 0.5,
+  "phase": "denoising | decoding | encoding | saving | null",
   "queue_position": 3,
   "result_url": "/v2/jobs/{id}/result",
   "result_media_type": "video/mp4 | image/webp",
@@ -378,9 +384,41 @@ Optionally place a same-named `.json` sidecar alongside the `.safetensors` for d
 }
 ```
 
+### SSE stream (`/v2/jobs/{id}/stream`)
+
+EventSource-compatible. Emits one event on connect with the current state, then emits again only when `(status, progress, phase, error_code)` changes. Closes the stream on terminal state (completed / failed / cancelled) after one final event. Idle periods (e.g. job sitting queued) get a `: keepalive` comment every 15 s so intermediate proxies don't drop the connection.
+
+**Auth**: browsers can't set custom headers on `EventSource`, so the endpoint accepts either a bearer `Authorization` header **or** a `?token=<sse-token>` query-param. Get a 5-minute disposable token via `POST /v1/sse-token`.
+
+```js
+// Browser
+const { token } = await fetch("/v1/sse-token", {
+  method: "POST",
+  headers: { Authorization: `Bearer ${KEY}` },
+}).then(r => r.json());
+
+const es = new EventSource(`/v2/jobs/${job_id}/stream?token=${token}`);
+es.onmessage = (ev) => {
+  const { status, progress, phase, result_url } = JSON.parse(ev.data);
+  setProgress(progress);
+  setPhase(phase);
+  if (status === "completed") {
+    fetchResult(result_url);
+    es.close();
+  } else if (status === "failed" || status === "cancelled") {
+    es.close();
+  }
+};
+```
+
+```bash
+# curl
+curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
+```
+
 - Max queue depth: 10 (returns 429 `Retry-After: 30`)
 - Results expire after 10 minutes
-- Job IDs are unguessable — no auth needed to poll/fetch
+- Job IDs are unguessable tokens, but auth is still required for all job endpoints
 
 ---
 

@@ -2,6 +2,8 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
+**Version**: v1.1.7 (2026-04-11).
+
 ## Structure
 - `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs
 - `split_model_manager.py` — Single-GPU LTX pipeline: shared encoder hub + swappable transformer
@@ -146,13 +148,22 @@ Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = 
 - Score ≥ 9 cutoff and structured-edit format are both prompt-engineered, not hardcoded in the server
 
 ## Generation history (history_store.py)
-- SQLite DB at `/mnt/nvme-1/servers/taco-backend/history.db`
+- SQLite DB at `/mnt/nvme-1/servers/taco-backend/history.db` — **WAL mode** (v1.1.6), readers never block behind the single writer
 - Saves every completed v2 job with prompt, model, dimensions, result_uri, thumbnail
 - API key hashed with SHA-256 (raw keys never stored)
-- Thumbnails: 256px-wide JPEG at `/mnt/nvme-1/servers/taco-backend/thumbnails/`
+- Thumbnails: 256px-wide JPEG at `/mnt/nvme-1/servers/taco-backend/thumbnails/`. Video thumbnails extract the first frame via PyAV (v1.1.5).
 - Endpoints: `GET /v2/history`, `GET /v2/history/{id}/image`, `GET /v2/history/{id}/thumbnail`
 - Cleanup: job_queue keeps completed result files (history manages lifecycle), 30-day retention
 - Both noodle-i and noodle-v consume the same history API
+- **`history.save()` runs in an `asyncio.to_thread` task** (v1.1.6) fire-and-forgotten from `worker_loop`, so the queue worker dequeues the next job immediately instead of stalling ~300 ms per job on PyAV + SQLite
+
+## v2 job observability (v1.1.6 / v1.1.7)
+
+- **`Job.phase` field** — coarse post-denoise phase: `"denoising" | "decoding" | "encoding" | "saving" | None`. Denoising callbacks cap at **0.90** (was 0.99 in v1.1.4); the top 10% of progress is reserved for post-denoise phases emitted explicitly by `split_model_manager._run_*` and `flux_manager._generate/_img2img/_edit`.
+- **`/v2/jobs/{id}` status response** exposes `phase` when processing.
+- **`/v2/jobs/{id}/stream` SSE endpoint** (v1.1.7) — EventSource-compatible live status stream. Emits on `(status, progress, phase, error_code)` change, closes on terminal state, keepalive comment every 15 s. Accepts bearer header OR `?token=` query param (browsers). Replaces the 240-GET polling loop per video job with one long-lived connection.
+- **`/v2/jobs/{id}/preview`** (v1.1.6) serves the on-disk thumbnail written by `history.save()` via zero-copy `FileResponse`. Fallback lazy extraction still exists for jobs without api_key but is offloaded via `asyncio.to_thread`.
+- **Timing logs** at every post-denoise phase boundary in `split_model_manager` (`vae_decode`, `video_decode+encode`) and `flux_manager` (`flux_webp_encode`), plus `history.save` in `job_queue`. Grep production logs for real wall-clock per phase: `journalctl -u taco-backend | grep -E "vae_decode|encode|history.save"`.
 
 ## Approved images (noodle-i → noodle-v pipeline)
 - Manifest: `/mnt/nvme-1/servers/taco-backend/approved-images/manifest.json`
