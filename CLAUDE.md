@@ -18,11 +18,15 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - Test: `uv run pytest tests/ -v`
 - Health: `curl http://localhost:8090/health`
 
-## GPU topology
-- cuda:0 → RTX PRO 6000 Blackwell 96GB — Flux 2 Dev/Klein (FP8 transformer ~32GB + text encoder + VAE ~77GB total)
-- cuda:1 → RTX PRO 6000 Blackwell 96GB — LTX (encoder hub + transformer ~69GB)
+## GPU topology (v1.1.4 — single-GPU swap mode)
+- **cuda:0** → RTX PRO 6000 Blackwell 96GB — **both Flux 2 and LTX**, mutually exclusive, auto-swapped on dispatch
+- **cuda:1** → RTX PRO 6000 Blackwell 96GB — **reserved exclusively for external training runs** (e.g. ai-toolkit). taco-backend never touches it.
 
 Verified via `nvidia-smi -L`. No third GPU on this box — any earlier references to `cuda:2`/RTX 4000 are stale.
+
+**Why mutually exclusive**: LTX active is ~79 GB (60 GB transformer + 19 GB encoder hub + decoder activations) and Flux active is ~81 GB (60 GB transformer + ~14 GB CPU-offload forward-pass peak via `enable_model_cpu_offload`). Combined ~160 GB > 96 GB physical. They cannot coexist on one GPU during forward pass, so the server evicts the other before running.
+
+**Auto-swap**: `server.py` exposes `_ensure_ltx_resident()` and `_ensure_flux_ready()` helpers, called inside `_inference_lock` by `_dispatch_job()` (v2 async) and every v1 sync handler (text_to_video, image_to_video, audio_to_video, retake, text_to_image, image_to_image, image_edit) before `torch.cuda.set_device()`. LTX is **not** auto-reloaded after a Flux request — it stays evicted until the next video request. Long-stretch image-only or video-only workloads incur zero swap overhead; mixed workloads pay a per-direction-change cost (see swap section below).
 
 ## Flux pipeline details
 
@@ -38,6 +42,8 @@ Verified via `nvidia-smi -L`. No third GPU on this box — any earlier reference
 **Why no FP8.** FP8 layerwise casting was removed in v1.1.1 after diagnosing screendoor / grid artifacts traced to the `fuse_lora → enable_layerwise_casting(float8_e4m3fn)` interaction. PEFT's input autocast hook forces compute back into FP8, silently defeating `compute_dtype=bfloat16`, and the shifted fused weights sit on non-standard FP8 grid points creating structured dithering (diffusers PR #10685, Flux issue #406). ComfyUI force-casts to bf16 on high-VRAM hardware for the same reason (ComfyUI issue #10087). On-disk upstream release is bf16 (`black-forest-labs/FLUX.2-dev`); we were casting bf16→fp8 at load time to save 30 GB on cuda:0, but that saving isn't worth the quality cost.
 
 **Why `enable_model_cpu_offload` instead of `sequential_cpu_offload`.** Model-level paging moves whole components between CPU and GPU at pipeline call boundaries (text encoder for encoding, then transformer for denoising, then VAE for decoding). Sequential offload pages at the module level and is ~10x slower per step. Model-level offload adds roughly 2–5 s per request for PCIe transfer; sequential would add minutes.
+
+**Interaction with single-GPU swap (v1.1.4).** Because Flux Dev uses `enable_model_cpu_offload`, its resident GPU footprint between requests is near-zero — the pipeline object exists in Python but weights live on pinned CPU memory. A LTX transformer can remain loaded alongside an idle Flux pipeline in Python, but **not** during a forward pass (see the mutual-exclusion math in GPU topology above). `_ensure_flux_ready()` evicts LTX only when Flux is about to run.
 
 ### Turbo mode
 - `turbo: bool` field on `TextToImageRequest` / `ImageToImageRequest`
@@ -66,6 +72,7 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Flux output: WEBP quality 95
 - LTX output: raw MP4 bytes with `Content-Type: video/mp4`
 - LTX: evict transformer before VAE decode (reclaims ~22GB), don't reload after — next request handles its own state
+- LTX swap: on dispatch, `_ensure_ltx_resident()` / `_ensure_flux_ready()` (server.py) auto-evicts the other manager before each request. Never assume either manager is loaded — call the helper inside `_inference_lock`.
 - LTX LoRA: fusion is permanent (no unfuse), different strengths require full transformer reload. Cache key `(state_name, user_lora_tuple)`.
 - Flux LoRA: adapter mode (NOT fused) — strength is applied at inference time via `pipe.set_adapters([...], [strength])`. Cache key `(model_name, lora_path)` — strength is NOT in the key, so strength changes are free. Only model or LoRA file changes trigger reload.
 - Frame count must be 8k+1; resolution multiples of 64
@@ -95,6 +102,28 @@ At inference time, every generate method calls `_apply_lora_strength(lora_path, 
 - **Strength change → no reload**. Only a runtime `set_adapters` call, ~0 ms
 - LoRA file removed (request with no `lora` field) → no reload, just `disable_lora()` call
 - Why PR #10685 doesn't apply to us: that bug is specifically about the PEFT input-autocast hook firing when the transformer is FP8-cast. Since we no longer call `enable_layerwise_casting`, the hook has nothing to fight against.
+
+## Single-GPU swap mode (v1.1.4)
+
+Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda:0"`. `cuda:1` is reserved for external training runs and the backend never reads/writes it.
+
+**Auto-swap helpers** (`server.py`):
+- `_ensure_ltx_resident()` — no-op if `ltx_manager.is_ready`, else calls `ltx_manager.load_all()` (cold load is 7–30 s depending on OS page cache)
+- `_ensure_flux_ready()` — no-op if `not ltx_manager.is_ready`, else calls `ltx_manager.evict_all()` (~3 s)
+- Both **must** be called while holding `_inference_lock`. Wired into `_dispatch_job()` (v2 async queue) and all 7 v1 sync handlers. The old `if not manager.is_ready: return 500` early-return guards have been removed from LTX sync handlers — auto-swap handles readiness lazily.
+
+**evict_all leak fix** (`split_model_manager.py::evict_all`): each `DenoiserWorker` holds two strong refs to its source `ModelLedger` — a direct `worker._model_ledger` (set at split_model_manager.py:392) and an indirect `worker.ledger._source_ledger` via `CachingModelLedger(source_ledger=...)`. Prior to v1.1.4 neither was cleared, so the encoder hub (Gemma text encoder + VAE + spatial upsampler, ~22 GB) stayed pinned on the LTX device after `/v1/ltx/unload`. Fix: explicitly null both paths plus `_encoder_ledger._source_ledger` defensively before dropping the workers list. Verified: cuda:0 drops from 66.9 GB → **683 MiB** after unload.
+
+**Swap endpoints** (Bearer auth required):
+- `POST /v1/ltx/unload`, `POST /v1/ltx/reload`
+- `POST /v1/flux/unload`, `POST /v1/flux/reload`
+- `POST /v1/system/pause`, `POST /v1/system/resume` (acquire `_inference_lock`)
+
+**Latency**:
+- Within-type (video→video, image→image with same LoRA): unchanged, fast
+- LTX→Flux (image request after video): +3 s eviction + normal Flux forward pass
+- Flux→LTX (video request after image): +7–30 s cold LTX load + normal video generation
+- LoRA strength changes: still free runtime op, unchanged by the swap refactor
 
 ## Keyframe symbolic indices (v1.1)
 - `KeyframeInput.frame_index` accepts `int | "first" | "middle" | "last"`

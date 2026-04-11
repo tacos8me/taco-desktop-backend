@@ -1,11 +1,11 @@
 # taco-backend
 
-Multi-GPU inference server for AI video and image generation. Powers [noodle-i](https://i.noodlefinger.io) (image gen), [noodle-v](https://v.noodlefinger.io) (video gen), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video gen).
+Single-GPU swap-mode inference server for AI video and image generation. Powers [noodle-i](https://i.noodlefinger.io) (image gen), [noodle-v](https://v.noodlefinger.io) (video gen), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video gen).
 
-- **Video**: LTX-2.3 (22B transformer) on cuda:1 — text-to-video, image-to-video, audio-to-video, temporal retake
+- **Video**: LTX-2.3 (22B transformer) on cuda:0 — text-to-video, image-to-video, audio-to-video, temporal retake
 - **Image**: Flux 2 Dev/Klein KV on cuda:0 — text-to-image, image-to-image, multi-reference editing
 - **Chat**: Gemma 3 12B via llama-swap proxy
-- **Serialized**: Flux and LTX share a single inference lock (FP8 cuBLAS constraint)
+- **Single-GPU swap mode**: LTX and Flux are mutually exclusive on cuda:0 and auto-swap per request. cuda:1 is reserved for external training runs and is never touched by taco-backend. See [Single-GPU swap mode](#single-gpu-swap-mode) below.
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ Max upload: 1GB. Upload IDs must be 32 hex chars (UUID without dashes).
 
 ## Video Generation (LTX-2.3)
 
-**GPU**: cuda:1 (RTX PRO 6000 96GB)
+**GPU**: cuda:0 (RTX PRO 6000 96GB) — shared with Flux in [single-GPU swap mode](#single-gpu-swap-mode). LTX is loaded on demand: the first video request after server start, after a `/v1/ltx/unload`, or after any Flux image request pays a **cold LTX load of ~7–30 s** (depends on OS page cache). Subsequent video-to-video requests stay fast.
 
 ### Models
 
@@ -248,7 +248,7 @@ curl https://i.noodlefinger.io/v2/jobs/$JOB/result --output musicvideo.mp4
 
 ## Image Generation (Flux 2)
 
-**GPU**: cuda:0 (RTX PRO 6000 96GB)
+**GPU**: cuda:0 (RTX PRO 6000 96GB) — shared with LTX in [single-GPU swap mode](#single-gpu-swap-mode). If LTX is currently resident, the first image request pays a **~3 s LTX eviction** before the usual forward pass (~22 s Dev cache-hit, ~45 s Dev cold, ~3 s Klein). After an image request, LTX is **not** auto-reloaded — it stays evicted until the next video request triggers a cold load.
 
 ### Models
 
@@ -389,16 +389,41 @@ Optionally place a same-named `.json` sidecar alongside the `.safetensors` for d
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Server status |
-| `/v1/system/pause` | POST | Yes | Free GPU VRAM for training |
-| `/v1/system/resume` | POST | Yes | Reload all models |
-| `/v1/flux/unload` | POST | Yes | Unload Flux from cuda:0 |
-| `/v1/flux/reload` | POST | Yes | Reload Flux to cuda:0 |
+| `/v1/system/pause` | POST | Yes | Free all GPU VRAM (evicts LTX + Flux, cancels queued jobs) |
+| `/v1/system/resume` | POST | Yes | Reload models after pause |
+| `/v1/flux/unload` | POST | Yes | Unload Flux from the shared device |
+| `/v1/flux/reload` | POST | Yes | Reload Flux to the shared device |
+| `/v1/ltx/unload` | POST | Yes | Unload LTX from the shared device (full encoder-hub + transformer reclaim) |
+| `/v1/ltx/reload` | POST | Yes | Reload LTX to the shared device |
 | `/v1/loras` | GET | Yes | List LTX video LoRAs |
 | `/v1/loras` | POST | Yes | Upload LTX LoRA (multipart: `file`, `name`, `description`) |
 | `/v1/loras/{id}` | DELETE | Yes | Delete LTX LoRA |
 | `/v1/flux-loras` | GET | Yes | List Flux LoRAs (see Flux LoRAs section — folder-drop, no upload) |
 | `/v1/flux-loras/rescan` | POST | Yes | Re-scan `flux_loras/` directory |
 | `/v1/chat/completions` | POST | Yes | Chat/vision proxy to llama-swap (OpenAI-compatible) |
+
+### Single-GPU swap mode
+
+LTX-2.3 and Flux 2 share a single GPU (`cuda:0`) and are mutually exclusive — their combined active memory footprint exceeds the 96 GB physical budget. The dispatcher automatically swaps between them on every inference request, inside the inference lock, so there is no race window and **the client API contract is unchanged**.
+
+- Before any **video** request the dispatcher calls `_ensure_ltx_resident()` — loads LTX if not already resident.
+- Before any **Flux** request the dispatcher calls `_ensure_flux_ready()` — evicts LTX if resident.
+- After an image request, LTX is **not** eagerly reloaded; it stays evicted until the next video request.
+- `cuda:1` is reserved for external training runs (e.g. ai-toolkit). taco-backend never allocates or evicts anything on `cuda:1`.
+
+**Latency:**
+
+| Scenario | Added swap cost | Notes |
+|----------|-----------------|-------|
+| Video → video | 0 s | LTX stays resident, warm forward pass |
+| Image → image (same model) | 0 s | Flux stays resident |
+| Image → image (model change) | ~20–30 s | Normal Flux Dev↔Klein swap, unchanged from prior releases |
+| **Flux → LTX** | **+7–30 s** | Cold LTX load (`~7 s` warm page cache, `~30 s` cold) |
+| **LTX → Flux** | **+3 s** | LTX eviction, then the usual Flux forward pass (~22 s Dev cache-hit / ~45 s Dev cold / ~3 s Klein) |
+
+Operators who want explicit control can still call `/v1/ltx/unload`, `/v1/ltx/reload`, `/v1/flux/unload`, `/v1/flux/reload` manually — e.g. to proactively free the device before a burst of cross-type work. These are also the building blocks the auto-swap dispatcher uses internally.
+
+**Why:** `cuda:1` is fully reserved for external training — taco-backend refuses to allocate there under any circumstances, so both inference engines have to alternate on `cuda:0`.
 
 ### History
 
@@ -466,17 +491,20 @@ Request: `{"rank_image_uri": "storage://...", "generated_image_uri": "storage://
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOAD_FLUX` | `false` | Set `1`/`true` to enable Flux on cuda:0 |
+| `LOAD_FLUX` | `false` | Set `1`/`true` to enable Flux on the shared device |
+| `LTX_DEVICE` | `cuda:0` | Device for LTX video generation (shared with Flux in swap mode) |
+| `FLUX_DEVICE` | `cuda:0` | Device for Flux image generation (shared with LTX in swap mode) |
 | `GEMMA_VARIANT` | `default` | `default` (standard) or `sikaworld` (uncensored) |
 
 ### GPU Topology
 
-| Device | GPU | VRAM | Model | Memory |
-|--------|-----|------|-------|--------|
-| cuda:0 | RTX PRO 6000 Blackwell | 96GB | Flux 2 | ~32GB (Klein, resident) / ~60GB transformer + TE paged (Dev, bf16 + `enable_model_cpu_offload`) |
-| cuda:1 | RTX PRO 6000 Blackwell | 96GB | LTX-2.3 | ~69GB |
+| Device | GPU | VRAM | Role | Active residency |
+|--------|-----|------|------|------------------|
+| cuda:0 | RTX PRO 6000 Blackwell | 96 GB | **Shared**: Flux 2 **or** LTX-2.3 (mutually exclusive, auto-swap on dispatch) | LTX active ~79 GB; Flux active ~81 GB (Dev bf16 + `enable_model_cpu_offload`) / ~32 GB (Klein resident) |
+| cuda:1 | RTX PRO 6000 Blackwell | 96 GB | **Reserved for external training runs** — never touched by taco-backend | — |
+| cuda:2 | RTX PRO 4000 Blackwell | 24 GB | Unused | — |
 
-Verified via `nvidia-smi -L`. Flux and LTX share a single inference lock — the offload hooks move Flux components CPU↔GPU around cuda:0, LTX stays resident on cuda:1 throughout.
+**Memory budget**: LTX active (~79 GB) + Flux active (~81 GB) > 96 GB physical, so they cannot coexist on cuda:0. The dispatcher auto-swaps inside the inference lock — clients do not orchestrate it. See [Single-GPU swap mode](#single-gpu-swap-mode) for latency details.
 
 ---
 

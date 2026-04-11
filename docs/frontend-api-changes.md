@@ -1,7 +1,7 @@
 # Frontend API Changes
 
 > **Audience**: taco-desktop frontend team
-> **Date**: 2026-03-07 (original) · 2026-04-09 (Flux 2 LoRA added)
+> **Date**: 2026-03-07 (original) · 2026-04-09 (Flux 2 LoRA added) · 2026-04-11 (v1.1.4 single-GPU swap mode)
 > **Server**: `http://<host>:8090`
 
 This document covers all recent backend changes that affect the frontend. Read it top to bottom before starting migration work.
@@ -18,6 +18,7 @@ This document covers all recent backend changes that affect the frontend. Read i
 6. [TypeScript Definitions](#6-typescript-definitions)
 7. [Migration Checklist](#7-migration-checklist)
 8. [Flux 2 Image LoRAs (v1.1, 2026-04-09)](#8-flux-2-image-loras-v11-2026-04-09)
+9. [Single-GPU Swap Mode (v1.1.4, 2026-04-11)](#9-single-gpu-swap-mode-v114-2026-04-11)
 
 ---
 
@@ -793,3 +794,76 @@ Surface a "Loading LoRA…" indicator on the first call after a `(model, lora_id
 - [ ] Empty-state copy explaining folder-drop (no upload UI)
 
 **Full integration details** (including UI flow and UX patterns): see `docs/frontend-lora-integration.md` section 10.
+
+---
+
+## 9. Single-GPU Swap Mode (v1.1.4, 2026-04-11)
+
+### 9.1 What changed server-side
+
+Flux 2 and LTX now share a single physical GPU (`cuda:0`) and are **mutually exclusive** during forward pass. On every generation request the server automatically evicts the other manager before running yours. The second physical GPU (`cuda:1`) is now reserved for external training runs — taco-backend never touches it.
+
+- **LTX_DEVICE = FLUX_DEVICE = "cuda:0"** (previously LTX was on `cuda:1`)
+- **Mutual exclusion math**: LTX active ~79 GB + Flux active ~81 GB = ~160 GB > 96 GB physical. They cannot coexist.
+- **Auto-swap**: `_dispatch_job()` (v2 async queue) and every v1 sync handler call `_ensure_ltx_resident()` / `_ensure_flux_ready()` before running. These helpers evict the other manager if needed.
+- **LTX is not auto-reloaded after a Flux request** — it stays evicted until the next video request. Long-stretch image-only or video-only workloads have zero swap overhead.
+
+### 9.2 Frontend contract: UNCHANGED
+
+**No request/response shape changes. No new required fields. No breaking changes.** The switch is transparent to clients. You do not need to ship a release to pick up v1.1.4 — existing code continues to work.
+
+### 9.3 Latency behavior (new)
+
+The only observable difference is added latency on **cross-type** sequences:
+
+| Sequence | Added latency | Notes |
+|---|---|---|
+| video → video | 0 s | Unchanged |
+| image → image (same LoRA) | 0 s | Unchanged |
+| image → image (different LoRA) | ~30–60 s pipeline reload | Same as before, unrelated to swap |
+| **LTX → Flux** (image after video) | **+3 s** eviction | Then normal Flux forward pass |
+| **Flux → LTX** (video after image) | **+7–30 s** cold LTX load | Depends on OS page cache; then normal video gen |
+
+**Recommendation**: surface a "Switching models…" indicator **only** when the frontend detects a cross-type transition (the previous request was a different media type). For within-type sequences, do not show the indicator — the server is fast and the overhead is unchanged.
+
+```typescript
+// Simple heuristic: track the last submitted job type per session
+let lastJobType: "image" | "video" | null = null;
+
+function willSwap(nextType: "image" | "video"): boolean {
+  return lastJobType !== null && lastJobType !== nextType;
+}
+
+// Before submit:
+if (willSwap(nextType)) {
+  showStatus(nextType === "video"
+    ? "Loading video model (up to 30 s on first run)…"
+    : "Switching to image model…");
+}
+```
+
+Strength-slider changes on Flux LoRAs remain **free** (O(ms), no reload) — this behavior is unchanged by the swap refactor.
+
+### 9.4 Admin / debug endpoints
+
+If the frontend exposes a server-admin panel, the following endpoints let you manually control the managers. All require Bearer auth.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/v1/ltx/unload` | POST | Evict LTX from GPU (frees ~79 GB); next video request will auto-reload |
+| `/v1/ltx/reload` | POST | Force-load LTX now (pre-warm before a video session) |
+| `/v1/flux/unload` | POST | Evict Flux (unchanged from earlier versions) |
+| `/v1/flux/reload` | POST | Force-load Flux (unchanged) |
+| `/v1/system/pause` | POST | Evict both managers and cancel queued jobs (unchanged) |
+| `/v1/system/resume` | POST | Reload all models (unchanged) |
+
+All of these are optional for normal client operation. The auto-swap handles everything lazily on the first inference request.
+
+### 9.5 No changes required
+
+- No new types, no new fields, no new endpoints to *call* from the normal generation path.
+- No changes to polling, cancel, or result-fetch behavior.
+- No changes to error codes or status semantics.
+- Existing v1 sync handlers and v2 async queue both auto-swap identically.
+
+The only frontend work worth doing is the optional "Switching models…" indicator in section 9.3 and (if applicable) wiring up the admin endpoints in section 9.4.

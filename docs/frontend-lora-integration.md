@@ -810,7 +810,9 @@ const resp = await fetch(`${SERVER}/v1/text-to-image`, {
 });
 ```
 
-**Latency note (v1.1.1 update):** the first request with a new `(model, lora_id)` **pair** triggers a ~30–60 s pipeline reload on the server (full bf16 load + CPU offload hook setup on Dev). Subsequent requests with the **same** pair are cached. **Changing `strength` is now free** — it's applied via a runtime `set_adapters([...], [strength])` call, no reload. The strength slider can be scrubbed freely without blocking the UI. Only `lora_id` changes, model switches (`flux2-dev` ↔ `flux2-klein`), or adding/removing the LoRA field trigger the full reload. Show the "Loading LoRA…" indicator only on `(model, lora_id)` changes, NOT on strength-only changes.
+**Latency note (v1.1.1 + v1.1.4 updates):** the first request with a new `(model, lora_id)` **pair** triggers a ~30–60 s pipeline reload on the server (full bf16 load + CPU offload hook setup on Dev). Subsequent requests with the **same** pair are cached. **Changing `strength` is free** — it's applied via a runtime `set_adapters([...], [strength])` call, no reload. The strength slider can be scrubbed freely without blocking the UI. Only `lora_id` changes, model switches (`flux2-dev` ↔ `flux2-klein`), or adding/removing the LoRA field trigger the full reload. Show the "Loading LoRA…" indicator only on `(model, lora_id)` changes, NOT on strength-only changes.
+
+**v1.1.4 cross-type consideration**: if the user submits a **video** request between two Flux image requests, the first Flux request after the video pays an additional **~3 s LTX eviction** cost on top of any LoRA reload (Flux 2 and LTX now share `cuda:0` and are auto-swapped on dispatch — see `docs/frontend-api-changes.md` section 9). Pure image-only workloads are unaffected; strength-slider scrubbing remains O(ms) free regardless.
 
 ### 10.5 Error Handling
 
