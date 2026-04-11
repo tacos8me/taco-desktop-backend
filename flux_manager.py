@@ -417,12 +417,13 @@ class FluxManager:
         self, prompt: str, image_paths: list[str], width: int, height: int,
         num_inference_steps: int = 4, guidance_scale: float = 4.0,
         seed: int = 0,
+        model: str = "flux2-klein",
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
         phase_sink: Callable | None = None,
     ) -> bytes:
-        """Multi-reference image editing via Klein."""
-        self.ensure_model("flux2-klein", user_lora_path=lora_path)
+        """Multi-reference image editing via Dev or Klein."""
+        self.ensure_model(model, user_lora_path=lora_path)
         self._apply_lora_strength(lora_path, lora_strength)
         generator = torch.Generator(device=self._device).manual_seed(seed)
         images = [Image.open(p).convert("RGB") for p in image_paths]
@@ -432,7 +433,9 @@ class FluxManager:
             num_inference_steps=num_inference_steps,
             generator=generator,
         )
-        # Klein KV pipeline doesn't accept guidance_scale
+        # Klein KV pipeline is distilled and doesn't accept guidance_scale.
+        if model != "flux2-klein":
+            kwargs["guidance_scale"] = guidance_scale
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
             kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
@@ -448,7 +451,7 @@ class FluxManager:
         torch.cuda.empty_cache()
 
         _emit_phase(phase_sink, 0.95, "encoding")
-        with _timed("flux_webp_encode model=flux2-klein-edit"):
+        with _timed("flux_webp_encode model=%s-edit" % model):
             return self._to_webp(result.images[0])
 
     # --- Async API ---
@@ -471,5 +474,5 @@ class FluxManager:
         async with self._lock:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, lambda: self._edit(**kwargs),
+                None, lambda: self._edit(model=model, **kwargs),
             )

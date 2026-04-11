@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.1.7 (2026-04-11)
+**Server version:** v1.1.8 (2026-04-11)
 **Base URL:** `http://<host>:8090`
 **Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
@@ -80,13 +80,14 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs. They reso
 - v2 job queue cap: `config.MAX_QUEUE_DEPTH`. Exceeding returns `429 {"error": "queue_full"}` with `Retry-After: 30`.
 - `503` with `Retry-After: 300` while the system is paused.
 
-### Single-GPU swap mode (v1.1.4+)
+### Single-GPU swap mode (v1.1.4+, three tenants v1.1.8+)
 
-LTX and Flux both target `cuda:0` and are **mutually exclusive**. The server auto-swaps:
+LTX, Flux, and JoyAI all target `cuda:0` and are **mutually exclusive**. The server auto-swaps:
 
-- Video request → evicts Flux if needed, ensures LTX resident (cold load ≈ 25–30 s after a Flux session).
-- Image request → evicts LTX if resident (≈ 3 s), Flux's own offload hooks page weights in (≈ 15–60 s first call).
-- Long stretches of image-only or video-only workloads pay zero swap overhead.
+- Video request → evicts Flux/JoyAI if needed, ensures LTX resident (cold load ≈ 25–30 s after another tenant was last on the device).
+- Image request (Flux) → evicts LTX/JoyAI if resident (≈ 3 s each), Flux's own offload hooks page weights in (≈ 15–60 s first call).
+- Image-edit request (`model: "joyai-edit"`, v1.1.8) → evicts LTX/Flux if resident, calls out to the joyai-sidecar on `127.0.0.1:8092` (~5 s cold load).
+- Long stretches of single-tenant workload pay zero swap overhead.
 - `cuda:1` is reserved for external training — taco-backend never touches it.
 
 ---
@@ -127,11 +128,13 @@ Up to 8 keyframes per request.
 | `duration` | `0 < x ≤ 30` seconds |
 | `fps` | `0 < x ≤ 60` |
 | `model` (video) | `"ltx-2-3-fast"` \| `"ltx-2-3-pro"` \| `"ltx-2-3-hq"` |
-| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` |
+| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` \| `"joyai-edit"` (edit only, v1.1.8) |
 | `resolution` | `"1920x1080"` \| `"1080x1920"` \| `"2560x1440"` \| `"1440x2560"` \| `"3840x2160"` \| `"2160x3840"` |
-| `width` / `height` (Flux) | `64 ≤ x ≤ 4096`, snapped to multiples of 16 server-side |
-| `num_inference_steps` (Flux) | `1 ≤ x ≤ 100`. Defaults: 50 (dev), 4 (edit/klein). Turbo mode overrides to 8. |
-| `guidance_scale` (Flux) | `0 ≤ x ≤ 20`. Klein silently ignores this (distilled, no CFG). |
+| `width` / `height` (Flux / JoyAI) | `64 ≤ x ≤ 4096`, snapped to multiples of 16 server-side |
+| `num_inference_steps` (Flux / JoyAI) | `1 ≤ x ≤ 100`. Defaults: 50 (dev), 4 (klein), 30 (joyai-edit). Turbo mode overrides to 8. |
+| `guidance_scale` (Flux / JoyAI) | `0 ≤ x ≤ 20`. Defaults: 4.0. Klein silently ignores this (distilled, no CFG). JoyAI respects it. |
+| `image_uris` (image-edit) | Length `1–10` for `flux2-dev` / `flux2-klein`. **Exactly `1`** for `joyai-edit` (422 otherwise). |
+| `lora` (image-edit) | Supported for `flux2-dev` / `flux2-klein`. **Not supported** for `joyai-edit` — request returns `422 {"error": "joyai-edit does not support LoRA"}`. |
 
 Frame counts are derived as `8k + 1` closest to `duration * fps`. Actual frame count can drift by ±4 frames.
 
@@ -320,7 +323,11 @@ Same fields as `text-to-image` plus required `image_uri`. Response `200 image/we
 
 ### `POST /v1/image-edit`
 
-Multi-image edit (Klein KV by default).
+Image editing. Supports three models:
+
+- **`flux2-klein`** (default) — multi-reference Klein KV, 4 distilled steps, no CFG
+- **`flux2-dev`** — Flux 2 Dev, 50 steps, full CFG (v1.1.8 bug fix: prior versions silently fell back to Klein)
+- **`joyai-edit`** (v1.1.8) — instruction-based single-image editing via JoyImageEditPipeline, running out-of-process in the `joyai-sidecar` on `127.0.0.1:8092`
 
 ```json
 {
@@ -335,7 +342,30 @@ Multi-image edit (Klein KV by default).
 }
 ```
 
-`image_uris`: 1–10 entries. Response `200 image/webp`.
+`image_uris` length: **1–10** for `flux2-dev` / `flux2-klein`, **exactly 1** for `joyai-edit`. Response `200 image/webp`.
+
+**`joyai-edit` specifics (v1.1.8)**:
+
+```json
+{
+  "prompt": "Remove the construction crane from the top of the building.",
+  "image_uris": ["storage://abc123"],
+  "model": "joyai-edit",
+  "width": 1024,
+  "height": 1024,
+  "num_inference_steps": 30,
+  "guidance_scale": 4.0
+}
+```
+
+- `image_uris` must have exactly one entry. `len(image_uris) != 1` → `422`.
+- `lora` is **not supported**. Requests with `lora` set → `422 {"error": "joyai-edit does not support LoRA"}`.
+- Defaults: `num_inference_steps=30`, `guidance_scale=4.0`. JoyAI respects `guidance_scale` (unlike Klein).
+- Prompts are freeform English. **The server wraps the prompt in a chat template** (`<|im_start|>user\n<image>\n{prompt}<|im_end|>\n`) before dispatching to the sidecar — clients send plain text.
+- Width / height: multiples of 16, same as Flux.
+- Latency: ~78 s at 1024×1024 / 30 steps (comparable to Flux 2 Dev 50-step).
+- **Feature flag**: requires `LOAD_JOYAI=1` on the server. If unset, all `joyai-edit` requests return `503 {"error": "joyai_disabled: ..."}`.
+- **Sidecar health**: if the joyai-sidecar process is unreachable, requests return `503 {"error": "sidecar_unreachable"}`. Clients should fall back to `flux2-klein`.
 
 ---
 
@@ -392,6 +422,7 @@ All return `202` + submission envelope.
 
 - `progress` is only populated while `processing` (range `0.0–1.0`). Denoising reports up to `0.90`; the top 10% is reserved for post-denoise phases. Completed jobs report `1.0`.
 - `phase` is only populated while `processing`. Typical sequence: `denoising` → `decoding` (LTX only, VAE decode) → `encoding` (ffmpeg or WEBP) → `saving` (upload-store write). Use this to render "Decoding video…" / "Encoding MP4…" / etc. instead of a frozen percentage during the silent post-denoise tail.
+- **`joyai-edit` (v1.1.8) jobs only emit `phase="encoding"`** for the entire sidecar call — the sidecar is a single opaque HTTP round-trip, so taco-backend cannot report per-step progress. Progress jumps to `0.90` at job start, stays at `0.90` throughout the ~78 s call, then transitions to `0.99` (`"saving"`) and `1.0` (`null`) on completion. Clients should render a spinner and an "encoding" label, not a moving percentage.
 - `queue_position` is only populated while `queued`.
 - `result_url` / `result_storage_uri` / `result_media_type` are only populated when `completed`.
 - `404` if the job id is unknown or expired (job store TTL applies).
@@ -822,7 +853,7 @@ Codes the backend actively returns:
 | `422` | Pydantic validation, keyframe bounds, LoRA id mismatch, retake content rejection |
 | `429` | Queue full (`queue_full`, `Retry-After: 30`) |
 | `500` | Unhandled internal error, Flux disabled, chat proxy not ready |
-| `503` | Paused (`Retry-After: 300`) |
+| `503` | Paused (`Retry-After: 300`), `joyai_disabled` (LOAD_JOYAI unset), or `sidecar_unreachable` (joyai-sidecar down — fall back to `flux2-klein`) |
 
 ---
 
@@ -843,7 +874,7 @@ Codes the backend actively returns:
 | POST | `/v1/retake` | yes | Sync retake |
 | POST | `/v1/text-to-image` | yes | Sync Flux t2i |
 | POST | `/v1/image-to-image` | yes | Sync Flux i2i |
-| POST | `/v1/image-edit` | yes | Sync Flux multi-image edit |
+| POST | `/v1/image-edit` | yes | Sync image edit (Flux multi-image or `joyai-edit` single-image sidecar, v1.1.8) |
 | POST | `/v1/chat/completions` | yes | Chat proxy |
 | POST | `/v1/upload` | yes | Get upload URL |
 | PUT | `/uploads/put/{upload_id}` | yes | Upload bytes |
@@ -858,7 +889,7 @@ Codes the backend actively returns:
 | POST | `/v2/retake` | yes | Async retake |
 | POST | `/v2/text-to-image` | yes | Async Flux t2i |
 | POST | `/v2/image-to-image` | yes | Async Flux i2i |
-| POST | `/v2/image-edit` | yes | Async Flux edit |
+| POST | `/v2/image-edit` | yes | Async image edit (Flux multi-image or `joyai-edit` single-image sidecar, v1.1.8) |
 | GET | `/v2/jobs/{job_id}` | yes | Poll job status |
 | GET | `/v2/jobs/{job_id}/preview` | yes | Preview JPEG (204 when empty) |
 | GET | `/v2/jobs/{job_id}/result` | yes | Download final media |
@@ -880,7 +911,7 @@ Codes the backend actively returns:
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue composition export job |
 
-Total: 48 routes (47 HTTP handlers + `/health`).
+Total: 48 routes (47 HTTP handlers + `/health`). No new routes in v1.1.8 — `joyai-edit` reuses the existing `/v1/image-edit` and `/v2/image-edit` endpoints via the `model` field.
 
 ---
 
@@ -929,6 +960,14 @@ curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
 
 ## Changelog
 
+- **v1.1.8** (2026-04-11)
+  - `model: "joyai-edit"` on `POST /v1/image-edit` and `POST /v2/image-edit` — single-image instruction-based editing via JoyAI-Image-Edit-Diffusers running in an out-of-process sidecar on 127.0.0.1:8092.
+  - Server wraps prompts in the `<|im_start|>user\n<image>\n{prompt}<|im_end|>\n` chat template — clients send plain English.
+  - `image_uris` must be length 1 for joyai-edit (422 otherwise). `lora` is not supported (422). `guidance_scale` is respected (unlike Klein).
+  - Latency ~78 s at 1024² / 30 steps. Phase field reports `"encoding"` for the entire sidecar call (JoyAI is opaque to per-step callbacks).
+  - Three-tenant swap protocol: LTX ↔ Flux ↔ JoyAI all mutually exclusive on cuda:0. `_ensure_joyai_ready()` helper mirrors `_ensure_ltx_resident()` / `_ensure_flux_ready()`.
+  - Feature-flagged via `LOAD_JOYAI=1` env var. If unset, joyai-edit returns 503 `{"error": "joyai_disabled"}`.
+  - Also fixes a pre-existing bug where `/v1/image-edit` silently ignored `model: "flux2-dev"` and always used Klein (the lambda in `flux_manager.generate_image_edit` dropped the `model` kwarg).
 - **v1.1.7** (2026-04-11)
   - `GET /v2/jobs/{id}/stream` — SSE endpoint that was previously advertised in the submission envelope but never implemented. One long-lived connection replaces the 240-GET polling loop per video job. Emits on state change + keepalive every 15 s. Accepts bearer header or `?token=` query param (for browser `EventSource`).
 - **v1.1.6** (2026-04-11)

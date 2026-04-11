@@ -43,6 +43,14 @@ GEMMA_ROOT = _GEMMA_VARIANTS.get(GEMMA_VARIANT, _GEMMA_VARIANTS["default"])
 LTX_DEVICE = "cuda:0"
 FLUX_DEVICE = "cuda:0"
 LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
+
+# JoyAI image-edit sidecar — out-of-process isolated inference (v1.1.8).
+# See docs/API.md v1.1.8 changelog and /mnt/nvme-1/servers/joyai-sidecar/ for the
+# sidecar itself. Empty LOAD_JOYAI means feature is disabled — requests for
+# model="joyai-edit" will return 503.
+JOYAI_SIDECAR_URL = os.environ.get("JOYAI_SIDECAR_URL", "http://127.0.0.1:8092")
+LOAD_JOYAI = os.environ.get("LOAD_JOYAI", "").lower() in ("1", "true", "yes")
+
 CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
 CHAR_VISION_MODEL = "gemma-4-31b-it"       # Vision model for Char mode ranking

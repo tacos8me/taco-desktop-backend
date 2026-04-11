@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.1.7 (2026-04-11).
+**Version**: v1.1.8 (2026-04-11).
 
 ## Structure
 - `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs
@@ -28,7 +28,7 @@ Verified via `nvidia-smi -L`. No third GPU on this box — any earlier reference
 
 **Why mutually exclusive**: LTX active is ~79 GB (60 GB transformer + 19 GB encoder hub + decoder activations) and Flux active is ~81 GB (60 GB transformer + ~14 GB CPU-offload forward-pass peak via `enable_model_cpu_offload`). Combined ~160 GB > 96 GB physical. They cannot coexist on one GPU during forward pass, so the server evicts the other before running.
 
-**Auto-swap**: `server.py` exposes `_ensure_ltx_resident()` and `_ensure_flux_ready()` helpers, called inside `_inference_lock` by `_dispatch_job()` (v2 async) and every v1 sync handler (text_to_video, image_to_video, audio_to_video, retake, text_to_image, image_to_image, image_edit) before `torch.cuda.set_device()`. LTX is **not** auto-reloaded after a Flux request — it stays evicted until the next video request. Long-stretch image-only or video-only workloads incur zero swap overhead; mixed workloads pay a per-direction-change cost (see swap section below).
+**Auto-swap (three tenants, v1.1.8)**: `server.py` exposes `_ensure_ltx_resident()`, `_ensure_flux_ready()`, and `_ensure_joyai_ready()` helpers, called inside `_inference_lock` by `_dispatch_job()` (v2 async) and every v1 sync handler (text_to_video, image_to_video, audio_to_video, retake, text_to_image, image_to_image, image_edit) before `torch.cuda.set_device()`. All three tenants (LTX, Flux, JoyAI) are mutually exclusive on cuda:0. LTX is **not** auto-reloaded after a Flux/JoyAI request — it stays evicted until the next video request. Long-stretch single-tenant workloads incur zero swap overhead; mixed workloads pay a per-direction-change cost (see swap section below).
 
 ## Flux pipeline details
 
@@ -130,6 +130,23 @@ Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = 
 - LTX→Flux (image request after video): +3 s eviction + normal Flux forward pass
 - Flux→LTX (video request after image): +7–30 s cold LTX load + normal video generation
 - LoRA strength changes: still free runtime op, unchanged by the swap refactor
+
+### JoyAI image-edit sidecar (v1.1.8)
+
+Third tenant of the cuda:0 mutual-exclusion slot, running **out-of-process** at
+`/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8091`. Separate venv because
+JoyAI needs `transformers==4.57.1` + `diffusers` fork (Moran232/diffusers@joyimage_edit),
+incompatible with taco-backend's `transformers==5.3` + `diffusers==0.38.0.dev0`.
+
+- Activation: `LOAD_JOYAI=1` env var in `.env` (off by default).
+- Dispatch: `/v1/image-edit` and `/v2/image-edit` with `model="joyai-edit"` route to `joyai_client.edit()` instead of `flux.generate_image_edit()`.
+- GPU coordination: taco-backend holds `_inference_lock` for the full HTTP call. Sidecar's internal asyncio.Lock is defense-in-depth.
+- Three-tenant swap: `_evict_other_tenants(new)` in server.py flips any tenant→`new`. `_ensure_joyai_ready()` mirrors `_ensure_ltx_resident()` / `_ensure_flux_ready()`. All three helpers are now `async def` (was sync in v1.1.7).
+- Phase 0 measurement: 50.3 GB resident, 65.5 GB peak reserved, 78 s for 30 steps at 1024² bf16. Within the 96 GB budget with headroom.
+- Memory pressure: JoyAI + LTX (129 GB) and JoyAI + Flux peak (125 GB) both exceed 96 GB — always evict before swapping.
+- Service: `systemctl --user {start,stop,restart,status} joyai-sidecar`. Unit ordered `Before=taco-backend.service`.
+- Fallback on sidecar failure: `/v2/image-edit` with `model="joyai-edit"` returns `503 {"error": "sidecar_unreachable"}` — client should retry with `flux2-klein`.
+- **Pre-existing bug fixed in same commit**: `flux_manager._edit()` hardcoded `ensure_model("flux2-klein", ...)`, silently ignoring `model="flux2-dev"`. Now respects the passed model.
 
 ## Keyframe symbolic indices (v1.1)
 - `KeyframeInput.frame_index` accepts `int | "first" | "middle" | "last"`

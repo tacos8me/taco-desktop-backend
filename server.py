@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 import config
 from split_model_manager import SplitModelManager
 from flux_manager import FluxManager, FluxLoraError
+from joyai_client import joyai, JoyAIError
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
@@ -58,31 +59,53 @@ _job_queue: asyncio.Queue[str] = asyncio.Queue()
 # ---------------------------------------------------------------------------
 
 
-def _ensure_ltx_resident() -> None:
-    """Single-GPU swap mode: ensure LTX is loaded on cuda:0 before a video request.
+# Three-tenant mutual exclusion on cuda:0 (v1.1.8): LTX, Flux, JoyAI. Exactly
+# one tenant can hold GPU memory at a time. `_last_gpu_tenant` tracks the current
+# holder; `_evict_other_tenants(new)` idempotently flips from any state to `new`.
+# Must be called while holding `_inference_lock`.
+_last_gpu_tenant: str | None = None  # "ltx" | "flux" | "joyai" | None
 
-    Caller MUST hold `_inference_lock` so no concurrent Flux forward pass is
-    already paging weights onto the same device. LTX and Flux share cuda:0 and
-    are mutually exclusive — this helper is the "swap in" direction.
-    """
+
+async def _evict_other_tenants(new: str) -> None:
+    """Evict any tenant that isn't `new`. Caller MUST hold _inference_lock."""
+    global _last_gpu_tenant
+    if _last_gpu_tenant == "joyai" and new != "joyai":
+        logger.info("Auto-swap: unloading JoyAI from %s for %s", config.FLUX_DEVICE, new)
+        try:
+            await joyai.unload()
+        except JoyAIError:
+            logger.exception("JoyAI unload failed during swap — continuing")
+    if _last_gpu_tenant == "ltx" and new != "ltx":
+        logger.info("Auto-swap: evicting LTX from %s for %s", config.LTX_DEVICE, new)
+        manager.evict_all()
+    if _last_gpu_tenant == "flux" and new != "flux":
+        logger.info("Auto-swap: unloading Flux from %s for %s", config.FLUX_DEVICE, new)
+        flux.unload()
+    _last_gpu_tenant = new
+
+
+async def _ensure_ltx_resident() -> None:
+    """Ensure LTX is loaded on cuda:0. Caller must hold _inference_lock."""
+    await _evict_other_tenants("ltx")
     if not manager.is_ready:
         logger.info("Auto-swap: loading LTX on %s", config.LTX_DEVICE)
         manager.load_all()
 
 
-def _ensure_flux_ready() -> None:
-    """Single-GPU swap mode: ensure LTX is evicted before a Flux forward pass.
+async def _ensure_flux_ready() -> None:
+    """Ensure Flux is ready (pipeline exists) on cuda:0. Caller must hold _inference_lock."""
+    await _evict_other_tenants("flux")
+    if not flux.is_ready:
+        logger.info("Auto-swap: loading Flux on %s", config.FLUX_DEVICE)
+        flux.load()
 
-    Caller MUST hold `_inference_lock`. Flux uses `enable_model_cpu_offload` so
-    its own pipeline doesn't hold cuda:0 when idle, but its forward pass peaks
-    at ~75 GB which collides with LTX's resident ~67 GB. This helper evicts
-    LTX to make room. LTX is NOT automatically reloaded afterwards — the next
-    video request triggers `_ensure_ltx_resident` which cold-loads it again
-    (~25–30 s).
-    """
-    if manager.is_ready:
-        logger.info("Auto-swap: evicting LTX from %s to free room for Flux", config.LTX_DEVICE)
-        manager.evict_all()
+
+async def _ensure_joyai_ready() -> None:
+    """Ensure JoyAI sidecar is loaded on cuda:0. Caller must hold _inference_lock."""
+    if not config.LOAD_JOYAI:
+        raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
+    await _evict_other_tenants("joyai")
+    await joyai.load()
 
 
 async def _dispatch_job(job: Job) -> bytes:
@@ -103,36 +126,61 @@ async def _dispatch_job(job: Job) -> bytes:
 
     match job.type:
         case JobType.TEXT_TO_VIDEO:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_text_to_video(**p, on_progress=on_progress)
         case JobType.IMAGE_TO_VIDEO:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_image_to_video(**p, on_progress=on_progress)
         case JobType.AUDIO_TO_VIDEO:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_audio_to_video(**p, on_progress=on_progress)
         case JobType.RETAKE:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.retake(**p, on_progress=on_progress)
         case JobType.TEXT_TO_IMAGE:
-            _ensure_flux_ready()
+            await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_text_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.IMAGE_TO_IMAGE:
-            _ensure_flux_ready()
+            await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
             return await flux.generate_image_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.IMAGE_EDIT:
-            _ensure_flux_ready()
-            torch.cuda.set_device(config.FLUX_DEVICE)
-            cb = make_flux_callback(job, p.get("num_inference_steps", 4))
-            return await flux.generate_image_edit(**p, callback_on_step_end=cb, phase_sink=on_progress)
+            model = p.get("model", "flux2-klein")
+            if model == "joyai-edit":
+                await _ensure_joyai_ready()
+                torch.cuda.set_device(config.FLUX_DEVICE)
+                # joyai-edit: exactly one image_path, ignores lora, chat-template
+                # prompt wrap is server-side in the sidecar.
+                image_paths = p.get("image_paths") or []
+                if len(image_paths) != 1:
+                    raise ValueError(
+                        f"joyai-edit requires exactly one image_uri, got {len(image_paths)}"
+                    )
+                # Phase callback: JoyAI is a single opaque HTTP call so we just
+                # set one phase transition. Client UIs will show "encoding" for
+                # the whole duration.
+                on_progress(0.90, phase="encoding")
+                return await joyai.edit(
+                    prompt=p["prompt"],
+                    image_path=image_paths[0],
+                    width=p["width"],
+                    height=p["height"],
+                    num_inference_steps=p.get("num_inference_steps", 30),
+                    guidance_scale=p.get("guidance_scale", 4.0),
+                    seed=p.get("seed"),
+                )
+            else:
+                await _ensure_flux_ready()
+                torch.cuda.set_device(config.FLUX_DEVICE)
+                cb = make_flux_callback(job, p.get("num_inference_steps", 4))
+                return await flux.generate_image_edit(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.EXPORT_COMPOSITION:
             from export_handler import export_composition
             return await asyncio.get_running_loop().run_in_executor(
@@ -144,19 +192,34 @@ async def _dispatch_job(job: Job) -> bytes:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    global _last_gpu_tenant
     logger.info("Loading LTX pipelines on %s ...", config.GPU_DEVICES)
     manager.load_all()
     logger.info("LTX pipelines ready.")
+    _last_gpu_tenant = "ltx"
 
     if config.LOAD_FLUX:
         logger.info("Loading Flux pipeline on %s ...", config.FLUX_DEVICE)
         flux.load()
         logger.info("Flux pipeline ready.")
+        # Flux uses enable_model_cpu_offload, so its weights live on pinned CPU
+        # at idle. GPU tenancy stays "ltx" until an actual Flux forward pass.
     else:
         logger.info("Flux loading disabled (LOAD_FLUX not set)")
 
     chat.load()
     logger.info("Chat proxy ready.")
+
+    if config.LOAD_JOYAI:
+        try:
+            health = await joyai.health()
+            logger.info("JoyAI sidecar reachable: %s", health)
+        except Exception as exc:
+            logger.warning(
+                "JoyAI sidecar unreachable at %s — joyai-edit will return 503: %s",
+                config.JOYAI_SIDECAR_URL,
+                exc,
+            )
 
     worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history),
@@ -219,7 +282,7 @@ class LoRAInput(BaseModel):
     strength: float = Field(default=1.0, ge=0.0, le=2.0)
 Resolution = Literal["1920x1080", "1080x1920", "2560x1440", "1440x2560", "3840x2160", "2160x3840"]
 RetakeMode = Literal["replace_audio_and_video", "replace_video", "replace_video_only", "replace_audio"]
-ImageModelName = Literal["flux2-dev", "flux2-klein"]
+ImageModelName = Literal["flux2-dev", "flux2-klein", "joyai-edit"]
 
 
 class TextToVideoRequest(BaseModel):
@@ -559,7 +622,7 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.generate_text_to_video(
                 prompt=prompt,
@@ -598,7 +661,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
@@ -642,7 +705,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.generate_audio_to_video(
                 prompt=body.prompt,
@@ -681,7 +744,7 @@ async def retake(body: RetakeRequest) -> Response:
         seed = random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_ltx_resident()
+            await _ensure_ltx_resident()
             torch.cuda.set_device(config.LTX_DEVICE)
             video_bytes = await manager.retake(
                 video_path=video_path,
@@ -717,7 +780,7 @@ async def text_to_image(body: TextToImageRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_flux_ready()
+            await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             image_bytes = await flux.generate_text_to_image(
                 prompt=body.prompt,
@@ -756,7 +819,7 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_flux_ready()
+            await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             image_bytes = await flux.generate_image_to_image(
                 prompt=body.prompt,
@@ -785,6 +848,37 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
 async def image_edit(body: ImageEditRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
+    # joyai-edit routes to the out-of-process sidecar; the flux-backed
+    # models still require LOAD_FLUX.
+    if body.model == "joyai-edit":
+        if len(body.image_uris) != 1:
+            return _error(422, "joyai-edit requires exactly one image_uri")
+        try:
+            image_path = str(uploads.resolve(body.image_uris[0]))
+            width = (body.width // 16) * 16
+            height = (body.height // 16) * 16
+            seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
+            async with _inference_lock:
+                await _ensure_joyai_ready()
+                torch.cuda.set_device(config.FLUX_DEVICE)
+                image_bytes = await joyai.edit(
+                    prompt=body.prompt,
+                    image_path=image_path,
+                    width=width,
+                    height=height,
+                    num_inference_steps=body.num_inference_steps,
+                    guidance_scale=body.guidance_scale,
+                    seed=seed,
+                )
+            return Response(content=image_bytes, media_type="image/webp")
+        except JoyAIError as exc:
+            return _error(exc.status_code, str(exc))
+        except FileNotFoundError as exc:
+            return _error(404, str(exc))
+        except Exception as exc:
+            logger.exception("image-edit (joyai) failed")
+            return _error(500, str(exc))
+
     if not config.LOAD_FLUX:
         return _error(500, "Flux pipeline not loaded")
     flux_lora_result = _resolve_flux_lora(body)
@@ -798,7 +892,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
         seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
-            _ensure_flux_ready()
+            await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             image_bytes = await flux.generate_image_edit(
                 prompt=body.prompt,
@@ -808,6 +902,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
                 num_inference_steps=body.num_inference_steps,
                 guidance_scale=body.guidance_scale,
                 seed=seed,
+                model=body.model,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
             )

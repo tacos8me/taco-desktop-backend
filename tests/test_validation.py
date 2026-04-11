@@ -61,3 +61,43 @@ def test_text_to_image_accepts_valid_request():
         "height": 1024,
     })
     assert resp.status_code == 500  # past validation, fails at pipeline
+
+
+def test_image_edit_accepts_joyai_edit_model():
+    """joyai-edit should pass schema validation with one image_uri."""
+    resp = client.post("/v1/image-edit", json={
+        "prompt": "make it a cat",
+        "image_uris": ["storage://00000000-0000-0000-0000-000000000000"],
+        "model": "joyai-edit",
+        "width": 1024,
+        "height": 1024,
+    })
+    # Not 422 — the schema accepts joyai-edit. Handler returns 404 (image not
+    # found in uploads) or 503 (joyai disabled) depending on state; both mean
+    # validation passed.
+    assert resp.status_code != 422
+
+
+def test_image_edit_joyai_rejects_multiple_images():
+    """joyai-edit only supports exactly one image_uri — handler returns 422."""
+    resp = client.post("/v1/image-edit", json={
+        "prompt": "make it a cat",
+        "image_uris": [
+            "storage://00000000-0000-0000-0000-000000000000",
+            "storage://00000000-0000-0000-0000-000000000001",
+        ],
+        "model": "joyai-edit",
+        "width": 1024,
+        "height": 1024,
+    })
+    assert resp.status_code == 422
+
+
+def test_image_edit_rejects_unknown_model():
+    """Unknown model values should fail pydantic literal validation."""
+    resp = client.post("/v1/image-edit", json={
+        "prompt": "test",
+        "image_uris": ["storage://00000000-0000-0000-0000-000000000000"],
+        "model": "nonsense-model",
+    })
+    assert resp.status_code == 422

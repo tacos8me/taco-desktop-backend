@@ -132,6 +132,7 @@ await fetch(`${API}/v2/image-to-video`, {
 | `flux2-dev` + `turbo: true` | ~15 s (8 steps) | Fast preview, iteration |
 | `flux2-dev` | ~60 s (50 steps) | Highest quality |
 | `flux2-klein` | ~10 s (4 steps) | Multi-reference editing, multi-subject consistency |
+| `joyai-edit` | ~78 s (30 steps) | **Instruction-based single-image edits** (remove objects, move things, camera moves). Sidecar-hosted. |
 
 ### Chat / vision
 - `POST /v1/chat/completions` — OpenAI-compatible proxy (llama-swap)
@@ -198,6 +199,24 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
 ```
 `image_uris`: 1–10 entries. Klein ignores `guidance_scale` — the server strips it silently.
 
+### `POST /v2/image-edit` (JoyAI instruction-based, v1.1.8)
+```json
+{
+  "prompt": "Remove the construction crane from the top of the building.",
+  "image_uris": ["storage://abc123"],
+  "model": "joyai-edit",
+  "width": 1024,
+  "height": 1024,
+  "num_inference_steps": 30,
+  "guidance_scale": 4.0
+}
+```
+- **Exactly one** `image_uris` entry — multi-reference is rejected with `422`.
+- **LoRA is not supported** — requests with the `lora` field return `422`.
+- The server wraps the prompt in a chat template (`<|im_start|>user\n<image>\n{prompt}<|im_end|>\n`) before calling the sidecar — send plain English.
+- Phase stays on `"encoding"` for the entire ~78 s sidecar call. Render a spinner, not a moving percentage.
+- Requires `LOAD_JOYAI=1` on the server. If unset / sidecar down: `503 joyai_disabled` or `503 sidecar_unreachable` — fall back to `flux2-klein`.
+
 ## Common pitfalls
 
 - **Image dims must be multiples of 16** (width/height). Video dims must be multiples of 64. The server floors silently — you'll lose pixels if you forget.
@@ -210,6 +229,8 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
 - **SSE tokens expire after 5 minutes.** Issue a new one if your stream disconnects.
 - **Max queue depth is 10.** `429 queue_full` with `Retry-After: 30` when exceeded.
 - **Auth is enforced on every endpoint** except `/health` and `/v1/approved-images/events`. Don't forget the bearer.
+- **`joyai-edit` requires exactly one `image_uri`** (not 1–10 like flux2-klein) — `422` otherwise.
+- **`joyai-edit` stays on phase `"encoding"` for the entire ~78 s sidecar call** — render it as a spinner, not a frozen percentage. Progress sits at `0.90` the whole time.
 
 ## Error envelope
 

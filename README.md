@@ -4,8 +4,9 @@ Single-GPU swap-mode inference server for AI video and image generation. Powers 
 
 - **Video**: LTX-2.3 (22B transformer) on cuda:0 — text-to-video, image-to-video, audio-to-video, temporal retake
 - **Image**: Flux 2 Dev/Klein KV on cuda:0 — text-to-image, image-to-image, multi-reference editing
+- **Image edit (v1.1.8)**: JoyAI-Image-Edit-Diffusers via out-of-process sidecar on `127.0.0.1:8092` — instruction-based single-image editing
 - **Chat**: Gemma 3 12B via llama-swap proxy
-- **Single-GPU swap mode**: LTX and Flux are mutually exclusive on cuda:0 and auto-swap per request. cuda:1 is reserved for external training runs and is never touched by taco-backend. See [Single-GPU swap mode](#single-gpu-swap-mode) below.
+- **Single-GPU swap mode**: LTX, Flux, and JoyAI are mutually exclusive on cuda:0 and auto-swap per request (three-tenant protocol, v1.1.8). cuda:1 is reserved for external training runs and is never touched by taco-backend. See [Single-GPU swap mode](#single-gpu-swap-mode) below.
 
 ## Quick Start
 
@@ -261,6 +262,7 @@ curl https://i.noodlefinger.io/v2/jobs/$JOB/result --output musicvideo.mp4
 | Dev | `flux2-dev` | 20–50 | ~50–90s | Full bf16, highest quality, TE offloaded to CPU between requests |
 | Dev Turbo | `flux2-dev` + `turbo:true` | 8 | ~25–35s | 8-step sigma schedule; compose with `flux2-turbo` folder-drop LoRA for full distilled fidelity |
 | Klein KV | `flux2-klein` | 4 | ~3s | Ultra-fast, full bf16 resident, editing |
+| JoyAI Edit | `joyai-edit` | 30 | ~78s | **v1.1.8** — instruction-based single-image editing via out-of-process sidecar on `127.0.0.1:8092`. Exactly 1 `image_uri`. No LoRA. `LOAD_JOYAI=1` required. |
 
 Precision: **full bf16 throughout** (matches ComfyUI default). FP8 layerwise casting was dropped in v1.1.1 after diagnosing screendoor/grid artifacts traced to the FP8 + fused-LoRA interaction. Dev uses `enable_model_cpu_offload` because all components together exceed 96 GB in bf16; Klein fits comfortably and stays fully resident.
 
@@ -272,7 +274,7 @@ Models swap on demand — first request to a different model adds ~20–30 s loa
 |------|-------|-------------|
 | `POST /v1/text-to-image` | `POST /v2/text-to-image` | Image from text |
 | `POST /v1/image-to-image` | `POST /v2/image-to-image` | Single-ref edit |
-| `POST /v1/image-edit` | `POST /v2/image-edit` | Multi-ref edit (Klein) |
+| `POST /v1/image-edit` | `POST /v2/image-edit` | Multi-ref edit (Flux Klein / Dev) OR single-image instruction edit (`joyai-edit`, v1.1.8) |
 
 ### Request Fields
 
@@ -312,7 +314,8 @@ For `image-edit`:
   "num_inference_steps": 4
 }
 ```
-- 1-10 reference images. All references condition every output (style/composition blending).
+- `flux2-klein` / `flux2-dev`: 1–10 reference images, all references condition every output (style/composition blending).
+- **`joyai-edit` (v1.1.8)**: **exactly one** `image_uri`, instruction-based editing. LoRA is not supported (422). Prompts are plain English — the server wraps them in a chat template server-side. Latency ~78 s for 30 steps at 1024². Runs in a sidecar on `127.0.0.1:8092`; if `LOAD_JOYAI` is unset or the sidecar is down the request returns `503 joyai_disabled` / `503 sidecar_unreachable` — fall back to `flux2-klein`.
 
 **Response** (v1): raw WEBP bytes (`Content-Type: image/webp`, quality 95)
 
@@ -442,11 +445,13 @@ curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
 
 ### Single-GPU swap mode
 
-LTX-2.3 and Flux 2 share a single GPU (`cuda:0`) and are mutually exclusive — their combined active memory footprint exceeds the 96 GB physical budget. The dispatcher automatically swaps between them on every inference request, inside the inference lock, so there is no race window and **the client API contract is unchanged**.
+**LTX ↔ Flux ↔ JoyAI, mutually exclusive on cuda:0 (v1.1.8 three-tenant).** All three tenants share `cuda:0` — their combined active memory footprint exceeds the 96 GB physical budget. The dispatcher automatically swaps between them on every inference request, inside the inference lock, so there is no race window and **the client API contract is unchanged**.
 
-- Before any **video** request the dispatcher calls `_ensure_ltx_resident()` — loads LTX if not already resident.
-- Before any **Flux** request the dispatcher calls `_ensure_flux_ready()` — evicts LTX if resident.
+- Before any **video** request the dispatcher calls `_ensure_ltx_resident()` — loads LTX if not already resident, evicts Flux/JoyAI if they are.
+- Before any **Flux** image request the dispatcher calls `_ensure_flux_ready()` — evicts LTX/JoyAI if resident.
+- Before any **`joyai-edit`** image-edit request the dispatcher calls `_ensure_joyai_ready()` (v1.1.8) — evicts LTX/Flux and calls the sidecar's `/load` endpoint if the sidecar is idle.
 - After an image request, LTX is **not** eagerly reloaded; it stays evicted until the next video request.
+- The sidecar lives at `/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8092`, runs as `systemctl --user ... joyai-sidecar`, and is gated by the `LOAD_JOYAI=1` env var on taco-backend. When `LOAD_JOYAI` is unset, the feature is disabled and the sidecar is never called.
 - `cuda:1` is reserved for external training runs (e.g. ai-toolkit). taco-backend never allocates or evicts anything on `cuda:1`.
 
 **Latency:**
@@ -458,10 +463,14 @@ LTX-2.3 and Flux 2 share a single GPU (`cuda:0`) and are mutually exclusive — 
 | Image → image (model change) | ~20–30 s | Normal Flux Dev↔Klein swap, unchanged from prior releases |
 | **Flux → LTX** | **+7–30 s** | Cold LTX load (`~7 s` warm page cache, `~30 s` cold) |
 | **LTX → Flux** | **+3 s** | LTX eviction, then the usual Flux forward pass (~22 s Dev cache-hit / ~45 s Dev cold / ~3 s Klein) |
+| **Flux → JoyAI** (v1.1.8) | **+5 s Flux unload + ~5 s sidecar load** | Flux offload hooks released, then sidecar `/load` |
+| **LTX → JoyAI** (v1.1.8) | **+3 s LTX evict + ~5 s sidecar load** | LTX `evict_all()`, then sidecar `/load` |
+| **JoyAI → LTX** (v1.1.8) | **+3 s sidecar unload + ~25–30 s LTX cold load** | Sidecar `/unload`, then `_ensure_ltx_resident()` cold path |
+| **JoyAI → Flux** (v1.1.8) | **+3 s sidecar unload + Flux reload** | Sidecar `/unload`, then Flux offload hooks re-attach |
 
 Operators who want explicit control can still call `/v1/ltx/unload`, `/v1/ltx/reload`, `/v1/flux/unload`, `/v1/flux/reload` manually — e.g. to proactively free the device before a burst of cross-type work. These are also the building blocks the auto-swap dispatcher uses internally.
 
-**Why:** `cuda:1` is fully reserved for external training — taco-backend refuses to allocate there under any circumstances, so both inference engines have to alternate on `cuda:0`.
+**Why:** `cuda:1` is fully reserved for external training — taco-backend refuses to allocate there under any circumstances, so all three inference tenants have to alternate on `cuda:0`.
 
 ### History
 
@@ -530,8 +539,9 @@ Request: `{"rank_image_uri": "storage://...", "generated_image_uri": "storage://
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOAD_FLUX` | `false` | Set `1`/`true` to enable Flux on the shared device |
-| `LTX_DEVICE` | `cuda:0` | Device for LTX video generation (shared with Flux in swap mode) |
-| `FLUX_DEVICE` | `cuda:0` | Device for Flux image generation (shared with LTX in swap mode) |
+| `LOAD_JOYAI` | `false` | **v1.1.8** — set `1`/`true` to enable the JoyAI image-edit sidecar (`/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8092`). When unset, `model="joyai-edit"` requests return `503 joyai_disabled`. |
+| `LTX_DEVICE` | `cuda:0` | Device for LTX video generation (shared with Flux + JoyAI in swap mode) |
+| `FLUX_DEVICE` | `cuda:0` | Device for Flux image generation (shared with LTX + JoyAI in swap mode) |
 | `GEMMA_VARIANT` | `default` | `default` (standard) or `sikaworld` (uncensored) |
 
 ### GPU Topology
