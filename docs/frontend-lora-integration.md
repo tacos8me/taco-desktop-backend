@@ -1,5 +1,7 @@
 # Frontend LoRA Integration Guide
 
+> ⚠️ **SUPERSEDED (2026-04-11)** — the canonical LoRA usage reference is now **[API.md § LoRAs](./API.md)** alongside the Flux LoRA (`lora: {id, strength}`) field documented on each image endpoint. This doc is preserved for historical context. For new integrations use [QUICKSTART.md](./QUICKSTART.md) and [API.md](./API.md).
+
 > **Audience**: taco-desktop frontend team
 > **Date**: 2026-03-09 (LTX) · 2026-04-09 (Flux 2 added)
 > **Server**: `http://<host>:8090`

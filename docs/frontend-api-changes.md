@@ -1,5 +1,7 @@
 # Frontend API Changes
 
+> ⚠️ **SUPERSEDED (2026-04-11)** — the canonical frontend references are now **[QUICKSTART.md](./QUICKSTART.md)** (5-minute onboarding) and **[API.md](./API.md)** (full 47-route spec). This doc is preserved for historical context of the v1.1–v1.1.4 migration; new features from **v1.1.5+ (video thumbnails, phase field, SSE stream, JoyAI edit)** are documented in the canonical files.
+
 > **Audience**: taco-desktop frontend team
 > **Date**: 2026-03-07 (original) · 2026-04-09 (Flux 2 LoRA added) · 2026-04-11 (v1.1.4 single-GPU swap mode)
 > **Server**: `http://<host>:8090`

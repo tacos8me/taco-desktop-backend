@@ -20,8 +20,8 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - Test: `uv run pytest tests/ -v`
 - Health: `curl http://localhost:8090/health`
 
-## GPU topology (v1.1.4 — single-GPU swap mode)
-- **cuda:0** → RTX PRO 6000 Blackwell 96GB — **both Flux 2 and LTX**, mutually exclusive, auto-swapped on dispatch
+## GPU topology (v1.1.4 — single-GPU swap mode, extended to three tenants in v1.1.8)
+- **cuda:0** → RTX PRO 6000 Blackwell 96GB — **Flux 2 + LTX + JoyAI-edit sidecar**, all mutually exclusive, auto-swapped on dispatch (v1.1.8 added JoyAI as a third tenant via an out-of-process sidecar — see the "JoyAI image-edit sidecar" subsection below)
 - **cuda:1** → RTX PRO 6000 Blackwell 96GB — **reserved exclusively for external training runs** (e.g. ai-toolkit). taco-backend never touches it.
 
 Verified via `nvidia-smi -L`. No third GPU on this box — any earlier references to `cuda:2`/RTX 4000 are stale.
@@ -109,9 +109,9 @@ At inference time, every generate method calls `_apply_lora_strength(lora_path, 
 - LoRA file removed (request with no `lora` field) → no reload, just `disable_lora()` call
 - Why PR #10685 doesn't apply to us: that bug is specifically about the PEFT input-autocast hook firing when the transformer is FP8-cast. Since we no longer call `enable_layerwise_casting`, the hook has nothing to fight against.
 
-## Single-GPU swap mode (v1.1.4)
+## Single-GPU swap mode (v1.1.4, three tenants v1.1.8)
 
-Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda:0"`. `cuda:1` is reserved for external training runs and the backend never reads/writes it.
+Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda:0"`. `cuda:1` is reserved for external training runs and the backend never reads/writes it. **v1.1.8 added a third tenant**: the JoyAI image-edit sidecar, which also lives on `cuda:0` and is mutually exclusive with both LTX and Flux. See the "JoyAI image-edit sidecar" subsection below for details.
 
 **Auto-swap helpers** (`server.py`):
 - `_ensure_ltx_resident()` — no-op if `ltx_manager.is_ready`, else calls `ltx_manager.load_all()` (cold load is 7–30 s depending on OS page cache)
@@ -134,9 +134,10 @@ Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = 
 ### JoyAI image-edit sidecar (v1.1.8)
 
 Third tenant of the cuda:0 mutual-exclusion slot, running **out-of-process** at
-`/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8091`. Separate venv because
-JoyAI needs `transformers==4.57.1` + `diffusers` fork (Moran232/diffusers@joyimage_edit),
-incompatible with taco-backend's `transformers==5.3` + `diffusers==0.38.0.dev0`.
+`/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8092` (8091 is taken by
+`noodle-t-backend`). Separate venv because JoyAI needs `transformers==4.57.1`
++ `diffusers` fork (Moran232/diffusers@joyimage_edit), incompatible with
+taco-backend's `transformers==5.3` + `diffusers==0.38.0.dev0`.
 
 - Activation: `LOAD_JOYAI=1` env var in `.env` (off by default).
 - Dispatch: `/v1/image-edit` and `/v2/image-edit` with `model="joyai-edit"` route to `joyai_client.edit()` instead of `flux.generate_image_edit()`.
