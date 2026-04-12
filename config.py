@@ -51,6 +51,11 @@ LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
 JOYAI_SIDECAR_URL = os.environ.get("JOYAI_SIDECAR_URL", "http://127.0.0.1:8092")
 LOAD_JOYAI = os.environ.get("LOAD_JOYAI", "").lower() in ("1", "true", "yes")
 
+# ACE-Step music generation sidecar on cuda:1 (v1.2).
+ACE_SIDECAR_URL = os.environ.get("ACE_SIDECAR_URL", "http://127.0.0.1:8001")
+LOAD_ACE = os.environ.get("LOAD_ACE", "").lower() in ("1", "true", "yes")
+MAX_MUSIC_PENDING = int(os.environ.get("MAX_MUSIC_PENDING", "5"))
+
 CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
 CHAR_VISION_MODEL = "gemma-4-31b-it"       # Vision model for Char mode ranking

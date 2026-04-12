@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import torch
 import logging
 import random
@@ -20,6 +21,7 @@ import config
 from split_model_manager import SplitModelManager
 from flux_manager import FluxManager, FluxLoraError
 from joyai_client import joyai, JoyAIError
+from ace_client import ace, AceError
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
@@ -59,22 +61,16 @@ _job_queue: asyncio.Queue[str] = asyncio.Queue()
 # ---------------------------------------------------------------------------
 
 
-# Three-tenant mutual exclusion on cuda:0 (v1.1.8): LTX, Flux, JoyAI. Exactly
-# one tenant can hold GPU memory at a time. `_last_gpu_tenant` tracks the current
+# Two-tenant mutual exclusion on cuda:0 (v1.2): LTX, Flux. JoyAI and ACE are
+# on cuda:1 sidecars — no swap needed. `_last_gpu_tenant` tracks the current
 # holder; `_evict_other_tenants(new)` idempotently flips from any state to `new`.
 # Must be called while holding `_inference_lock`.
-_last_gpu_tenant: str | None = None  # "ltx" | "flux" | "joyai" | None
+_last_gpu_tenant: str | None = None  # "ltx" | "flux" | None
 
 
 async def _evict_other_tenants(new: str) -> None:
     """Evict any tenant that isn't `new`. Caller MUST hold _inference_lock."""
     global _last_gpu_tenant
-    if _last_gpu_tenant == "joyai" and new != "joyai":
-        logger.info("Auto-swap: unloading JoyAI from %s for %s", config.FLUX_DEVICE, new)
-        try:
-            await joyai.unload()
-        except JoyAIError:
-            logger.exception("JoyAI unload failed during swap — continuing")
     if _last_gpu_tenant == "ltx" and new != "ltx":
         logger.info("Auto-swap: evicting LTX from %s for %s", config.LTX_DEVICE, new)
         manager.evict_all()
@@ -100,12 +96,66 @@ async def _ensure_flux_ready() -> None:
         flux.load()
 
 
-async def _ensure_joyai_ready() -> None:
-    """Ensure JoyAI sidecar is loaded on cuda:0. Caller must hold _inference_lock."""
-    if not config.LOAD_JOYAI:
-        raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
-    await _evict_other_tenants("joyai")
-    await joyai.load()
+async def _run_music_job(job: Job) -> None:
+    """Standalone async task for music on cuda:1. No _inference_lock needed."""
+    job.status = JobStatus.PROCESSING
+    job.started_at = time.monotonic()
+    job.phase = "generating"
+    result_bytes: bytes | None = None
+    try:
+        p = job.params
+        ace_params = _build_ace_params(p)
+        est = _estimate_music_time(p)
+
+        def on_progress(elapsed: float) -> None:
+            if job.status == JobStatus.CANCELLED:
+                return
+            job.progress = min(elapsed / max(est, 1), 0.90)
+
+        result_bytes = await ace.generate(params=ace_params, on_progress=on_progress)
+        job.phase = "saving"
+        job.progress = 0.99
+        upload_id, storage_uri = uploads.create()
+        uploads.save(upload_id, result_bytes)
+        job.result_uri = storage_uri
+        job.result_media_type = _AUDIO_MEDIA_TYPES.get(p.get("audio_format", "mp3"), "audio/mpeg")
+        job.status = JobStatus.COMPLETED
+        job.progress = 1.0
+        job.phase = None
+        elapsed = time.monotonic() - (job.started_at or job.created_at)
+        logger.info("Music job %s completed in %.1fs", job.id, elapsed)
+    except AceError as exc:
+        job.status = JobStatus.FAILED
+        job.phase = None
+        job.error = str(exc)[:500]
+        job.error_code = "ace_error"
+        logger.exception("Music job %s failed", job.id)
+    except Exception as exc:
+        job.status = JobStatus.FAILED
+        job.phase = None
+        job.error = str(exc)[:500]
+        job.error_code = "generation_failed"
+        logger.exception("Music job %s failed", job.id)
+    finally:
+        job.completed_at = time.monotonic()
+        if history and job.api_key and result_bytes is not None:
+            _params = job.params or {}
+            _captured = dict(
+                job_id=job.id, api_key=job.api_key, job_type=job.type,
+                prompt=_params.get("prompt", ""), model=None,
+                width=0, height=0, turbo=False,
+                status=job.status, result_uri=job.result_uri,
+                result_bytes=result_bytes, created_at=time.time(),
+                completed_at=time.time(), error=job.error,
+            )
+
+            async def _save():
+                try:
+                    await asyncio.to_thread(history.save, **_captured)
+                except Exception:
+                    logger.warning("Failed to save music job %s to history", job.id, exc_info=True)
+
+            asyncio.create_task(_save())
 
 
 async def _dispatch_job(job: Job) -> bytes:
@@ -154,8 +204,9 @@ async def _dispatch_job(job: Job) -> bytes:
         case JobType.IMAGE_EDIT:
             model = p.get("model", "flux2-klein")
             if model == "joyai-edit":
-                await _ensure_joyai_ready()
-                torch.cuda.set_device(config.FLUX_DEVICE)
+                # JoyAI is on cuda:1 sidecar -- no GPU swap needed
+                if not config.LOAD_JOYAI:
+                    raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
                 # joyai-edit: exactly one image_path, ignores lora, chat-template
                 # prompt wrap is server-side in the sidecar.
                 image_paths = p.get("image_paths") or []
@@ -221,6 +272,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 exc,
             )
 
+    if config.LOAD_ACE:
+        for attempt in range(3):
+            try:
+                ace_health = await ace.health()
+                logger.info("ACE sidecar reachable: %s", ace_health)
+                break
+            except Exception as exc:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning("ACE sidecar unreachable at %s: %s", config.ACE_SIDECAR_URL, exc)
+
     worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history),
         name="queue-worker",
@@ -251,7 +314,7 @@ app.add_middleware(
 async def check_api_key(request: Request, call_next):
     if not config.API_KEYS:
         return await call_next(request)
-    if request.url.path in ("/health", "/v1/approved-images/events"):
+    if request.url.path in ("/health", "/v1/approved-images/events", "/dashboard"):
         return await call_next(request)
     # SSE job streams: EventSource can't set custom headers, so these endpoints
     # accept a `?token=` query param and do their own auth inside the handler.
@@ -393,6 +456,105 @@ class CharRankRequest(BaseModel):
     prompt: str = Field(max_length=10000)
 
 
+class MusicGenerationRequest(BaseModel):
+    # Core
+    prompt: str = Field(max_length=10000, description="Music description / caption")
+    lyrics: str = Field(default="[Instrumental]", max_length=50000)
+    duration: float = Field(default=60.0, gt=0, le=600)
+    audio_format: Literal["mp3", "flac", "wav", "wav32", "opus", "aac"] = "mp3"
+    seed: int | None = None
+    # Music theory
+    bpm: int | None = Field(default=None, ge=30, le=300)
+    key_scale: str | None = None
+    time_signature: str | None = None
+    vocal_language: str | None = None
+    # Diffusion (xl-base defaults)
+    num_inference_steps: int = Field(default=50, ge=1, le=200)
+    guidance_scale: float = Field(default=7.0, ge=0, le=15)
+    shift: float = Field(default=3.0, ge=1.0, le=5.0)
+    infer_method: Literal["ode", "sde"] = "ode"
+    use_adg: bool = False
+    cfg_interval_start: float = Field(default=0.0, ge=0, le=1)
+    cfg_interval_end: float = Field(default=1.0, ge=0, le=1)
+    batch_size: int = Field(default=1, ge=1, le=8)
+    # Task type
+    task_type: Literal["text2music", "cover", "repaint", "extract", "lego", "complete"] = "text2music"
+    source_audio_uri: str | None = None
+    reference_audio_uri: str | None = None
+    audio_cover_strength: float = Field(default=1.0, ge=0, le=1)
+    repainting_start: float = Field(default=0.0, ge=0)
+    repainting_end: float | None = None
+    repaint_mode: Literal["conservative", "balanced", "aggressive"] = "balanced"
+    repaint_strength: float = Field(default=0.5, ge=0, le=1)
+    track_name: str | None = None
+    # LM / thinking
+    thinking: bool = False
+    sample_mode: bool = False
+    sample_query: str | None = None
+    lm_temperature: float = Field(default=0.85, ge=0, le=2)
+    lm_top_p: float = Field(default=0.9, ge=0, le=1)
+
+
+_AUDIO_MEDIA_TYPES = {
+    "mp3": "audio/mpeg", "flac": "audio/flac", "wav": "audio/wav",
+    "wav32": "audio/wav", "opus": "audio/opus", "aac": "audio/aac",
+}
+
+
+def _build_ace_params(p: dict) -> dict:
+    """Translate MusicGenerationRequest params to ACE /release_task fields."""
+    ace_p = {
+        "caption": p["prompt"],
+        "lyrics": p.get("lyrics", "[Instrumental]"),
+        "audio_duration": p.get("duration", 60.0),
+        "audio_format": p.get("audio_format", "mp3"),
+        "inference_steps": p.get("num_inference_steps", 50),
+        "guidance_scale": p.get("guidance_scale", 7.0),
+        "shift": p.get("shift", 3.0),
+        "infer_method": p.get("infer_method", "ode"),
+        "use_adg": p.get("use_adg", False),
+        "cfg_interval_start": p.get("cfg_interval_start", 0.0),
+        "cfg_interval_end": p.get("cfg_interval_end", 1.0),
+        "batch_size": p.get("batch_size", 1),
+        "task_type": p.get("task_type", "text2music"),
+        "audio_cover_strength": p.get("audio_cover_strength", 1.0),
+        "thinking": p.get("thinking", False),
+        "sample_mode": p.get("sample_mode", False),
+    }
+    # Seed handling: ACE uses seed=-1 for random
+    if p.get("seed") is not None:
+        ace_p["seed"] = p["seed"]
+        ace_p["use_random_seed"] = False
+    else:
+        ace_p["seed"] = -1
+        ace_p["use_random_seed"] = True
+    # Optional fields -- only send if provided
+    for key in ("bpm", "key_scale", "time_signature", "vocal_language",
+                "sample_query", "repainting_start", "repainting_end",
+                "repaint_mode", "repaint_strength", "track_name",
+                "lm_temperature", "lm_top_p"):
+        if p.get(key) is not None:
+            ace_p[key] = p[key]
+    # Resolved audio paths (already converted from storage:// URIs by the handler)
+    if p.get("source_audio_path"):
+        ace_p["src_audio_path"] = p["source_audio_path"]
+    if p.get("reference_audio_path"):
+        ace_p["reference_audio_path"] = p["reference_audio_path"]
+    return ace_p
+
+
+def _estimate_music_time(p: dict) -> float:
+    """Rough estimate of music generation time in seconds."""
+    steps = p.get("num_inference_steps", 50)
+    dur = p.get("duration", 60.0)
+    if steps <= 8:
+        return max(5, dur * 0.1)
+    elif steps <= 32:
+        return max(15, dur * 0.3)
+    else:
+        return max(25, dur * 0.5)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -473,6 +635,43 @@ def _error(status: int, msg: str) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/dashboard", include_in_schema=False)
+async def dashboard():
+    """Serve the GPU management dashboard (static HTML SPA)."""
+    from fastapi.responses import HTMLResponse
+    dash_path = Path(__file__).parent / "dashboard.html"
+    if not dash_path.exists():
+        return _error(404, "dashboard.html not found")
+    return HTMLResponse(content=dash_path.read_text(), media_type="text/html")
+
+
+@app.get("/v1/system/gpu")
+async def system_gpu() -> dict:
+    """nvidia-smi GPU telemetry for the dashboard."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        gpus = []
+        for line in result.stdout.strip().split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 5:
+                gpus.append({
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "memory_used_mb": int(parts[2]),
+                    "memory_total_mb": int(parts[3]),
+                    "temperature_c": int(parts[4]) if parts[4].isdigit() else None,
+                })
+        return {"gpus": gpus}
+    except Exception as exc:
+        logger.warning("nvidia-smi failed: %s", exc)
+        return {"gpus": [], "error": str(exc)}
+
+
 @app.get("/health")
 async def health() -> dict:
     if _paused:
@@ -480,6 +679,7 @@ async def health() -> dict:
             "status": "paused",
             "ltx": "paused",
             "flux": "paused",
+            "ace": "paused" if config.LOAD_ACE else "disabled",
             "chat": "ready" if chat.is_ready else "not_loaded",
             "queue": job_store.stats(),
         }
@@ -487,6 +687,7 @@ async def health() -> dict:
         "status": "ok",
         "ltx": "ready" if manager.is_ready else "not_loaded",
         "flux": "ready" if flux.is_ready else "not_loaded",
+        "ace": "enabled" if config.LOAD_ACE else "disabled",
         "chat": "ready" if chat.is_ready else "not_loaded",
         "queue": job_store.stats(),
     }
@@ -495,7 +696,7 @@ async def health() -> dict:
 @app.post("/v1/system/pause")
 async def system_pause() -> dict:
     """Evict all models from GPU to free VRAM for training."""
-    global _paused
+    global _paused, _last_gpu_tenant
     if _paused:
         return {"status": "already_paused"}
     try:
@@ -513,6 +714,12 @@ async def system_pause() -> dict:
             _paused = True
             manager.evict_all()
             flux.unload()
+            if config.LOAD_JOYAI:
+                try:
+                    await joyai.unload()
+                except Exception:
+                    logger.warning("JoyAI unload during pause failed", exc_info=True)
+            _last_gpu_tenant = None
         logger.info("System paused — all GPU memory freed")
         return {"status": "paused"}
     except Exception:
@@ -524,12 +731,13 @@ async def system_pause() -> dict:
 @app.post("/v1/system/resume")
 async def system_resume() -> dict:
     """Reload all models after training."""
-    global _paused
+    global _paused, _last_gpu_tenant
     if not _paused:
         return {"status": "already_running"}
     try:
         async with _inference_lock:
             manager.load_all()
+            _last_gpu_tenant = "ltx"
             if config.LOAD_FLUX:
                 flux.load()
             _paused = False
@@ -543,11 +751,13 @@ async def system_resume() -> dict:
 @app.post("/v1/flux/unload")
 async def flux_unload() -> dict:
     """Unload Flux model from the Flux device to free VRAM for training / vision models."""
+    global _last_gpu_tenant
     if not flux.is_ready:
         return {"status": "already_unloaded"}
     try:
         async with _inference_lock:
             flux.unload()
+            _last_gpu_tenant = None
         logger.info("Flux unloaded from %s", config.FLUX_DEVICE)
         return {"status": "unloaded"}
     except Exception:
@@ -564,11 +774,13 @@ async def ltx_unload() -> dict:
     FLUX_DEVICE), this also makes room on the GPU for a subsequent Flux
     forward pass; the next video request will auto-swap LTX back in.
     """
+    global _last_gpu_tenant
     if not manager.is_ready:
         return {"status": "already_unloaded"}
     try:
         async with _inference_lock:
             manager.evict_all()
+            _last_gpu_tenant = None
         logger.info("LTX unloaded from %s", config.LTX_DEVICE)
         return {"status": "unloaded"}
     except Exception:
@@ -579,11 +791,13 @@ async def ltx_unload() -> dict:
 @app.post("/v1/ltx/reload")
 async def ltx_reload() -> dict:
     """Reload LTX to the LTX device."""
+    global _last_gpu_tenant
     if manager.is_ready:
         return {"status": "already_loaded"}
     try:
         async with _inference_lock:
             manager.load_all()
+            _last_gpu_tenant = "ltx"
         logger.info("LTX reloaded to %s", config.LTX_DEVICE)
         return {"status": "loaded"}
     except Exception:
@@ -594,11 +808,13 @@ async def ltx_reload() -> dict:
 @app.post("/v1/flux/reload")
 async def flux_reload() -> dict:
     """Reload Flux model to the Flux device."""
+    global _last_gpu_tenant
     if flux.is_ready:
         return {"status": "already_loaded"}
     try:
         async with _inference_lock:
             flux.load()
+            _last_gpu_tenant = "flux"
         logger.info("Flux reloaded to %s", config.FLUX_DEVICE)
         return {"status": "loaded"}
     except Exception:
@@ -853,23 +1069,23 @@ async def image_edit(body: ImageEditRequest) -> Response:
     if body.model == "joyai-edit":
         if len(body.image_uris) != 1:
             return _error(422, "joyai-edit requires exactly one image_uri")
+        if not config.LOAD_JOYAI:
+            return _error(503, "JoyAI not enabled (LOAD_JOYAI=0)")
         try:
             image_path = str(uploads.resolve(body.image_uris[0]))
             width = (body.width // 16) * 16
             height = (body.height // 16) * 16
             seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
-            async with _inference_lock:
-                await _ensure_joyai_ready()
-                torch.cuda.set_device(config.FLUX_DEVICE)
-                image_bytes = await joyai.edit(
-                    prompt=body.prompt,
-                    image_path=image_path,
-                    width=width,
-                    height=height,
-                    num_inference_steps=body.num_inference_steps,
-                    guidance_scale=body.guidance_scale,
-                    seed=seed,
-                )
+            # JoyAI is on cuda:1 sidecar -- no inference lock needed
+            image_bytes = await joyai.edit(
+                prompt=body.prompt,
+                image_path=image_path,
+                width=width,
+                height=height,
+                num_inference_steps=body.num_inference_steps,
+                guidance_scale=body.guidance_scale,
+                seed=seed,
+            )
             return Response(content=image_bytes, media_type="image/webp")
         except JoyAIError as exc:
             return _error(exc.status_code, str(exc))
@@ -916,6 +1132,41 @@ async def image_edit(body: ImageEditRequest) -> Response:
         return _error(500, str(exc))
 
 
+@app.post("/v1/music")
+async def generate_music(body: MusicGenerationRequest) -> Response:
+    if _paused:
+        return _error(503, "System is paused for maintenance")
+    if not config.LOAD_ACE:
+        return _error(503, "Music generation not enabled (LOAD_ACE=0)")
+    # Validate task-type requirements
+    if body.task_type in ("cover", "repaint", "extract", "lego", "complete") and not body.source_audio_uri:
+        return _error(422, f"task_type '{body.task_type}' requires source_audio_uri")
+    if body.task_type in ("extract", "lego", "complete") and not body.track_name:
+        return _error(422, f"task_type '{body.task_type}' requires track_name")
+    # Resolve URIs
+    params = body.model_dump(exclude_none=True)
+    if body.source_audio_uri:
+        try:
+            params["source_audio_path"] = str(uploads.resolve(body.source_audio_uri))
+        except FileNotFoundError:
+            return _error(404, "source_audio_uri not found")
+    if body.reference_audio_uri:
+        try:
+            params["reference_audio_path"] = str(uploads.resolve(body.reference_audio_uri))
+        except FileNotFoundError:
+            return _error(404, "reference_audio_uri not found")
+    params.pop("source_audio_uri", None)
+    params.pop("reference_audio_uri", None)
+    try:
+        ace_params = _build_ace_params(params)
+        audio_bytes = await ace.generate(params=ace_params)
+        media_type = _AUDIO_MEDIA_TYPES.get(body.audio_format, "audio/mpeg")
+        return Response(content=audio_bytes, media_type=media_type)
+    except AceError as exc:
+        return _error(exc.status_code, str(exc))
+    except Exception as exc:
+        logger.exception("music generation failed")
+        return _error(500, str(exc))
 
 
 @app.post("/v1/chat/completions")
@@ -1227,6 +1478,50 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
                   model=body.model,
                   lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.IMAGE_EDIT, params, request)
+
+
+@app.post("/v2/music")
+async def v2_music(body: MusicGenerationRequest, request: Request) -> JSONResponse:
+    if _paused:
+        return JSONResponse(status_code=503, content={"error": "system_paused"}, headers={"Retry-After": "300"})
+    if not config.LOAD_ACE:
+        return _error(503, "Music generation not enabled (LOAD_ACE=0)")
+    # Validate task-type requirements
+    if body.task_type in ("cover", "repaint", "extract", "lego", "complete") and not body.source_audio_uri:
+        return _error(422, f"task_type '{body.task_type}' requires source_audio_uri")
+    if body.task_type in ("extract", "lego", "complete") and not body.track_name:
+        return _error(422, f"task_type '{body.task_type}' requires track_name")
+    # Queue depth check for music
+    music_pending = sum(
+        1 for j in job_store._jobs.values()
+        if j.type == JobType.MUSIC_GENERATION and j.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
+    )
+    if music_pending >= config.MAX_MUSIC_PENDING:
+        return JSONResponse(status_code=429, content={"error": "music_queue_full"}, headers={"Retry-After": "30"})
+    # Resolve URIs
+    params = body.model_dump(exclude_none=True)
+    if body.source_audio_uri:
+        try:
+            params["source_audio_path"] = str(uploads.resolve(body.source_audio_uri))
+        except FileNotFoundError:
+            return _error(404, "source_audio_uri not found")
+    if body.reference_audio_uri:
+        try:
+            params["reference_audio_path"] = str(uploads.resolve(body.reference_audio_uri))
+        except FileNotFoundError:
+            return _error(404, "reference_audio_uri not found")
+    params.pop("source_audio_uri", None)
+    params.pop("reference_audio_uri", None)
+    auth = request.headers.get("Authorization", "")
+    api_key = auth[7:] if auth.startswith("Bearer ") else ""
+    job = Job(id=make_job_id(), type=JobType.MUSIC_GENERATION, params=params, api_key=api_key)
+    job_store.add(job)
+    asyncio.create_task(_run_music_job(job))
+    return JSONResponse(status_code=202, content={
+        "job_id": job.id, "status": "queued",
+        "poll_url": f"/v2/jobs/{job.id}",
+        "stream_url": f"/v2/jobs/{job.id}/stream",
+    })
 
 
 @app.get("/v2/jobs/{job_id}")

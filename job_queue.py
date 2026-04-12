@@ -37,6 +37,7 @@ class JobType(StrEnum):
     IMAGE_TO_IMAGE = "image-to-image"
     IMAGE_EDIT = "image-edit"
     EXPORT_COMPOSITION = "export-composition"
+    MUSIC_GENERATION = "music-generation"
 
 
 _MEDIA_TYPES: dict[JobType, str] = {
@@ -48,6 +49,7 @@ _MEDIA_TYPES: dict[JobType, str] = {
     JobType.IMAGE_TO_IMAGE: "image/webp",
     JobType.IMAGE_EDIT: "image/webp",
     JobType.EXPORT_COMPOSITION: "video/mp4",
+    JobType.MUSIC_GENERATION: "audio/mpeg",
 }
 
 

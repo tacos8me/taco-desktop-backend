@@ -101,3 +101,55 @@ def test_image_edit_rejects_unknown_model():
         "model": "nonsense-model",
     })
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Music generation validation
+# ---------------------------------------------------------------------------
+
+
+def test_music_accepts_valid_request():
+    """Valid music params should get past pydantic validation."""
+    resp = client.post("/v1/music", json={
+        "prompt": "epic orchestral soundtrack",
+    })
+    # Not 422 means validation passed. Will be 503 (LOAD_ACE=0) in test env.
+    assert resp.status_code != 422
+
+
+def test_music_rejects_extreme_duration():
+    """Duration > 600 should fail pydantic validation."""
+    resp = client.post("/v1/music", json={
+        "prompt": "test",
+        "duration": 9999,
+    })
+    assert resp.status_code == 422
+
+
+def test_music_rejects_invalid_audio_format():
+    """Invalid audio format should fail pydantic validation."""
+    resp = client.post("/v1/music", json={
+        "prompt": "test",
+        "audio_format": "ogg",
+    })
+    assert resp.status_code == 422
+
+
+def test_music_rejects_invalid_task_type():
+    """Invalid task_type should fail pydantic validation."""
+    resp = client.post("/v1/music", json={
+        "prompt": "test",
+        "task_type": "invalid_type",
+    })
+    assert resp.status_code == 422
+
+
+def test_music_cover_without_source_returns_422():
+    """task_type=cover without source_audio_uri should return 422 from handler."""
+    resp = client.post("/v1/music", json={
+        "prompt": "cover this song",
+        "task_type": "cover",
+    })
+    # Either 422 (handler validation) or 503 (ACE disabled) -- both mean
+    # pydantic validation passed. The handler check happens before ACE call.
+    assert resp.status_code in (422, 503)

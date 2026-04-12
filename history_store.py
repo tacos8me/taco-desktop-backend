@@ -212,6 +212,13 @@ class HistoryStore:
                    ORDER BY created_at DESC LIMIT ? OFFSET ?""",
                 (key_hash, limit, offset),
             ).fetchall()
+        elif job_type == "music":
+            rows = self._conn.execute(
+                """SELECT * FROM generations
+                   WHERE api_key_hash = ? AND job_type LIKE '%music%'
+                   ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                (key_hash, limit, offset),
+            ).fetchall()
         elif job_type:
             rows = self._conn.execute(
                 """SELECT * FROM generations

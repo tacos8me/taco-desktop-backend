@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>taco-backend — GPU Dashboard</title>
+<style>
+:root {
+  --bg: oklch(0.15 0 0);
+  --bg-card: oklch(0.20 0 0);
+  --bg-input: oklch(0.25 0 0);
+  --bg-hover: oklch(0.28 0 0);
+  --text: oklch(0.95 0 0);
+  --text-muted: oklch(0.65 0 0);
+  --text-dim: oklch(0.45 0 0);
+  --accent: oklch(0.65 0.15 250);
+  --accent-hover: oklch(0.72 0.15 250);
+  --success: oklch(0.65 0.15 150);
+  --danger: oklch(0.65 0.15 25);
+  --warning: oklch(0.75 0.15 85);
+  --border: oklch(0.28 0 0);
+  --radius: 8px;
+  --font: system-ui, -apple-system, sans-serif;
+  --mono: "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px 20px;
+}
+
+/* --- Header --- */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 28px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+header h1 span { color: var(--text-muted); font-weight: 400; }
+
+.conn-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: background 0.3s;
+}
+
+.conn-dot.ok { background: var(--success); }
+.conn-dot.err { background: var(--danger); }
+
+/* --- Auth bar --- */
+.auth-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 24px;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.auth-bar label {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.auth-bar input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+
+.auth-bar input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+/* --- Section --- */
+section {
+  margin-bottom: 28px;
+}
+
+section h2 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+/* --- Cards --- */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.card-title {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.card-value {
+  font-size: 1.6rem;
+  font-weight: 700;
+  font-family: var(--mono);
+  letter-spacing: -0.03em;
+}
+
+/* --- GPU cards --- */
+.gpu-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+
+.gpu-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.gpu-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.gpu-tenant {
+  font-size: 0.78rem;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.tenant-ltx      { background: oklch(0.30 0.08 250); color: oklch(0.82 0.12 250); }
+.tenant-flux     { background: oklch(0.30 0.08 150); color: oklch(0.82 0.12 150); }
+.tenant-joyai    { background: oklch(0.30 0.08 310); color: oklch(0.82 0.12 310); }
+.tenant-ace      { background: oklch(0.30 0.08 85);  color: oklch(0.82 0.12 85);  }
+.tenant-idle     { background: oklch(0.25 0 0);      color: var(--text-dim);       }
+
+.vram-bar-container {
+  margin-bottom: 6px;
+}
+
+.vram-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.vram-bar {
+  width: 100%;
+  height: 10px;
+  background: var(--bg-input);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.vram-fill {
+  height: 100%;
+  border-radius: 5px;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+
+.vram-fill.high { background: var(--warning); }
+.vram-fill.critical { background: var(--danger); }
+
+.gpu-temp {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+/* --- Badges --- */
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+}
+
+.badge-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+
+.badge-dot.green  { background: var(--success); }
+.badge-dot.gray   { background: var(--text-dim); }
+.badge-dot.red    { background: var(--danger); }
+.badge-dot.yellow { background: var(--warning); }
+
+/* --- Queue stats --- */
+.queue-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  text-align: center;
+}
+
+.stat-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.stat-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  font-family: var(--mono);
+}
+
+.stat-value.queued     { color: var(--warning); }
+.stat-value.processing { color: var(--accent); }
+.stat-value.completed  { color: var(--success); }
+.stat-value.failed     { color: var(--danger); }
+
+/* Active job */
+.active-job {
+  margin-top: 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  display: none;
+}
+
+.active-job.visible { display: block; }
+
+.active-job-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.85rem;
+}
+
+.active-job-header .job-type { font-weight: 600; }
+.active-job-header .job-phase { color: var(--text-muted); font-style: italic; }
+
+.progress-bar {
+  width: 100%;
+  height: 18px;
+  background: var(--bg-input);
+  border-radius: 9px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 9px;
+  transition: width 0.3s ease;
+}
+
+.progress-label {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text);
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+/* --- Controls --- */
+.btn-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.btn {
+  padding: 8px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--text-dim); }
+.btn:active:not(:disabled) { background: var(--bg-input); }
+
+.btn-danger { border-color: oklch(0.35 0.08 25); }
+.btn-danger:hover:not(:disabled) { background: oklch(0.25 0.06 25); border-color: var(--danger); }
+
+.btn-success { border-color: oklch(0.35 0.08 150); }
+.btn-success:hover:not(:disabled) { background: oklch(0.25 0.06 150); border-color: var(--success); }
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-row-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* --- Quick Generate --- */
+.tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 0;
+}
+
+.tab {
+  padding: 8px 20px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.tab:first-child { border-radius: var(--radius) 0 0 0; }
+.tab:last-child  { border-radius: 0 var(--radius) 0 0; }
+
+.tab.active {
+  background: var(--bg-card);
+  color: var(--text);
+  border-bottom-color: var(--bg-card);
+}
+
+.tab-content {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 0 var(--radius) var(--radius) var(--radius);
+  padding: 18px 20px;
+  display: none;
+}
+
+.tab-content.active { display: block; }
+
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+  align-items: flex-end;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 140px;
+}
+
+.form-group.full { flex-basis: 100%; }
+
+.form-group label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea {
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
+.form-group textarea { min-height: 60px; font-family: var(--font); }
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
+.form-group input[type="range"] {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 4px;
+}
+
+.range-value {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.response-box {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  display: none;
+}
+
+.response-box.visible { display: block; }
+
+/* --- Toast --- */
+.toast-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 10px 18px;
+  border-radius: var(--radius);
+  font-size: 0.82rem;
+  font-weight: 500;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  pointer-events: auto;
+  animation: toast-in 0.25s ease-out, toast-out 0.3s ease-in 3.2s forwards;
+  max-width: 360px;
+}
+
+.toast.ok   { border-color: var(--success); color: var(--success); }
+.toast.err  { border-color: var(--danger);  color: var(--danger);  }
+.toast.warn { border-color: var(--warning); color: var(--warning); }
+
+@keyframes toast-in  { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes toast-out { from { opacity: 1; } to { opacity: 0; transform: translateY(-8px); } }
+
+/* Responsive */
+@media (max-width: 640px) {
+  .container { padding: 14px 12px; }
+  .gpu-card, .card { padding: 12px 14px; }
+  .cards { grid-template-columns: 1fr; }
+  header { flex-direction: column; align-items: flex-start; }
+  .btn { padding: 8px 12px; font-size: 0.78rem; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<!-- Header -->
+<header>
+  <h1>taco-backend <span>v1.2 — GPU Dashboard</span></h1>
+  <div class="conn-status">
+    <div class="conn-dot" id="connDot"></div>
+    <span id="connLabel">Connecting...</span>
+  </div>
+</header>
+
+<!-- Auth bar -->
+<div class="auth-bar">
+  <label for="apiKey">API Key</label>
+  <input type="password" id="apiKey" placeholder="Bearer token for authenticated endpoints" autocomplete="off">
+</div>
+
+<!-- Section 1: GPU Status -->
+<section>
+  <h2>GPU Status</h2>
+  <div class="cards">
+    <div class="gpu-card" id="gpu0">
+      <div class="gpu-header">
+        <span class="gpu-name">cuda:0 &mdash; RTX PRO 6000</span>
+        <span class="gpu-tenant tenant-idle" id="gpu0Tenant">Idle</span>
+      </div>
+      <div class="vram-bar-container">
+        <div class="vram-label">
+          <span id="gpu0VramUsed">-- GB</span>
+          <span id="gpu0VramPct">--%</span>
+        </div>
+        <div class="vram-bar"><div class="vram-fill" id="gpu0VramFill" style="width:0%"></div></div>
+      </div>
+      <div class="gpu-temp" id="gpu0Temp">Temp: --</div>
+    </div>
+    <div class="gpu-card" id="gpu1">
+      <div class="gpu-header">
+        <span class="gpu-name">cuda:1 &mdash; RTX PRO 6000</span>
+        <span class="gpu-tenant tenant-ace" id="gpu1Tenant">ACE + JoyAI</span>
+      </div>
+      <div class="vram-bar-container">
+        <div class="vram-label">
+          <span id="gpu1VramUsed">-- GB</span>
+          <span id="gpu1VramPct">--%</span>
+        </div>
+        <div class="vram-bar"><div class="vram-fill" id="gpu1VramFill" style="width:0%"></div></div>
+      </div>
+      <div class="gpu-temp" id="gpu1Temp">Temp: --</div>
+    </div>
+  </div>
+</section>
+
+<!-- Section 2: Model State -->
+<section>
+  <h2>Model State</h2>
+  <div class="badge-row" id="badges">
+    <div class="badge"><div class="badge-dot gray" id="badgeLtx"></div>LTX</div>
+    <div class="badge"><div class="badge-dot gray" id="badgeFlux"></div>Flux</div>
+    <div class="badge"><div class="badge-dot gray" id="badgeJoyai"></div>JoyAI</div>
+    <div class="badge"><div class="badge-dot gray" id="badgeAce"></div>ACE</div>
+    <div class="badge"><div class="badge-dot gray" id="badgeChat"></div>Chat</div>
+  </div>
+</section>
+
+<!-- Section 3: Job Queue -->
+<section>
+  <h2>Job Queue</h2>
+  <div class="queue-stats" id="queueStats">
+    <div class="stat-card">
+      <div class="stat-label">Queued</div>
+      <div class="stat-value queued" id="statQueued">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Processing</div>
+      <div class="stat-value processing" id="statProcessing">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Completed</div>
+      <div class="stat-value completed" id="statCompleted">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Failed</div>
+      <div class="stat-value failed" id="statFailed">0</div>
+    </div>
+  </div>
+  <div class="active-job" id="activeJob">
+    <div class="active-job-header">
+      <span class="job-type" id="activeJobType">--</span>
+      <span class="job-phase" id="activeJobPhase">--</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="activeJobFill" style="width:0%"></div>
+      <div class="progress-label" id="activeJobLabel">0%</div>
+    </div>
+  </div>
+</section>
+
+<!-- Section 4: Controls -->
+<section>
+  <h2>Controls</h2>
+  <div class="btn-row-label">System</div>
+  <div class="btn-grid">
+    <button class="btn btn-danger" onclick="callEndpoint('POST','/v1/system/pause')">Pause System</button>
+    <button class="btn btn-success" onclick="callEndpoint('POST','/v1/system/resume')">Resume System</button>
+  </div>
+  <div class="btn-row-label">Models</div>
+  <div class="btn-grid">
+    <button class="btn" onclick="callEndpoint('POST','/v1/ltx/unload')">Unload LTX</button>
+    <button class="btn" onclick="callEndpoint('POST','/v1/ltx/reload')">Reload LTX</button>
+    <button class="btn" onclick="callEndpoint('POST','/v1/flux/unload')">Unload Flux</button>
+    <button class="btn" onclick="callEndpoint('POST','/v1/flux/reload')">Reload Flux</button>
+  </div>
+  <div class="btn-row-label">Turbo Mode</div>
+  <div class="btn-grid">
+    <button class="btn" disabled title="Coming in Phase 3 — dual-GPU turbo with batch scheduler">Turbo Mode ON</button>
+    <button class="btn" disabled title="Coming in Phase 3 — dual-GPU turbo with batch scheduler">Turbo Mode OFF</button>
+  </div>
+</section>
+
+<!-- Section 5: Quick Generate -->
+<section>
+  <h2>Quick Generate</h2>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('music')">Music</div>
+    <div class="tab" onclick="switchTab('video')">Video</div>
+  </div>
+
+  <!-- Music tab -->
+  <div class="tab-content active" id="tab-music">
+    <div class="form-row">
+      <div class="form-group full">
+        <label for="musicPrompt">Prompt</label>
+        <textarea id="musicPrompt" placeholder="Upbeat lo-fi hip hop beat with jazzy piano and vinyl crackle..."></textarea>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label for="musicDuration">Duration: <span class="range-value" id="musicDurationVal">30s</span></label>
+        <input type="range" id="musicDuration" min="10" max="120" value="30" step="5"
+               oninput="document.getElementById('musicDurationVal').textContent=this.value+'s'">
+      </div>
+      <div class="form-group">
+        <label for="musicBpm">BPM</label>
+        <input type="number" id="musicBpm" value="120" min="40" max="300" step="1">
+      </div>
+      <div class="form-group">
+        <label for="musicFormat">Format</label>
+        <select id="musicFormat">
+          <option value="wav">WAV</option>
+          <option value="mp3">MP3</option>
+          <option value="ogg">OGG</option>
+        </select>
+      </div>
+    </div>
+    <div class="btn-grid">
+      <button class="btn btn-success" onclick="generateMusic()">Generate</button>
+    </div>
+    <div class="response-box" id="musicResponse"></div>
+  </div>
+
+  <!-- Video tab -->
+  <div class="tab-content" id="tab-video">
+    <div class="form-row">
+      <div class="form-group full">
+        <label for="videoPrompt">Prompt</label>
+        <textarea id="videoPrompt" placeholder="A drone shot flying over a misty forest at sunrise..."></textarea>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label for="videoModel">Model</label>
+        <select id="videoModel">
+          <option value="ltx-2-3-fast">ltx-2-3-fast</option>
+          <option value="ltx-2-3-pro">ltx-2-3-pro</option>
+          <option value="ltx-2-3-hq" selected>ltx-2-3-hq</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="videoResolution">Resolution</label>
+        <select id="videoResolution">
+          <option value="1920x1080" selected>1920x1080</option>
+          <option value="1080x1920">1080x1920</option>
+          <option value="2560x1440">2560x1440</option>
+          <option value="1440x2560">1440x2560</option>
+          <option value="3840x2160">3840x2160</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="videoDuration">Duration: <span class="range-value" id="videoDurationVal">5s</span></label>
+        <input type="range" id="videoDuration" min="1" max="30" value="5" step="1"
+               oninput="document.getElementById('videoDurationVal').textContent=this.value+'s'">
+      </div>
+    </div>
+    <div class="btn-grid">
+      <button class="btn btn-success" onclick="generateVideo()">Generate</button>
+    </div>
+    <div class="response-box" id="videoResponse"></div>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+const apiKeyInput = document.getElementById("apiKey");
+apiKeyInput.value = localStorage.getItem("taco_api_key") || "";
+apiKeyInput.addEventListener("input", () => {
+  localStorage.setItem("taco_api_key", apiKeyInput.value);
+});
+
+function getAuthHeaders() {
+  const key = apiKeyInput.value.trim();
+  if (!key) return {};
+  return { "Authorization": "Bearer " + key };
+}
+
+// ---------------------------------------------------------------------------
+// Toast notifications
+// ---------------------------------------------------------------------------
+
+function toast(message, type = "ok") {
+  const container = document.getElementById("toasts");
+  const el = document.createElement("div");
+  el.className = "toast " + type;
+  el.textContent = message;
+  container.appendChild(el);
+  setTimeout(() => { if (el.parentNode) el.remove(); }, 3800);
+}
+
+// ---------------------------------------------------------------------------
+// Generic API caller
+// ---------------------------------------------------------------------------
+
+async function callEndpoint(method, path, body) {
+  const headers = { ...getAuthHeaders() };
+  const opts = { method, headers };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const res = await fetch(path, opts);
+    const data = await res.json();
+    if (res.ok) {
+      toast(path + " -> " + (data.status || "ok"), "ok");
+    } else {
+      toast(path + " -> " + (data.error || res.status), "err");
+    }
+    return data;
+  } catch (err) {
+    toast(path + " -> " + err.message, "err");
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Health polling
+// ---------------------------------------------------------------------------
+
+let lastHealth = null;
+let pollFails = 0;
+
+async function pollHealth() {
+  try {
+    const res = await fetch("/health");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    lastHealth = data;
+    pollFails = 0;
+    updateConnectionStatus(true);
+    updateModelBadges(data);
+    updateGpuTenant(data);
+    updateQueueStats(data.queue || {});
+  } catch (err) {
+    pollFails++;
+    if (pollFails >= 2) updateConnectionStatus(false);
+  }
+}
+
+function updateConnectionStatus(ok) {
+  const dot = document.getElementById("connDot");
+  const label = document.getElementById("connLabel");
+  if (ok) {
+    dot.className = "conn-dot ok";
+    label.textContent = lastHealth?.status === "paused" ? "Paused" : "Connected";
+  } else {
+    dot.className = "conn-dot err";
+    label.textContent = "Disconnected";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model badges
+// ---------------------------------------------------------------------------
+
+function badgeState(value) {
+  // "ready" -> green, "not_loaded" / "paused" -> gray, "error" / "unreachable" -> red
+  if (value === "ready") return "green";
+  if (value === "error" || value === "unreachable") return "red";
+  return "gray";
+}
+
+function updateModelBadges(data) {
+  setBadge("badgeLtx",  badgeState(data.ltx));
+  setBadge("badgeFlux", badgeState(data.flux));
+  setBadge("badgeChat", badgeState(data.chat));
+
+  // JoyAI: derived from health if present, otherwise gray (the ace-integration
+  // agent may add joyai/ace fields to /health — handle gracefully)
+  setBadge("badgeJoyai", badgeState(data.joyai || "not_loaded"));
+  setBadge("badgeAce",   badgeState(data.ace || "not_loaded"));
+}
+
+function setBadge(id, color) {
+  const el = document.getElementById(id);
+  el.className = "badge-dot " + color;
+}
+
+// ---------------------------------------------------------------------------
+// GPU tenant derivation (from /health until /v1/system/gpu exists)
+// ---------------------------------------------------------------------------
+
+function updateGpuTenant(data) {
+  const tenantEl = document.getElementById("gpu0Tenant");
+  let tenant = "Idle";
+  let cls = "tenant-idle";
+
+  if (data.status === "paused") {
+    tenant = "Paused";
+    cls = "tenant-idle";
+  } else if (data.ltx === "ready") {
+    tenant = "LTX";
+    cls = "tenant-ltx";
+  } else if (data.flux === "ready") {
+    tenant = "Flux";
+    cls = "tenant-flux";
+  } else if (data.joyai === "ready") {
+    tenant = "JoyAI";
+    cls = "tenant-joyai";
+  }
+
+  tenantEl.textContent = tenant;
+  tenantEl.className = "gpu-tenant " + cls;
+}
+
+// ---------------------------------------------------------------------------
+// GPU VRAM polling (future /v1/system/gpu endpoint)
+// ---------------------------------------------------------------------------
+
+async function pollGpu() {
+  try {
+    const res = await fetch("/v1/system/gpu", { headers: getAuthHeaders() });
+    if (!res.ok) return; // endpoint doesn't exist yet — silently skip
+    const data = await res.json();
+    if (data.gpus && data.gpus.length >= 1) updateGpuCard(0, data.gpus[0]);
+    if (data.gpus && data.gpus.length >= 2) updateGpuCard(1, data.gpus[1]);
+  } catch {
+    // Endpoint not yet available — leave placeholder data
+  }
+}
+
+function updateGpuCard(idx, gpu) {
+  const prefix = "gpu" + idx;
+  const usedGB = (gpu.memory_used_mb / 1024).toFixed(1);
+  const totalGB = (gpu.memory_total_mb / 1024).toFixed(1);
+  const pct = Math.round((gpu.memory_used_mb / gpu.memory_total_mb) * 100);
+
+  document.getElementById(prefix + "VramUsed").textContent = usedGB + " / " + totalGB + " GB";
+  document.getElementById(prefix + "VramPct").textContent = pct + "%";
+
+  const fill = document.getElementById(prefix + "VramFill");
+  fill.style.width = pct + "%";
+  fill.className = "vram-fill" + (pct > 90 ? " critical" : pct > 75 ? " high" : "");
+
+  if (gpu.temperature_c !== undefined && gpu.temperature_c !== null) {
+    document.getElementById(prefix + "Temp").textContent = "Temp: " + gpu.temperature_c + "\u00B0C";
+  }
+
+  if (gpu.name) {
+    // Update GPU name if provided
+    const card = document.getElementById(prefix);
+    const nameEl = card.querySelector(".gpu-name");
+    nameEl.textContent = "cuda:" + idx + " \u2014 " + gpu.name;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Queue stats
+// ---------------------------------------------------------------------------
+
+function updateQueueStats(q) {
+  document.getElementById("statQueued").textContent     = q.queued     || 0;
+  document.getElementById("statProcessing").textContent = q.processing || 0;
+  document.getElementById("statCompleted").textContent  = q.completed  || 0;
+  document.getElementById("statFailed").textContent     = q.failed     || 0;
+
+  // Active job indicator: show if processing > 0
+  const activeEl = document.getElementById("activeJob");
+  if ((q.processing || 0) > 0) {
+    activeEl.classList.add("visible");
+    // We don't have per-job data from /health, so show a generic indicator
+    document.getElementById("activeJobType").textContent = "Job in progress";
+    document.getElementById("activeJobPhase").textContent = "processing";
+    // Pulse animation at 50% since we don't know actual progress from /health
+    document.getElementById("activeJobFill").style.width = "50%";
+    document.getElementById("activeJobLabel").textContent = "Processing...";
+  } else {
+    activeEl.classList.remove("visible");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+function switchTab(name) {
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".tab-content").forEach(t => t.classList.remove("active"));
+
+  // Activate clicked tab
+  const tabs = document.querySelectorAll(".tab");
+  tabs.forEach(t => {
+    if (t.textContent.toLowerCase() === name) t.classList.add("active");
+  });
+  document.getElementById("tab-" + name).classList.add("active");
+}
+
+// ---------------------------------------------------------------------------
+// Quick Generate: Music
+// ---------------------------------------------------------------------------
+
+async function generateMusic() {
+  const prompt   = document.getElementById("musicPrompt").value.trim();
+  const duration = parseInt(document.getElementById("musicDuration").value, 10);
+  const bpm      = parseInt(document.getElementById("musicBpm").value, 10);
+  const format   = document.getElementById("musicFormat").value;
+  const respBox  = document.getElementById("musicResponse");
+
+  if (!prompt) { toast("Prompt is required", "warn"); return; }
+
+  respBox.textContent = "Submitting...";
+  respBox.classList.add("visible");
+
+  const body = { prompt, duration, bpm, format };
+  const headers = { "Content-Type": "application/json", ...getAuthHeaders() };
+
+  try {
+    const res = await fetch("/v1/music", { method: "POST", headers, body: JSON.stringify(body) });
+    const contentType = res.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+      const data = await res.json();
+      respBox.textContent = JSON.stringify(data, null, 2);
+      if (res.ok) toast("Music generation submitted", "ok");
+      else toast("Error: " + (data.error || res.status), "err");
+    } else {
+      // Binary response (audio file) -- show metadata
+      const blob = await res.blob();
+      respBox.textContent = "Received " + (blob.size / 1024).toFixed(1) + " KB " + contentType;
+      toast("Music generated (" + (blob.size / 1024).toFixed(1) + " KB)", "ok");
+
+      // Offer download
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "music." + format;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  } catch (err) {
+    respBox.textContent = "Error: " + err.message;
+    toast("Music request failed: " + err.message, "err");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Quick Generate: Video
+// ---------------------------------------------------------------------------
+
+async function generateVideo() {
+  const prompt     = document.getElementById("videoPrompt").value.trim();
+  const model      = document.getElementById("videoModel").value;
+  const resolution = document.getElementById("videoResolution").value;
+  const duration   = parseInt(document.getElementById("videoDuration").value, 10);
+  const respBox    = document.getElementById("videoResponse");
+
+  if (!prompt) { toast("Prompt is required", "warn"); return; }
+
+  respBox.textContent = "Submitting to v2 async queue...";
+  respBox.classList.add("visible");
+
+  const body = { prompt, model, resolution, duration };
+  const headers = { "Content-Type": "application/json", ...getAuthHeaders() };
+
+  try {
+    // Submit to v2 async endpoint
+    const res = await fetch("/v2/text-to-video", { method: "POST", headers, body: JSON.stringify(body) });
+    const data = await res.json();
+    respBox.textContent = JSON.stringify(data, null, 2);
+
+    if (res.ok || res.status === 202) {
+      toast("Video job submitted: " + (data.job_id || "ok"), "ok");
+
+      // If we got a job_id, start polling
+      if (data.job_id) pollJob(data.job_id, respBox);
+    } else {
+      toast("Error: " + (data.error || res.status), "err");
+    }
+  } catch (err) {
+    respBox.textContent = "Error: " + err.message;
+    toast("Video request failed: " + err.message, "err");
+  }
+}
+
+async function pollJob(jobId, respBox) {
+  const headers = getAuthHeaders();
+  const poll = async () => {
+    try {
+      const res = await fetch("/v2/jobs/" + jobId, { headers });
+      const data = await res.json();
+      respBox.textContent = JSON.stringify(data, null, 2);
+
+      if (data.status === "completed") {
+        toast("Video job completed", "ok");
+        if (data.result_uri) {
+          respBox.textContent += "\n\nResult: " + data.result_uri;
+        }
+        return; // Stop polling
+      } else if (data.status === "failed") {
+        toast("Video job failed: " + (data.error || "unknown"), "err");
+        return;
+      } else if (data.status === "cancelled") {
+        toast("Video job cancelled", "warn");
+        return;
+      }
+
+      // Update active job display
+      const activeEl = document.getElementById("activeJob");
+      activeEl.classList.add("visible");
+      document.getElementById("activeJobType").textContent = data.type || "video";
+      document.getElementById("activeJobPhase").textContent = data.phase || "queued";
+      const pct = Math.round((data.progress || 0) * 100);
+      document.getElementById("activeJobFill").style.width = pct + "%";
+      document.getElementById("activeJobLabel").textContent = pct + "% " + (data.phase || "");
+
+      // Continue polling
+      setTimeout(poll, 1500);
+    } catch (err) {
+      respBox.textContent += "\nPoll error: " + err.message;
+      setTimeout(poll, 3000); // Retry slower on error
+    }
+  };
+  setTimeout(poll, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+// Start polling
+pollHealth();
+setInterval(pollHealth, 2000);
+
+// GPU polling (slower cadence, endpoint may not exist yet)
+pollGpu();
+setInterval(pollGpu, 5000);
+</script>
+</body>
+</html>
