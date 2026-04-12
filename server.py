@@ -230,6 +230,7 @@ async def _dispatch_job(job: Job) -> bytes:
                     raise JoyAIError("turbo_mode_active: JoyAI unavailable while turbo is enabled", 503)
                 if not config.LOAD_JOYAI:
                     raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
+                await joyai.load()  # idempotent — ensures sidecar pipeline is loaded on cuda:1
                 # joyai-edit: exactly one image_path, ignores lora, chat-template
                 # prompt wrap is server-side in the sidecar.
                 image_paths = p.get("image_paths") or []
@@ -1395,6 +1396,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
         if not config.LOAD_JOYAI:
             return _error(503, "JoyAI not enabled (LOAD_JOYAI=0)")
         try:
+            await joyai.load()  # idempotent — ensures sidecar pipeline is loaded on cuda:1
             image_path = str(uploads.resolve(body.image_uris[0]))
             width = (body.width // 16) * 16
             height = (body.height // 16) * 16
