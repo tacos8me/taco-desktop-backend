@@ -91,8 +91,19 @@ async def _evict_other_tenants(new: str) -> None:
 
 
 async def _ensure_ltx_resident() -> None:
-    """Ensure LTX is loaded on cuda:0. Caller must hold _inference_lock."""
+    """Ensure LTX is loaded on cuda:0. Caller must hold _inference_lock.
+
+    Aggressively unloads Flux even if the tracker already says "ltx" —
+    because Flux's pipeline (loaded at startup with enable_model_cpu_offload)
+    holds ~0.5-1 GB of CUDA context + offload hook allocations. On peak
+    LTX workloads (i2v + audio gen = 85-90 GB), that extra GB causes OOM.
+    """
     await _evict_other_tenants("ltx")
+    # Kill any lingering Flux pipeline — its CUDA context wastes VRAM
+    # that LTX's peak inference needs. Flux will lazy-reload on next image req.
+    if flux.is_ready:
+        logger.info("Auto-swap: destroying Flux pipeline to free CUDA context for LTX peak")
+        flux.unload()
     if not manager.is_ready:
         logger.info("Auto-swap: loading LTX on %s", config.LTX_DEVICE)
         manager.load_all()
@@ -262,9 +273,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _last_gpu_tenant = "ltx"
 
     if config.LOAD_FLUX:
-        logger.info("Loading Flux pipeline on %s ...", config.FLUX_DEVICE)
-        flux.load()
-        logger.info("Flux pipeline ready.")
+        # Don't load Flux eagerly — its pipeline + CUDA context wastes ~0.5-1 GB
+        # of GPU that LTX's peak inference needs. _ensure_flux_ready() will
+        # lazy-load it on the first image request. The page-cache warmup task
+        # below pre-reads Flux's safetensors files for fast cold load.
+        logger.info("Flux enabled (lazy load on first image request)")
         # Flux uses enable_model_cpu_offload, so its weights live on pinned CPU
         # at idle. GPU tenancy stays "ltx" until an actual Flux forward pass.
     else:
