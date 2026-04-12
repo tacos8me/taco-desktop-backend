@@ -631,12 +631,46 @@ def _is_image_type(type_str: str) -> bool:
 
 
 def _batch_item_to_job(item: BatchItem, api_key: str) -> Job:
-    """Create a synthetic Job from a BatchItem for dispatch."""
+    """Create a synthetic Job from a BatchItem for dispatch.
+
+    Pre-processes params the same way the v2 endpoint handlers do:
+    resolution → width/height, duration → num_frames, camera_motion → prompt.
+    Without this, _dispatch_job passes raw pydantic fields (resolution, duration)
+    to the manager which expects pre-resolved values (width, height, num_frames).
+    """
     job_type, _ = _BATCH_TYPE_MAP[item.type]
+    p = dict(item.params)
+
+    # Video items: resolve resolution + duration → width/height/num_frames
+    if item.type in ("text-to-video", "image-to-video", "audio-to-video"):
+        if "resolution" in p:
+            w, h = _resolution_to_dims(p.pop("resolution"))
+            p["width"] = w
+            p["height"] = h
+        if "duration" in p and "num_frames" not in p:
+            fps = p.get("fps", 24)
+            p["num_frames"] = _duration_to_frames(p.pop("duration"), fps)
+        if "camera_motion" in p:
+            cm = p.pop("camera_motion")
+            if cm:
+                p["prompt"] = f"{p.get('prompt', '')} [{cm}]"
+        if "seed" not in p or p.get("seed") is None:
+            p["seed"] = random.randint(0, 2**32 - 1)
+        p.setdefault("generate_audio", False)
+
+    # Image items: snap dims to multiples of 16
+    if item.type in ("text-to-image", "image-to-image", "image-edit"):
+        if "width" in p:
+            p["width"] = (p["width"] // 16) * 16
+        if "height" in p:
+            p["height"] = (p["height"] // 16) * 16
+        if "seed" not in p or p["seed"] is None:
+            p["seed"] = random.randint(0, 2**32 - 1)
+
     return Job(
         id=make_job_id(),
         type=job_type,
-        params=item.params,
+        params=p,
         api_key=api_key,
     )
 
