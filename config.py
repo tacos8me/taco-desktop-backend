@@ -51,6 +51,10 @@ LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
 JOYAI_SIDECAR_URL = os.environ.get("JOYAI_SIDECAR_URL", "http://127.0.0.1:8092")
 LOAD_JOYAI = os.environ.get("LOAD_JOYAI", "").lower() in ("1", "true", "yes")
 
+# LTX video sidecar — independent LTX pipeline on cuda:1 for turbo mode (v1.2).
+# Managed via systemctl; taco-backend calls /load and /unload to control GPU memory.
+LTX_SIDECAR_URL = os.environ.get("LTX_SIDECAR_URL", "http://127.0.0.1:8093")
+
 # ACE-Step music generation sidecar on cuda:1 (v1.2).
 ACE_SIDECAR_URL = os.environ.get("ACE_SIDECAR_URL", "http://127.0.0.1:8001")
 LOAD_ACE = os.environ.get("LOAD_ACE", "").lower() in ("1", "true", "yes")
