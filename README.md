@@ -1,12 +1,15 @@
 # taco-backend
 
-Single-GPU swap-mode inference server for AI video and image generation. Powers [noodle-i](https://i.noodlefinger.io) (image gen), [noodle-v](https://v.noodlefinger.io) (video gen), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video gen).
+Dual-GPU inference server for AI video, image, and music generation. Powers [noodle-i](https://i.noodlefinger.io) (image gen), [noodle-v](https://v.noodlefinger.io) (video gen), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video gen).
 
 - **Video**: LTX-2.3 (22B transformer) on cuda:0 — text-to-video, image-to-video, audio-to-video, temporal retake
 - **Image**: Flux 2 Dev/Klein KV on cuda:0 — text-to-image, image-to-image, multi-reference editing
-- **Image edit (v1.1.8)**: JoyAI-Image-Edit-Diffusers via out-of-process sidecar on `127.0.0.1:8092` — instruction-based single-image editing
+- **Image edit**: JoyAI-Image-Edit-Diffusers via out-of-process sidecar on cuda:1 (`127.0.0.1:8092`) — instruction-based single-image editing
+- **Music (v1.2)**: ACE Step xl-base+LM on cuda:1 (`127.0.0.1:8001`) — text-to-music, covers, repainting, stem extraction
 - **Chat**: Gemma 3 12B via llama-swap proxy
-- **Single-GPU swap mode**: LTX, Flux, and JoyAI are mutually exclusive on cuda:0 and auto-swap per request (three-tenant protocol, v1.1.8). cuda:1 is reserved for external training runs and is never touched by taco-backend. See [Single-GPU swap mode](#single-gpu-swap-mode) below.
+- **Dual-GPU layout**: cuda:0 = LTX ↔ Flux (2-tenant swap), cuda:1 = ACE + JoyAI (coexisting). See [GPU Management](#gpu-management) below.
+- **Turbo mode (v1.2)**: toggle via `/v1/system/turbo` — claims both GPUs for LTX, 2 concurrent video workers, 2x throughput
+- **Dashboard (v1.2)**: real-time GPU telemetry at `/dashboard`
 
 ## Quick Start
 
@@ -74,7 +77,7 @@ Max upload: 1GB. Upload IDs must be 32 hex chars (UUID without dashes).
 
 ## Video Generation (LTX-2.3)
 
-**GPU**: cuda:0 (RTX PRO 6000 96GB) — shared with Flux in [single-GPU swap mode](#single-gpu-swap-mode). LTX is loaded on demand: the first video request after server start, after a `/v1/ltx/unload`, or after any Flux image request pays a **cold LTX load of ~7–30 s** (depends on OS page cache). Subsequent video-to-video requests stay fast.
+**GPU**: cuda:0 (RTX PRO 6000 96GB) — shared with Flux in [GPU management](#gpu-management). LTX is loaded on demand: the first video request after server start, after a `/v1/ltx/unload`, or after any Flux image request pays a **cold LTX load of ~7–30 s** (depends on OS page cache). Subsequent video-to-video requests stay fast.
 
 ### Models
 
@@ -253,7 +256,7 @@ curl https://i.noodlefinger.io/v2/jobs/$JOB/result --output musicvideo.mp4
 
 ## Image Generation (Flux 2)
 
-**GPU**: cuda:0 (RTX PRO 6000 96GB) — shared with LTX in [single-GPU swap mode](#single-gpu-swap-mode). If LTX is currently resident, the first image request pays a **~3 s LTX eviction** before the usual forward pass (~22 s Dev cache-hit, ~45 s Dev cold, ~3 s Klein). After an image request, LTX is **not** auto-reloaded — it stays evicted until the next video request triggers a cold load.
+**GPU**: cuda:0 (RTX PRO 6000 96GB) — shared with LTX in [GPU management](#gpu-management). If LTX is currently resident, the first image request pays a **~3 s LTX eviction** before the usual forward pass (~22 s Dev cache-hit, ~45 s Dev cold, ~3 s Klein). After an image request, LTX is **not** auto-reloaded — it stays evicted until the next video request triggers a cold load.
 
 ### Models
 
@@ -423,6 +426,73 @@ curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
 - Results expire after 10 minutes
 - Job IDs are unguessable tokens, but auth is still required for all job endpoints
 
+### Batch Scheduler (v1.2)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `POST /v2/batch` | POST | Submit a batch of 1–50 generation jobs |
+| `GET /v2/batch/{id}` | GET | Poll batch status + partial results |
+| `DELETE /v2/batch/{id}` | DELETE | Cancel remaining items in a batch |
+
+```json
+{
+  "items": [
+    {"type": "text-to-image", "params": {"prompt": "a cat", "model": "flux2-klein", "width": 1024, "height": 1024, "num_inference_steps": 4}},
+    {"type": "text-to-video", "params": {"prompt": "a dog", "model": "ltx-2-3-fast", "resolution": "1920x1080", "duration": 5, "fps": 24}}
+  ],
+  "priority": "normal",
+  "callback_url": null
+}
+```
+
+Items are sorted images-first (Klein before Dev) to minimize GPU swaps. In turbo mode, the batch worker processes 2 video items concurrently via `asyncio.gather`. Supported types: `text-to-image`, `image-to-image`, `image-edit`, `text-to-video`, `image-to-video`.
+
+---
+
+## Music Generation (v1.2)
+
+**GPU**: cuda:1 (ACE Step xl-base+LM, ~18 GB resident, concurrent with JoyAI). Runs as a separate systemd service (`ace-step`) on `127.0.0.1:8001`.
+
+| Sync | Async | Description |
+|------|-------|-------------|
+| `POST /v1/music` | `POST /v2/music` | Generate music from text/lyrics |
+
+### Request Fields
+
+```json
+{
+  "prompt": "upbeat electronic dance track",
+  "lyrics": "[Instrumental]",
+  "duration": 60.0,
+  "audio_format": "mp3",
+  "task_type": "text2music",
+  "num_inference_steps": 50,
+  "guidance_scale": 7.0,
+  "bpm": 128,
+  "seed": 42
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `prompt` | string | required | Music description, max 10,000 chars |
+| `lyrics` | string | `"[Instrumental]"` | Song lyrics, max 50,000 chars |
+| `duration` | float | `60.0` | 0–600 seconds |
+| `audio_format` | string | `"mp3"` | `mp3`, `flac`, `wav`, `wav32`, `opus`, `aac` |
+| `task_type` | string | `"text2music"` | `text2music`, `cover`, `repaint`, `extract`, `lego`, `complete` |
+| `source_audio_uri` | string | null | Required for cover/repaint/extract/lego/complete tasks |
+| `reference_audio_uri` | string | null | Optional reference audio |
+| `bpm` | int | null | 30–300 |
+| `key_scale` | string | null | Musical key |
+| `num_inference_steps` | int | `50` | 1–200 |
+| `guidance_scale` | float | `7.0` | 0–15 |
+
+- Latency: ~2–10 s per track depending on duration and steps
+- Phase for music jobs: `"generating"` (not `"denoising"`)
+- Music queue cap: `MAX_MUSIC_PENDING` (default 5), returns `429 music_queue_full`
+- Gated by `LOAD_ACE=1` env var. Returns `503` when disabled or during turbo mode.
+- Response (v1): raw audio bytes with appropriate `Content-Type` (e.g., `audio/mpeg` for mp3)
+
 ---
 
 ## System & Management
@@ -430,12 +500,15 @@ curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Server status |
+| `/dashboard` | GET | No | GPU management dashboard (static HTML SPA) |
 | `/v1/system/pause` | POST | Yes | Free all GPU VRAM (evicts LTX + Flux, cancels queued jobs) |
 | `/v1/system/resume` | POST | Yes | Reload models after pause |
-| `/v1/flux/unload` | POST | Yes | Unload Flux from the shared device |
-| `/v1/flux/reload` | POST | Yes | Reload Flux to the shared device |
-| `/v1/ltx/unload` | POST | Yes | Unload LTX from the shared device (full encoder-hub + transformer reclaim) |
-| `/v1/ltx/reload` | POST | Yes | Reload LTX to the shared device |
+| `/v1/system/turbo` | POST | Yes | Toggle turbo mode — dual-GPU LTX for 2x video throughput (v1.2) |
+| `/v1/system/gpu` | GET | Yes | nvidia-smi GPU telemetry (2 s cache) — memory, temp, utilization, tenant info (v1.2) |
+| `/v1/flux/unload` | POST | Yes | Unload Flux from cuda:0 |
+| `/v1/flux/reload` | POST | Yes | Reload Flux to cuda:0 |
+| `/v1/ltx/unload` | POST | Yes | Unload LTX from cuda:0 (full encoder-hub + transformer reclaim) |
+| `/v1/ltx/reload` | POST | Yes | Reload LTX to cuda:0 |
 | `/v1/loras` | GET | Yes | List LTX video LoRAs |
 | `/v1/loras` | POST | Yes | Upload LTX LoRA (multipart: `file`, `name`, `description`) |
 | `/v1/loras/{id}` | DELETE | Yes | Delete LTX LoRA |
@@ -443,16 +516,14 @@ curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
 | `/v1/flux-loras/rescan` | POST | Yes | Re-scan `flux_loras/` directory |
 | `/v1/chat/completions` | POST | Yes | Chat/vision proxy to llama-swap (OpenAI-compatible) |
 
-### Single-GPU swap mode
+### GPU Management
 
-**LTX ↔ Flux ↔ JoyAI, mutually exclusive on cuda:0 (v1.1.8 three-tenant).** All three tenants share `cuda:0` — their combined active memory footprint exceeds the 96 GB physical budget. The dispatcher automatically swaps between them on every inference request, inside the inference lock, so there is no race window and **the client API contract is unchanged**.
+**LTX ↔ Flux, mutually exclusive on cuda:0 (2-tenant swap).** Their combined active memory footprint exceeds the 96 GB physical budget. The dispatcher automatically swaps between them on every inference request, inside the inference lock, so there is no race window and **the client API contract is unchanged**.
 
-- Before any **video** request the dispatcher calls `_ensure_ltx_resident()` — loads LTX if not already resident, evicts Flux/JoyAI if they are.
-- Before any **Flux** image request the dispatcher calls `_ensure_flux_ready()` — evicts LTX/JoyAI if resident.
-- Before any **`joyai-edit`** image-edit request the dispatcher calls `_ensure_joyai_ready()` (v1.1.8) — evicts LTX/Flux and calls the sidecar's `/load` endpoint if the sidecar is idle.
+- Before any **video** request the dispatcher calls `_ensure_ltx_resident()` — loads LTX if not already resident, evicts Flux if present.
+- Before any **Flux** image request the dispatcher calls `_ensure_flux_ready()` — evicts LTX if resident.
 - After an image request, LTX is **not** eagerly reloaded; it stays evicted until the next video request.
-- The sidecar lives at `/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8092`, runs as `systemctl --user ... joyai-sidecar`, and is gated by the `LOAD_JOYAI=1` env var on taco-backend. When `LOAD_JOYAI` is unset, the feature is disabled and the sidecar is never called.
-- `cuda:1` is reserved for external training runs (e.g. ai-toolkit). taco-backend never allocates or evicts anything on `cuda:1`.
+- **cuda:1** runs ACE (music, `127.0.0.1:8001`) and JoyAI (image edit, `127.0.0.1:8092`) concurrently — no swap needed, combined ~68 GB fits within 96 GB.
 
 **Latency:**
 
@@ -460,17 +531,17 @@ curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
 |----------|-----------------|-------|
 | Video → video | 0 s | LTX stays resident, warm forward pass |
 | Image → image (same model) | 0 s | Flux stays resident |
-| Image → image (model change) | ~20–30 s | Normal Flux Dev↔Klein swap, unchanged from prior releases |
+| Image → image (model change) | ~20–30 s | Normal Flux Dev↔Klein swap |
 | **Flux → LTX** | **+7–30 s** | Cold LTX load (`~7 s` warm page cache, `~30 s` cold) |
-| **LTX → Flux** | **+3 s** | LTX eviction, then the usual Flux forward pass (~22 s Dev cache-hit / ~45 s Dev cold / ~3 s Klein) |
-| **Flux → JoyAI** (v1.1.8) | **+5 s Flux unload + ~5 s sidecar load** | Flux offload hooks released, then sidecar `/load` |
-| **LTX → JoyAI** (v1.1.8) | **+3 s LTX evict + ~5 s sidecar load** | LTX `evict_all()`, then sidecar `/load` |
-| **JoyAI → LTX** (v1.1.8) | **+3 s sidecar unload + ~25–30 s LTX cold load** | Sidecar `/unload`, then `_ensure_ltx_resident()` cold path |
-| **JoyAI → Flux** (v1.1.8) | **+3 s sidecar unload + Flux reload** | Sidecar `/unload`, then Flux offload hooks re-attach |
+| **LTX → Flux** | **+3 s** | LTX eviction, then the usual Flux forward pass |
+| **Turbo entry** | **~20 s** | Evict ACE+JoyAI+Flux, load dual-GPU LTX |
+| **Turbo exit** | **~15 s** | Evict dual-GPU LTX, restore single-GPU, restart ACE+JoyAI |
 
-Operators who want explicit control can still call `/v1/ltx/unload`, `/v1/ltx/reload`, `/v1/flux/unload`, `/v1/flux/reload` manually — e.g. to proactively free the device before a burst of cross-type work. These are also the building blocks the auto-swap dispatcher uses internally.
+Operators who want explicit control can still call `/v1/ltx/unload`, `/v1/ltx/reload`, `/v1/flux/unload`, `/v1/flux/reload` manually.
 
-**Why:** `cuda:1` is fully reserved for external training — taco-backend refuses to allocate there under any circumstances, so all three inference tenants have to alternate on `cuda:0`.
+#### Turbo mode (v1.2)
+
+Toggle via `POST /v1/system/turbo` (body: `{"enable": true/false}`). Claims both GPUs for LTX with **2 concurrent denoiser workers** — processes **2 video jobs at a time**. While active, Flux/ACE/JoyAI/music endpoints all return `503 turbo_mode_active`. Dashboard provides UI controls for turbo toggle.
 
 ### History
 
@@ -538,21 +609,26 @@ Request: `{"rank_image_uri": "storage://...", "generated_image_uri": "storage://
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOAD_FLUX` | `false` | Set `1`/`true` to enable Flux on the shared device |
-| `LOAD_JOYAI` | `false` | **v1.1.8** — set `1`/`true` to enable the JoyAI image-edit sidecar (`/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8092`). When unset, `model="joyai-edit"` requests return `503 joyai_disabled`. |
-| `LTX_DEVICE` | `cuda:0` | Device for LTX video generation (shared with Flux + JoyAI in swap mode) |
-| `FLUX_DEVICE` | `cuda:0` | Device for Flux image generation (shared with LTX + JoyAI in swap mode) |
+| `LOAD_FLUX` | `false` | Set `1`/`true` to enable Flux on cuda:0 |
+| `LOAD_JOYAI` | `false` | Set `1`/`true` to enable the JoyAI image-edit sidecar on cuda:1 (`127.0.0.1:8092`) |
+| `LOAD_ACE` | `false` | Set `1`/`true` to enable ACE music generation on cuda:1 (`127.0.0.1:8001`) |
+| `ACE_SIDECAR_URL` | `http://127.0.0.1:8001` | URL of the ACE Step sidecar |
+| `LTX_DEVICE` | `cuda:0` | Device for LTX video generation (shared with Flux in swap mode) |
+| `FLUX_DEVICE` | `cuda:0` | Device for Flux image generation (shared with LTX in swap mode) |
 | `GEMMA_VARIANT` | `default` | `default` (standard) or `sikaworld` (uncensored) |
+| `MAX_MUSIC_PENDING` | `5` | Max concurrent music generation jobs |
+| `TURBO_GPU_DEVICES` | `["cuda:0", "cuda:1"]` | GPUs assigned to LTX in turbo mode |
+| `MAX_BATCH_QUEUE_DEPTH` | `5` | Max concurrent batch submissions |
+| `MAX_BATCH_ITEMS` | `50` | Max items per batch request |
 
-### GPU Topology
+### GPU Topology (v1.2)
 
 | Device | GPU | VRAM | Role | Active residency |
 |--------|-----|------|------|------------------|
-| cuda:0 | RTX PRO 6000 Blackwell | 96 GB | **Shared**: Flux 2 **or** LTX-2.3 (mutually exclusive, auto-swap on dispatch) | LTX active ~79 GB; Flux active ~81 GB (Dev bf16 + `enable_model_cpu_offload`) / ~32 GB (Klein resident) |
-| cuda:1 | RTX PRO 6000 Blackwell | 96 GB | **Reserved for external training runs** — never touched by taco-backend | — |
-| cuda:2 | RTX PRO 4000 Blackwell | 24 GB | Unused | — |
+| cuda:0 | RTX PRO 6000 Blackwell | 96 GB | **LTX ↔ Flux** (2-tenant swap, auto-swap on dispatch) | LTX active ~79 GB; Flux active ~81 GB (Dev bf16 + `enable_model_cpu_offload`) / ~32 GB (Klein resident) |
+| cuda:1 | RTX PRO 6000 Blackwell | 96 GB | **ACE** (~18 GB) + **JoyAI** (~50 GB) — coexisting, no swap | Combined ~68 GB |
 
-**Memory budget**: LTX active (~79 GB) + Flux active (~81 GB) > 96 GB physical, so they cannot coexist on cuda:0. The dispatcher auto-swaps inside the inference lock — clients do not orchestrate it. See [Single-GPU swap mode](#single-gpu-swap-mode) for latency details.
+**Memory budget**: LTX active (~79 GB) + Flux active (~81 GB) > 96 GB physical, so they cannot coexist on cuda:0. The dispatcher auto-swaps inside the inference lock — clients do not orchestrate it. ACE and JoyAI coexist on cuda:1 without swapping. In turbo mode, both GPUs are assigned to LTX and ACE+JoyAI+Flux are evicted. See [GPU Management](#gpu-management) for latency details.
 
 ---
 
@@ -570,15 +646,17 @@ uv run --no-sync pytest tests/ -q -p no:cacheprovider
 
 | File | Purpose |
 |------|---------|
-| `server.py` | FastAPI app, all endpoints, job queue |
+| `server.py` | FastAPI app, all endpoints, job queue, batch scheduler, turbo mode |
 | `split_model_manager.py` | LTX-2 pipeline, transformer swapping, VAE decode |
-| `flux_manager.py` | Flux 2 pipeline, model swapping (Dev/Klein), FP8 |
+| `flux_manager.py` | Flux 2 pipeline, model swapping (Dev/Klein), adapter-mode LoRA |
+| `ace_client.py` | ACE music generation sidecar client (httpx → ace-step on cuda:1:8001) |
 | `job_queue.py` | Async job queues with per-device workers |
 | `upload_store.py` | UUID file storage for uploads/results |
 | `history_store.py` | SQLite generation history (per API key) |
 | `lora_registry.py` | LoRA management with JSON registry |
 | `chat_manager.py` | llama-swap proxy for chat/vision |
 | `nvfp4_loader.py` | NVFP4→BF16 dequantizer (comfy-kitchen) |
+| `dashboard.html` | GPU management dashboard SPA (served at /dashboard) |
 | `config.py` | All configuration |
 | `run.sh` | Startup script (env vars + uvicorn) |
 | `taco-backend.service` | systemd user service |

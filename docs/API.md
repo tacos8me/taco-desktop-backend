@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.1.8 (2026-04-11)
+**Server version:** v1.2 (2026-04-11)
 **Base URL:** `http://<host>:8090`
 **Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
@@ -18,17 +18,19 @@
 3. [System & health](#system--health)
 4. [v1 synchronous generation](#v1-synchronous-generation) — blocks until media is ready
 5. [v2 async generation + jobs](#v2-async-generation--jobs) — 202 → poll → fetch
-6. [Uploads](#uploads)
-7. [LoRAs (LTX)](#loras-ltx)
-8. [Flux LoRAs](#flux-loras)
-9. [Chat completions](#chat-completions)
-10. [SSE session tokens](#sse-session-tokens)
-11. [Approved images](#approved-images)
-12. [Character-consistency vision ranking](#character-consistency-vision-ranking)
-13. [Generation history](#generation-history)
-14. [Compositions](#compositions)
-15. [Error codes](#error-codes)
-16. [Endpoint index](#endpoint-index)
+6. [Music generation](#music-generation) — ACE Step on cuda:1 (v1.2)
+7. [Batch scheduler](#batch-scheduler) — multi-job batches (v1.2)
+8. [Uploads](#uploads)
+9. [LoRAs (LTX)](#loras-ltx)
+10. [Flux LoRAs](#flux-loras)
+11. [Chat completions](#chat-completions)
+12. [SSE session tokens](#sse-session-tokens)
+13. [Approved images](#approved-images)
+14. [Character-consistency vision ranking](#character-consistency-vision-ranking)
+15. [Generation history](#generation-history)
+16. [Compositions](#compositions)
+17. [Error codes](#error-codes)
+18. [Endpoint index](#endpoint-index)
 
 ---
 
@@ -80,15 +82,14 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs. They reso
 - v2 job queue cap: `config.MAX_QUEUE_DEPTH`. Exceeding returns `429 {"error": "queue_full"}` with `Retry-After: 30`.
 - `503` with `Retry-After: 300` while the system is paused.
 
-### Single-GPU swap mode (v1.1.4+, three tenants v1.1.8+)
+### GPU layout (v1.2 — dual-GPU, 2-tenant swap on cuda:0)
 
-LTX, Flux, and JoyAI all target `cuda:0` and are **mutually exclusive**. The server auto-swaps:
+LTX and Flux target `cuda:0` and are **mutually exclusive**. cuda:1 runs ACE (music, :8001) and JoyAI (image edit, :8092) concurrently. The server auto-swaps on cuda:0:
 
-- Video request → evicts Flux/JoyAI if needed, ensures LTX resident (cold load ≈ 25–30 s after another tenant was last on the device).
-- Image request (Flux) → evicts LTX/JoyAI if resident (≈ 3 s each), Flux's own offload hooks page weights in (≈ 15–60 s first call).
-- Image-edit request (`model: "joyai-edit"`, v1.1.8) → evicts LTX/Flux if resident, calls out to the joyai-sidecar on `127.0.0.1:8092` (~5 s cold load).
+- Video request → evicts Flux if needed, ensures LTX resident (cold load ≈ 25–30 s).
+- Image request (Flux) → evicts LTX if resident (≈ 3 s), Flux's own offload hooks page weights in (≈ 15–60 s first call).
 - Long stretches of single-tenant workload pay zero swap overhead.
-- `cuda:1` is reserved for external training — taco-backend never touches it.
+- **Turbo mode** (`POST /v1/system/turbo`): claims both GPUs for LTX — 2 concurrent denoiser workers, 2 video jobs at a time. ACE, JoyAI, and Flux return `503` while active.
 
 ---
 
@@ -128,7 +129,7 @@ Up to 8 keyframes per request.
 | `duration` | `0 < x ≤ 30` seconds |
 | `fps` | `0 < x ≤ 60` |
 | `model` (video) | `"ltx-2-3-fast"` \| `"ltx-2-3-pro"` \| `"ltx-2-3-hq"` |
-| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` \| `"joyai-edit"` (edit only, v1.1.8) |
+| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` \| `"joyai-edit"` (edit only) |
 | `resolution` | `"1920x1080"` \| `"1080x1920"` \| `"2560x1440"` \| `"1440x2560"` \| `"3840x2160"` \| `"2160x3840"` |
 | `width` / `height` (Flux / JoyAI) | `64 ≤ x ≤ 4096`, snapped to multiples of 16 server-side |
 | `num_inference_steps` (Flux / JoyAI) | `1 ≤ x ≤ 100`. Defaults: 50 (dev), 4 (klein), 30 (joyai-edit). Turbo mode overrides to 8. |
@@ -151,6 +152,7 @@ Liveness + model readiness. Never blocks.
   "status": "ok" | "paused",
   "ltx": "ready" | "not_loaded" | "paused",
   "flux": "ready" | "not_loaded" | "paused",
+  "ace": "enabled" | "disabled" | "paused",
   "chat": "ready" | "not_loaded",
   "queue": {"queued": 0, "processing": 0, "completed": 12, "failed": 1}
 }
@@ -184,6 +186,59 @@ Unloads LTX only (Flux stays). In single-GPU mode this fully frees `cuda:0` so a
 ### `POST /v1/ltx/reload`
 
 Reloads LTX. Response: `{"status": "loaded" | "already_loaded"}`.
+
+### `POST /v1/system/turbo` (v1.2)
+
+Toggle turbo mode — claims both GPUs for LTX, enabling 2 concurrent denoiser workers and 2x video throughput. While active, Flux/ACE/JoyAI/music endpoints return `503`.
+
+**Body:**
+
+```json
+{"enable": true}
+```
+
+**Response:**
+
+```json
+{
+  "turbo": true,
+  "flux_device": "cuda:0",
+  "ltx_device": "cuda:0",
+  "ace_status": "unloaded",
+  "joyai_status": "unloaded"
+}
+```
+
+- `409 {"error": "already_enabled"}` if already in turbo mode.
+- `409 {"error": "already_disabled"}` if already in normal mode.
+- `503` if the system is paused.
+
+### `GET /v1/system/gpu` (v1.2)
+
+nvidia-smi GPU telemetry (2 s cache). Used by the dashboard.
+
+```json
+{
+  "gpus": [
+    {
+      "index": 0,
+      "name": "NVIDIA RTX PRO 6000",
+      "memory_used_mb": 65432,
+      "memory_total_mb": 98304,
+      "temperature_c": 52,
+      "utilization_pct": 85,
+      "power_draw_w": 250.0
+    }
+  ],
+  "turbo": false,
+  "gpu0_tenant": "ltx",
+  "gpu1_tenant": "ace"
+}
+```
+
+### `GET /dashboard` (v1.2, no auth)
+
+Serves the GPU management dashboard as a static HTML SPA. Provides real-time GPU telemetry, turbo toggle controls, and system status.
 
 ---
 
@@ -400,6 +455,7 @@ All accept the **same bodies** as their v1 counterparts:
 | `POST /v2/text-to-image` | `TextToImageRequest` |
 | `POST /v2/image-to-image` | `ImageToImageRequest` |
 | `POST /v2/image-edit` | `ImageEditRequest` |
+| `POST /v2/music` | `MusicGenerationRequest` (v1.2) |
 
 All return `202` + submission envelope.
 
@@ -506,6 +562,195 @@ es.addEventListener("error", (ev) => {
 ```bash
 curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
 ```
+
+---
+
+## Music generation
+
+ACE Step (xl-base + LM) on cuda:1 (`127.0.0.1:8001`). ~18 GB resident, runs as a separate systemd service, concurrent with JoyAI on the same GPU. Gated by `LOAD_ACE=1` env var.
+
+### `POST /v1/music`
+
+Synchronous music generation. Blocks until the audio is ready.
+
+**Body:** `MusicGenerationRequest`
+
+```json
+{
+  "prompt": "upbeat electronic dance track with heavy bass",
+  "lyrics": "[Instrumental]",
+  "duration": 60.0,
+  "audio_format": "mp3",
+  "task_type": "text2music",
+  "num_inference_steps": 50,
+  "guidance_scale": 7.0,
+  "bpm": 128,
+  "seed": 42
+}
+```
+
+| Field | Type | Default | Constraints |
+|---|---|---|---|
+| `prompt` | string | required | Music description, max 10,000 chars |
+| `lyrics` | string | `"[Instrumental]"` | Song lyrics, max 50,000 chars |
+| `duration` | float | `60.0` | `0 < x ≤ 600` seconds |
+| `audio_format` | string | `"mp3"` | `"mp3"` \| `"flac"` \| `"wav"` \| `"wav32"` \| `"opus"` \| `"aac"` |
+| `seed` | int | null | For reproducibility |
+| `bpm` | int | null | `30 ≤ x ≤ 300` |
+| `key_scale` | string | null | Musical key (e.g. `"C major"`) |
+| `time_signature` | string | null | e.g. `"4/4"` |
+| `vocal_language` | string | null | e.g. `"en"` |
+| `num_inference_steps` | int | `50` | `1 ≤ x ≤ 200` |
+| `guidance_scale` | float | `7.0` | `0 ≤ x ≤ 15` |
+| `shift` | float | `3.0` | `1.0 ≤ x ≤ 5.0` |
+| `infer_method` | string | `"ode"` | `"ode"` \| `"sde"` |
+| `use_adg` | bool | `false` | Adaptive denoising guidance |
+| `cfg_interval_start` | float | `0.0` | `0 ≤ x ≤ 1` |
+| `cfg_interval_end` | float | `1.0` | `0 ≤ x ≤ 1` |
+| `batch_size` | int | `1` | `1 ≤ x ≤ 8` |
+| `task_type` | string | `"text2music"` | `"text2music"` \| `"cover"` \| `"repaint"` \| `"extract"` \| `"lego"` \| `"complete"` |
+| `source_audio_uri` | string | null | Required for cover/repaint/extract/lego/complete |
+| `reference_audio_uri` | string | null | Optional reference audio |
+| `audio_cover_strength` | float | `1.0` | `0 ≤ x ≤ 1` |
+| `repainting_start` | float | `0.0` | `≥ 0` |
+| `repainting_end` | float | null | |
+| `repaint_mode` | string | `"balanced"` | `"conservative"` \| `"balanced"` \| `"aggressive"` |
+| `repaint_strength` | float | `0.5` | `0 ≤ x ≤ 1` |
+| `track_name` | string | null | Required for extract/lego/complete tasks |
+| `thinking` | bool | `false` | Enable LM thinking mode |
+| `sample_mode` | bool | `false` | |
+| `sample_query` | string | null | |
+| `lm_temperature` | float | `0.85` | `0 ≤ x ≤ 2` |
+| `lm_top_p` | float | `0.9` | `0 ≤ x ≤ 1` |
+
+**Task type requirements:**
+- `cover`, `repaint`, `extract`, `lego`, `complete` → require `source_audio_uri`
+- `extract`, `lego`, `complete` → additionally require `track_name`
+
+**Response:** raw audio bytes with `Content-Type` matching the format (e.g., `audio/mpeg` for mp3).
+
+- `503 Music generation not enabled (LOAD_ACE=0)` if the feature is disabled.
+- `503 turbo_mode_active` if turbo mode is enabled (ACE is evicted during turbo).
+- `422` if task_type requirements are not met.
+- `404` if `source_audio_uri` or `reference_audio_uri` not found.
+
+### `POST /v2/music`
+
+Async music generation. Returns `202` with the standard job envelope. Same body as `POST /v1/music`.
+
+- Music jobs use `phase="generating"` (not `"denoising"`).
+- Music queue cap: `MAX_MUSIC_PENDING` (default 5). Returns `429 {"error": "music_queue_full"}` when exceeded.
+
+---
+
+## Batch scheduler
+
+Submit multiple generation jobs as a single batch. Items are executed sequentially (or 2-at-a-time in turbo mode), sorted to minimize GPU swaps (images before videos, Klein before Dev).
+
+### `POST /v2/batch`
+
+**Body:** `BatchRequest`
+
+```json
+{
+  "items": [
+    {
+      "type": "text-to-image",
+      "params": {
+        "prompt": "a cat",
+        "model": "flux2-klein",
+        "width": 1024,
+        "height": 1024,
+        "num_inference_steps": 4
+      }
+    },
+    {
+      "type": "text-to-video",
+      "params": {
+        "prompt": "a dog walking",
+        "model": "ltx-2-3-fast",
+        "resolution": "1920x1080",
+        "duration": 5,
+        "fps": 24
+      }
+    }
+  ],
+  "priority": "normal",
+  "callback_url": null
+}
+```
+
+| Field | Type | Default | Constraints |
+|---|---|---|---|
+| `items` | array of `BatchItem` | required | `1 ≤ length ≤ 50` |
+| `items[].type` | string | required | `"text-to-image"` \| `"image-to-image"` \| `"image-edit"` \| `"text-to-video"` \| `"image-to-video"` |
+| `items[].params` | object | required | Must validate against the corresponding Pydantic model |
+| `priority` | string | `"normal"` | `"normal"` \| `"high"` |
+| `callback_url` | string | null | Optional webhook URL for completion notification |
+
+**Response:** `202`
+
+```json
+{
+  "batch_id": "batch_...",
+  "status": "queued",
+  "total": 2,
+  "queue_position": 0
+}
+```
+
+- `429 {"error": "batch_queue_full"}` when `MAX_BATCH_QUEUE_DEPTH` (default 5) is exceeded.
+- `400` if an item type is invalid.
+- `422` if item params fail validation.
+- `503` if the system is paused.
+
+### `GET /v2/batch/{batch_id}`
+
+Poll batch status and partial results.
+
+```json
+{
+  "batch_id": "batch_...",
+  "status": "queued" | "processing" | "completed" | "failed" | "cancelled",
+  "total": 5,
+  "completed_count": 3,
+  "failed_count": 0,
+  "current_index": 3,
+  "turbo": false,
+  "results": [
+    {
+      "index": 0,
+      "type": "text-to-image",
+      "status": "completed",
+      "result_uri": "storage://...",
+      "media_type": "image/webp",
+      "error": null,
+      "elapsed_s": 3.2
+    }
+  ],
+  "created_at": 1712345678.9,
+  "started_at": 1712345679.0,
+  "completed_at": null
+}
+```
+
+- `404` if the batch_id is unknown.
+
+### `DELETE /v2/batch/{batch_id}`
+
+Cancel remaining items in a batch. The currently-running item (if any) will finish.
+
+```json
+{
+  "batch_id": "batch_...",
+  "status": "cancelled",
+  "completed_count": 2,
+  "cancelled_count": 3
+}
+```
+
+- `409 {"error": "batch_already_finished"}` if already completed/failed/cancelled.
+- `404` if not found.
 
 ---
 
@@ -853,7 +1098,7 @@ Codes the backend actively returns:
 | `422` | Pydantic validation, keyframe bounds, LoRA id mismatch, retake content rejection |
 | `429` | Queue full (`queue_full`, `Retry-After: 30`) |
 | `500` | Unhandled internal error, Flux disabled, chat proxy not ready |
-| `503` | Paused (`Retry-After: 300`), `joyai_disabled` (LOAD_JOYAI unset), or `sidecar_unreachable` (joyai-sidecar down — fall back to `flux2-klein`) |
+| `503` | Paused (`Retry-After: 300`), `joyai_disabled` (LOAD_JOYAI unset), `sidecar_unreachable` (joyai-sidecar down), `turbo_mode_active` (ACE/JoyAI/Flux unavailable during turbo), or `Music generation not enabled` (LOAD_ACE unset) |
 
 ---
 
@@ -862,8 +1107,11 @@ Codes the backend actively returns:
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | no | Liveness + model status |
+| GET | `/dashboard` | no | GPU management dashboard (v1.2) |
 | POST | `/v1/system/pause` | yes | Evict all models + cancel queued jobs |
 | POST | `/v1/system/resume` | yes | Reload all models |
+| POST | `/v1/system/turbo` | yes | Toggle turbo mode (v1.2) |
+| GET | `/v1/system/gpu` | yes | nvidia-smi GPU telemetry (v1.2) |
 | POST | `/v1/flux/unload` | yes | Unload Flux only |
 | POST | `/v1/flux/reload` | yes | Reload Flux only |
 | POST | `/v1/ltx/unload` | yes | Unload LTX only |
@@ -874,7 +1122,8 @@ Codes the backend actively returns:
 | POST | `/v1/retake` | yes | Sync retake |
 | POST | `/v1/text-to-image` | yes | Sync Flux t2i |
 | POST | `/v1/image-to-image` | yes | Sync Flux i2i |
-| POST | `/v1/image-edit` | yes | Sync image edit (Flux multi-image or `joyai-edit` single-image sidecar, v1.1.8) |
+| POST | `/v1/image-edit` | yes | Sync image edit (Flux multi-image or `joyai-edit` single-image) |
+| POST | `/v1/music` | yes | Sync music generation (ACE, v1.2) |
 | POST | `/v1/chat/completions` | yes | Chat proxy |
 | POST | `/v1/upload` | yes | Get upload URL |
 | PUT | `/uploads/put/{upload_id}` | yes | Upload bytes |
@@ -889,7 +1138,11 @@ Codes the backend actively returns:
 | POST | `/v2/retake` | yes | Async retake |
 | POST | `/v2/text-to-image` | yes | Async Flux t2i |
 | POST | `/v2/image-to-image` | yes | Async Flux i2i |
-| POST | `/v2/image-edit` | yes | Async image edit (Flux multi-image or `joyai-edit` single-image sidecar, v1.1.8) |
+| POST | `/v2/image-edit` | yes | Async image edit (Flux multi-image or `joyai-edit` single-image) |
+| POST | `/v2/music` | yes | Async music generation (ACE, v1.2) |
+| POST | `/v2/batch` | yes | Submit batch of generation jobs (v1.2) |
+| GET | `/v2/batch/{batch_id}` | yes | Poll batch status + partial results (v1.2) |
+| DELETE | `/v2/batch/{batch_id}` | yes | Cancel remaining batch items (v1.2) |
 | GET | `/v2/jobs/{job_id}` | yes | Poll job status |
 | GET | `/v2/jobs/{job_id}/preview` | yes | Preview JPEG (204 when empty) |
 | GET | `/v2/jobs/{job_id}/result` | yes | Download final media |
@@ -904,6 +1157,7 @@ Codes the backend actively returns:
 | GET | `/v2/history` | yes | Per-key generation history |
 | GET | `/v2/history/{id}/image` | yes | Full-size history media |
 | GET | `/v2/history/{id}/thumbnail` | yes | History thumbnail |
+| DELETE | `/v2/history/{id}` | yes | Delete history entry |
 | POST | `/v2/compositions` | yes | Create composition |
 | GET | `/v2/compositions` | yes | List compositions |
 | GET | `/v2/compositions/{id}` | yes | Get composition |
@@ -911,7 +1165,7 @@ Codes the backend actively returns:
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue composition export job |
 
-Total: 48 routes (47 HTTP handlers + `/health`). No new routes in v1.1.8 — `joyai-edit` reuses the existing `/v1/image-edit` and `/v2/image-edit` endpoints via the `model` field.
+Total: 58 routes.
 
 ---
 
@@ -960,6 +1214,15 @@ curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
 
 ## Changelog
 
+- **v1.2** (2026-04-11)
+  - **Dual-GPU layout**: cuda:0 = LTX ↔ Flux (2-tenant swap), cuda:1 = ACE + JoyAI (coexisting). JoyAI migrated from cuda:0 to cuda:1.
+  - **Music generation**: `POST /v1/music` (sync) + `POST /v2/music` (async) — ACE Step xl-base+LM on cuda:1:8001. `MusicGenerationRequest` with 30+ fields, 6 task types (text2music/cover/repaint/extract/lego/complete), 6 audio formats. Gated by `LOAD_ACE=1`.
+  - **Batch scheduler**: `POST /v2/batch` + `GET /v2/batch/{id}` + `DELETE /v2/batch/{id}` — submit 1-50 generation jobs as a batch. Swap-optimized sort (images before videos). Max queue depth 5.
+  - **Turbo mode**: `POST /v1/system/turbo` — claims both GPUs for LTX with 2 concurrent denoiser workers, 2x video throughput. ACE/JoyAI/Flux return 503 while active. `worker_loop` turbo_check callback, batch_worker asyncio.gather for 2-at-a-time processing.
+  - **Dashboard**: `GET /dashboard` — static HTML SPA for GPU management with turbo controls.
+  - **GPU telemetry**: `GET /v1/system/gpu` — nvidia-smi per-GPU memory/temp/utilization, turbo state, tenant info (2 s cache).
+  - `/health` now includes `ace` field.
+  - New env vars: `LOAD_ACE`, `ACE_SIDECAR_URL`, `MAX_MUSIC_PENDING`, `TURBO_GPU_DEVICES`, `MAX_BATCH_QUEUE_DEPTH`, `MAX_BATCH_ITEMS`.
 - **v1.1.8** (2026-04-11)
   - `model: "joyai-edit"` on `POST /v1/image-edit` and `POST /v2/image-edit` — single-image instruction-based editing via JoyAI-Image-Edit-Diffusers running in an out-of-process sidecar on 127.0.0.1:8092.
   - Server wraps prompts in the `<|im_start|>user\n<image>\n{prompt}<|im_end|>\n` chat template — clients send plain English.

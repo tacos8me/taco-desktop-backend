@@ -2,17 +2,19 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.1.8 (2026-04-11).
+**Version**: v1.2 (2026-04-11).
 
 ## Structure
-- `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs
+- `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode, dashboard
 - `split_model_manager.py` — Single-GPU LTX pipeline: shared encoder hub + swappable transformer
-- `flux_manager.py` — Flux 2 image generation: per-request LoRA fusion + FP8 layerwise casting on cuda:0
+- `flux_manager.py` — Flux 2 image generation: per-request LoRA adapter mode on cuda:0
+- `ace_client.py` — ACE music generation sidecar client (httpx → ace-step on cuda:1:8001)
 - `chat_manager.py` — Proxies /v1/chat/completions to llama-swap (supports per-request model override for vision ranking)
 - `job_queue.py` — Async job queue: submit (202), poll, result, cancel; saves to history on completion
 - `upload_store.py` — UUID file storage for uploads and job results
 - `history_store.py` — SQLite-backed per-API-key generation history with thumbnails
 - `lora_registry.py` — Flat-dir LoRA storage with registry.json index
+- `dashboard.html` — GPU management dashboard SPA (served at /dashboard)
 - `config.py` — Paths, model mapping, device config, resolution tables, TF32 settings
 
 ## Key commands
@@ -20,15 +22,47 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - Test: `uv run pytest tests/ -v`
 - Health: `curl http://localhost:8090/health`
 
-## GPU topology (v1.1.4 — single-GPU swap mode, extended to three tenants in v1.1.8)
-- **cuda:0** → RTX PRO 6000 Blackwell 96GB — **Flux 2 + LTX + JoyAI-edit sidecar**, all mutually exclusive, auto-swapped on dispatch (v1.1.8 added JoyAI as a third tenant via an out-of-process sidecar — see the "JoyAI image-edit sidecar" subsection below)
-- **cuda:1** → RTX PRO 6000 Blackwell 96GB — **reserved exclusively for external training runs** (e.g. ai-toolkit). taco-backend never touches it.
+## GPU topology (v1.2 — dual-GPU layout)
+- **cuda:0** → RTX PRO 6000 Blackwell 96GB — **LTX ↔ Flux** (2-tenant swap, mutually exclusive, auto-swapped on dispatch)
+- **cuda:1** → RTX PRO 6000 Blackwell 96GB — **ACE xl-base+LM** (~18 GB) + **JoyAI** (~50 GB when loaded), coexisting, no swap needed
 
 Verified via `nvidia-smi -L`. No third GPU on this box — any earlier references to `cuda:2`/RTX 4000 are stale.
 
-**Why mutually exclusive**: LTX active is ~79 GB (60 GB transformer + 19 GB encoder hub + decoder activations) and Flux active is ~81 GB (60 GB transformer + ~14 GB CPU-offload forward-pass peak via `enable_model_cpu_offload`). Combined ~160 GB > 96 GB physical. They cannot coexist on one GPU during forward pass, so the server evicts the other before running.
+**Why mutually exclusive on cuda:0**: LTX active is ~79 GB (60 GB transformer + 19 GB encoder hub + decoder activations) and Flux active is ~81 GB (60 GB transformer + ~14 GB CPU-offload forward-pass peak via `enable_model_cpu_offload`). Combined ~160 GB > 96 GB physical. They cannot coexist on one GPU during forward pass, so the server evicts the other before running.
 
-**Auto-swap (three tenants, v1.1.8)**: `server.py` exposes `_ensure_ltx_resident()`, `_ensure_flux_ready()`, and `_ensure_joyai_ready()` helpers, called inside `_inference_lock` by `_dispatch_job()` (v2 async) and every v1 sync handler (text_to_video, image_to_video, audio_to_video, retake, text_to_image, image_to_image, image_edit) before `torch.cuda.set_device()`. All three tenants (LTX, Flux, JoyAI) are mutually exclusive on cuda:0. LTX is **not** auto-reloaded after a Flux/JoyAI request — it stays evicted until the next video request. Long-stretch single-tenant workloads incur zero swap overhead; mixed workloads pay a per-direction-change cost (see swap section below).
+**Auto-swap (two tenants on cuda:0)**: `server.py` exposes `_ensure_ltx_resident()` and `_ensure_flux_ready()` helpers, called inside `_inference_lock` by `_dispatch_job()` (v2 async) and every v1 sync handler (text_to_video, image_to_video, audio_to_video, retake, text_to_image, image_to_image, image_edit) before `torch.cuda.set_device()`. LTX and Flux are mutually exclusive on cuda:0. LTX is **not** auto-reloaded after a Flux request — it stays evicted until the next video request. Long-stretch single-tenant workloads incur zero swap overhead; mixed workloads pay a per-direction-change cost (see swap section below).
+
+### Turbo mode (v1.2)
+
+Toggled via `POST /v1/system/turbo` (body: `{"enable": true/false}`). Temporarily claims cuda:1 for LTX, giving **2 concurrent LTX denoiser workers** (one per GPU) and processing **2 video jobs at a time**.
+
+- **Entry**: evicts ACE, JoyAI, and Flux from both GPUs; loads dual-GPU LTX with encoder hub on cuda:0 and 2 denoiser workers; starts a second `worker_loop` pulling from `_job_queue`. Entry takes ~20 s.
+- **Active**: Flux, ACE, JoyAI, and music endpoints all return `503 turbo_mode_active`. Only video generation works.
+- **Exit**: cancels the second worker, evicts dual-GPU LTX, restores single-GPU LTX on cuda:0, restarts ACE+JoyAI on cuda:1. Exit takes ~15 s.
+- **Batch integration**: `_batch_worker` uses `asyncio.gather` to run 2 items concurrently when turbo is active.
+
+### ACE music sidecar (v1.2)
+
+ACE Step (xl-base + LM) runs on cuda:1 at `127.0.0.1:8001` via a separate systemd service (`ace-step.service`). ~18 GB resident, coexists with JoyAI on cuda:1. `ace_client.py` proxies requests via httpx.
+
+- Endpoints: `POST /v1/music` (sync), `POST /v2/music` (async job)
+- Gated by `LOAD_ACE=1` env var. Returns `503` when disabled or during turbo mode.
+- Music queue cap: `MAX_MUSIC_PENDING` (default 5), returns `429 music_queue_full` when exceeded.
+- Phase for music jobs: `"generating"` (not `"denoising"`).
+
+### JoyAI image-edit sidecar (v1.2, migrated from cuda:0)
+
+Previously a third tenant on cuda:0 (v1.1.8). Now runs on cuda:1 at `127.0.0.1:8092`, coexisting with ACE. No swap needed — combined footprint (~68 GB) fits within 96 GB.
+
+- Activation: `LOAD_JOYAI=1` env var in `.env`.
+- Dispatch: `/v1/image-edit` and `/v2/image-edit` with `model="joyai-edit"` route to `joyai_client.edit()`.
+- Service: `systemctl --user {start,stop,restart,status} joyai-sidecar`.
+- Fallback: `503 joyai_disabled` / `503 sidecar_unreachable` — client should retry with `flux2-klein`.
+
+### Dashboard and GPU telemetry (v1.2)
+
+- `GET /dashboard` — static HTML SPA for GPU management (served from `dashboard.html`)
+- `GET /v1/system/gpu` — nvidia-smi telemetry (2 s cache): per-GPU memory/temp/utilization, turbo state, tenant info
 
 ## Flux pipeline details
 
@@ -78,7 +112,7 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Flux output: WEBP quality 95
 - LTX output: raw MP4 bytes with `Content-Type: video/mp4`
 - LTX: evict transformer before VAE decode (reclaims ~22GB), don't reload after — next request handles its own state
-- LTX swap: on dispatch, `_ensure_ltx_resident()` / `_ensure_flux_ready()` (server.py) auto-evicts the other manager before each request. Never assume either manager is loaded — call the helper inside `_inference_lock`.
+- LTX swap: on dispatch, `_ensure_ltx_resident()` / `_ensure_flux_ready()` (server.py) auto-evicts the other tenant on cuda:0 before each request. Never assume either manager is loaded — call the helper inside `_inference_lock`.
 - LTX LoRA: fusion is permanent (no unfuse), different strengths require full transformer reload. Cache key `(state_name, user_lora_tuple)`.
 - Flux LoRA: adapter mode (NOT fused) — strength is applied at inference time via `pipe.set_adapters([...], [strength])`. Cache key `(model_name, lora_path)` — strength is NOT in the key, so strength changes are free. Only model or LoRA file changes trigger reload.
 - Frame count must be 8k+1; resolution multiples of 64
@@ -109,45 +143,43 @@ At inference time, every generate method calls `_apply_lora_strength(lora_path, 
 - LoRA file removed (request with no `lora` field) → no reload, just `disable_lora()` call
 - Why PR #10685 doesn't apply to us: that bug is specifically about the PEFT input-autocast hook firing when the transformer is FP8-cast. Since we no longer call `enable_layerwise_casting`, the hook has nothing to fight against.
 
-## Single-GPU swap mode (v1.1.4, three tenants v1.1.8)
+## GPU swap mode (v1.2 — 2-tenant swap on cuda:0)
 
-Both Flux and LTX target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda:0"`. `cuda:1` is reserved for external training runs and the backend never reads/writes it. **v1.1.8 added a third tenant**: the JoyAI image-edit sidecar, which also lives on `cuda:0` and is mutually exclusive with both LTX and Flux. See the "JoyAI image-edit sidecar" subsection below for details.
+LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda:0"`. cuda:1 runs ACE + JoyAI concurrently (no swap needed).
 
 **Auto-swap helpers** (`server.py`):
 - `_ensure_ltx_resident()` — no-op if `ltx_manager.is_ready`, else calls `ltx_manager.load_all()` (cold load is 7–30 s depending on OS page cache)
 - `_ensure_flux_ready()` — no-op if `not ltx_manager.is_ready`, else calls `ltx_manager.evict_all()` (~3 s)
-- Both **must** be called while holding `_inference_lock`. Wired into `_dispatch_job()` (v2 async queue) and all 7 v1 sync handlers. The old `if not manager.is_ready: return 500` early-return guards have been removed from LTX sync handlers — auto-swap handles readiness lazily.
+- Both **must** be called while holding `_inference_lock`. Wired into `_dispatch_job()` (v2 async queue) and all v1 sync handlers. The old `if not manager.is_ready: return 500` early-return guards have been removed from LTX sync handlers — auto-swap handles readiness lazily.
 
 **evict_all leak fix** (`split_model_manager.py::evict_all`): each `DenoiserWorker` holds two strong refs to its source `ModelLedger` — a direct `worker._model_ledger` (set at split_model_manager.py:392) and an indirect `worker.ledger._source_ledger` via `CachingModelLedger(source_ledger=...)`. Prior to v1.1.4 neither was cleared, so the encoder hub (Gemma text encoder + VAE + spatial upsampler, ~22 GB) stayed pinned on the LTX device after `/v1/ltx/unload`. Fix: explicitly null both paths plus `_encoder_ledger._source_ledger` defensively before dropping the workers list. Verified: cuda:0 drops from 66.9 GB → **683 MiB** after unload.
 
-**Swap endpoints** (Bearer auth required):
+**Swap + system endpoints** (Bearer auth required):
 - `POST /v1/ltx/unload`, `POST /v1/ltx/reload`
 - `POST /v1/flux/unload`, `POST /v1/flux/reload`
 - `POST /v1/system/pause`, `POST /v1/system/resume` (acquire `_inference_lock`)
+- `POST /v1/system/turbo` — toggle turbo mode (dual-GPU LTX, see GPU topology section)
+- `GET /v1/system/gpu` — nvidia-smi telemetry
+- `GET /dashboard` — GPU management dashboard
 
 **Latency**:
 - Within-type (video→video, image→image with same LoRA): unchanged, fast
 - LTX→Flux (image request after video): +3 s eviction + normal Flux forward pass
 - Flux→LTX (video request after image): +7–30 s cold LTX load + normal video generation
+- Turbo mode entry: ~20 s (evict ACE+JoyAI+Flux, load dual-GPU LTX)
+- Turbo mode exit: ~15 s (evict dual-GPU LTX, restore single-GPU, restart ACE+JoyAI)
 - LoRA strength changes: still free runtime op, unchanged by the swap refactor
 
-### JoyAI image-edit sidecar (v1.1.8)
+## Batch scheduler (v1.2)
 
-Third tenant of the cuda:0 mutual-exclusion slot, running **out-of-process** at
-`/mnt/nvme-1/servers/joyai-sidecar/` on `127.0.0.1:8092` (8091 is taken by
-`noodle-t-backend`). Separate venv because JoyAI needs `transformers==4.57.1`
-+ `diffusers` fork (Moran232/diffusers@joyimage_edit), incompatible with
-taco-backend's `transformers==5.3` + `diffusers==0.38.0.dev0`.
-
-- Activation: `LOAD_JOYAI=1` env var in `.env` (off by default).
-- Dispatch: `/v1/image-edit` and `/v2/image-edit` with `model="joyai-edit"` route to `joyai_client.edit()` instead of `flux.generate_image_edit()`.
-- GPU coordination: taco-backend holds `_inference_lock` for the full HTTP call. Sidecar's internal asyncio.Lock is defense-in-depth.
-- Three-tenant swap: `_evict_other_tenants(new)` in server.py flips any tenant→`new`. `_ensure_joyai_ready()` mirrors `_ensure_ltx_resident()` / `_ensure_flux_ready()`. All three helpers are now `async def` (was sync in v1.1.7).
-- Phase 0 measurement: 50.3 GB resident, 65.5 GB peak reserved, 78 s for 30 steps at 1024² bf16. Within the 96 GB budget with headroom.
-- Memory pressure: JoyAI + LTX (129 GB) and JoyAI + Flux peak (125 GB) both exceed 96 GB — always evict before swapping.
-- Service: `systemctl --user {start,stop,restart,status} joyai-sidecar`. Unit ordered `Before=taco-backend.service`.
-- Fallback on sidecar failure: `/v2/image-edit` with `model="joyai-edit"` returns `503 {"error": "sidecar_unreachable"}` — client should retry with `flux2-klein`.
-- **Pre-existing bug fixed in same commit**: `flux_manager._edit()` hardcoded `ensure_model("flux2-klein", ...)`, silently ignoring `model="flux2-dev"`. Now respects the passed model.
+- `POST /v2/batch` — submit a batch of generation jobs (1-50 items per batch)
+- `GET /v2/batch/{batch_id}` — poll batch status + partial results
+- `DELETE /v2/batch/{batch_id}` — cancel remaining items
+- Items are sorted images-first (Klein before Dev) to minimize GPU swaps
+- In turbo mode, `batch_worker` uses `asyncio.gather` to process 2 items concurrently
+- Max batch queue depth: `MAX_BATCH_QUEUE_DEPTH` (default 5)
+- Max items per batch: `MAX_BATCH_ITEMS` (default 50)
+- Supported item types: `text-to-image`, `image-to-image`, `image-edit`, `text-to-video`, `image-to-video`
 
 ## Keyframe symbolic indices (v1.1)
 - `KeyframeInput.frame_index` accepts `int | "first" | "middle" | "last"`

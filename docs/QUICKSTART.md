@@ -134,6 +134,12 @@ await fetch(`${API}/v2/image-to-video`, {
 | `flux2-klein` | ~10 s (4 steps) | Multi-reference editing, multi-subject consistency |
 | `joyai-edit` | ~78 s (30 steps) | **Instruction-based single-image edits** (remove objects, move things, camera moves). Sidecar-hosted. |
 
+### Music — `/v1/music`, `/v2/music` (v1.2)
+
+| Model | Latency | Use case |
+|---|---|---|
+| ACE xl-base + LM | ~2–10 s | Text-to-music, covers, repainting, stem extraction. Concurrent with video on cuda:1. |
+
 ### Chat / vision
 - `POST /v1/chat/completions` — OpenAI-compatible proxy (llama-swap)
 - `POST /v2/char/rank` — character-consistency scorer (reference vs generated → JSON with `face_match`, `eyes`, `proportions`, `overall_likeness`, suggested edits)
@@ -217,6 +223,36 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
 - Phase stays on `"encoding"` for the entire ~78 s sidecar call. Render a spinner, not a moving percentage.
 - Requires `LOAD_JOYAI=1` on the server. If unset / sidecar down: `503 joyai_disabled` or `503 sidecar_unreachable` — fall back to `flux2-klein`.
 
+### `POST /v2/music` (v1.2)
+```json
+{
+  "prompt": "upbeat electronic dance track with heavy bass",
+  "lyrics": "[Instrumental]",
+  "duration": 60.0,
+  "audio_format": "mp3",
+  "task_type": "text2music",
+  "num_inference_steps": 50,
+  "guidance_scale": 7.0,
+  "bpm": 128
+}
+```
+- Phase for music jobs is `"generating"` (not `"denoising"`).
+- Requires `LOAD_ACE=1`. Returns `503` when disabled or during turbo mode.
+- Music queue cap: 5. Returns `429 music_queue_full` when exceeded.
+
+### `POST /v2/batch` (v1.2)
+```json
+{
+  "items": [
+    {"type": "text-to-image", "params": {"prompt": "a cat", "model": "flux2-klein", "width": 1024, "height": 1024, "num_inference_steps": 4}},
+    {"type": "text-to-video", "params": {"prompt": "a dog walking", "model": "ltx-2-3-fast", "resolution": "1920x1080", "duration": 5, "fps": 24}}
+  ],
+  "priority": "normal"
+}
+```
+- Returns `202` with `batch_id`. Poll `GET /v2/batch/{batch_id}` for status + partial results. `DELETE /v2/batch/{batch_id}` to cancel.
+- Items sorted images-first to minimize GPU swaps. In turbo mode, 2 video items process concurrently.
+
 ## Common pitfalls
 
 - **Image dims must be multiples of 16** (width/height). Video dims must be multiples of 64. The server floors silently — you'll lose pixels if you forget.
@@ -231,6 +267,8 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
 - **Auth is enforced on every endpoint** except `/health` and `/v1/approved-images/events`. Don't forget the bearer.
 - **`joyai-edit` requires exactly one `image_uri`** (not 1–10 like flux2-klein) — `422` otherwise.
 - **`joyai-edit` stays on phase `"encoding"` for the entire ~78 s sidecar call** — render it as a spinner, not a frozen percentage. Progress sits at `0.90` the whole time.
+- **Turbo mode** (`POST /v1/system/turbo`) claims both GPUs for LTX — Flux, ACE (music), and JoyAI all return `503` while active. 2x video throughput.
+- **Music jobs use phase `"generating"`** (not `"denoising"`). The ACE sidecar is opaque to per-step callbacks.
 
 ## Error envelope
 
@@ -271,4 +309,4 @@ All error responses have the same shape — pick whichever field your parser alr
 
 ## Full spec
 
-For system endpoints, approved-images, compositions, SSE token lifecycle, exact pydantic shapes, and everything else: **[docs/API.md](./API.md)** (47 routes, ~900 lines).
+For system endpoints, approved-images, compositions, SSE token lifecycle, exact pydantic shapes, and everything else: **[docs/API.md](./API.md)** (58 routes).
