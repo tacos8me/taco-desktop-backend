@@ -62,10 +62,9 @@ _job_queue: asyncio.Queue[str] = asyncio.Queue()
 batch_store = BatchStore()
 _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 
-# Turbo mode — dual-GPU inference
+# Turbo mode — dual-GPU LTX inference (2 concurrent video jobs)
 _turbo_active: bool = False
-_flux_lock = asyncio.Lock()   # guards cuda:1 during turbo
-_ltx_lock = asyncio.Lock()    # guards cuda:0 during turbo
+_turbo_worker_task: asyncio.Task | None = None  # second worker_loop for concurrent dispatch
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -298,7 +297,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                     logger.warning("ACE sidecar unreachable at %s: %s", config.ACE_SIDECAR_URL, exc)
 
     worker_task = asyncio.create_task(
-        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history),
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
+                    turbo_check=lambda: _turbo_active),
         name="queue-worker",
     )
     cleanup_task = asyncio.create_task(
@@ -337,7 +337,7 @@ app.add_middleware(
 async def check_api_key(request: Request, call_next):
     if not config.API_KEYS:
         return await call_next(request)
-    if request.url.path in ("/health", "/v1/approved-images/events", "/dashboard"):
+    if request.url.path in ("/health", "/v1/approved-images/events", "/dashboard", "/v1/system/gpu"):
         return await call_next(request)
     # SSE job streams: EventSource can't set custom headers, so these endpoints
     # accept a `?token=` query param and do their own auth inside the handler.
@@ -967,59 +967,83 @@ async def _ace_systemctl(action: str) -> None:
 
 
 async def _enter_turbo_mode() -> None:
-    """Claim cuda:1 for inference. Caller must hold _inference_lock."""
-    global _turbo_active
+    """Enable dual-GPU LTX: 2 denoiser workers, 2 video jobs at a time.
+
+    cuda:0 gets encoder hub + denoiser worker 0.
+    cuda:1 gets denoiser worker 1 (shares encoder hub on cuda:0 for text encoding).
+    A second worker_loop is started so the queue can dispatch 2 jobs concurrently.
+    SplitModelManager._acquire_worker() handles per-GPU serialization.
+
+    Flux, ACE, and JoyAI are ALL unavailable during turbo — their requests get 503.
+    Caller must hold _inference_lock.
+    """
+    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
 
     if _turbo_active:
         return  # idempotent
 
-    # Step 1: Unload ACE from cuda:1
+    # Step 1: Evict ACE from cuda:1
     if config.LOAD_ACE:
         try:
             await _ace_systemctl("stop")
             logger.info("Turbo: ACE stopped via systemctl")
         except Exception:
-            logger.exception("Turbo: ACE stop failed -- aborting turbo entry")
+            logger.exception("Turbo: ACE stop failed — aborting turbo entry")
             raise RuntimeError("turbo_entry_failed: could not stop ACE on cuda:1")
 
-    # Step 2: Unload JoyAI from cuda:1
+    # Step 2: Evict JoyAI from cuda:1
     if config.LOAD_JOYAI:
         try:
             await joyai.unload()
             logger.info("Turbo: JoyAI unloaded from cuda:1")
         except JoyAIError:
-            logger.warning("Turbo: JoyAI unload failed -- continuing (non-critical)")
+            logger.warning("Turbo: JoyAI unload failed — continuing (non-critical)")
 
-    # Step 3: Verify cuda:1 is free
-    free_mb = _get_gpu_free_mb(1)
-    if free_mb < 90_000:
-        logger.warning("Turbo: cuda:1 has only %d MB free after unloads", free_mb)
-
-    # Step 4: Move Flux to cuda:1
+    # Step 3: Evict Flux from cuda:0 (LTX needs full GPU for encoder hub + denoiser)
     flux.unload()
-    config.FLUX_DEVICE = "cuda:1"
-    flux._device = "cuda:1"
-    # Don't eagerly reload -- lazy load on next image request
 
-    # Step 5: Enable turbo
+    # Step 4: Load dual-GPU LTX — encoder hub on cuda:0, 2 denoiser workers
+    manager.evict_all()
+    config.GPU_DEVICES = config.TURBO_GPU_DEVICES  # ["cuda:0", "cuda:1"]
+    manager.load_all()
+    _last_gpu_tenant = "ltx"
+
+    # Step 5: Start a second worker loop so the queue can dispatch 2 jobs concurrently.
+    # Both workers pull from _job_queue. In turbo mode, worker_loop skips _inference_lock
+    # because SplitModelManager._acquire_worker() serializes per-GPU via worker.lock.
     _turbo_active = True
-    logger.info("Turbo mode ACTIVE: Flux on cuda:1, LTX on cuda:0")
+    _turbo_worker_task = asyncio.create_task(
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
+                    turbo_check=lambda: _turbo_active),
+        name="turbo-worker",
+    )
+    logger.info("TURBO MODE ON: 2 LTX workers on %s, 2 concurrent video jobs", config.TURBO_GPU_DEVICES)
 
 
 async def _exit_turbo_mode() -> None:
-    """Release cuda:1 back to ACE/JoyAI. Caller must hold _inference_lock."""
-    global _turbo_active
+    """Restore single-GPU mode: 1 LTX worker on cuda:0, ACE+JoyAI back on cuda:1.
+
+    Caller must hold _inference_lock.
+    """
+    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
 
     if not _turbo_active:
         return  # idempotent
 
-    # Step 1: Unload Flux from cuda:1
-    flux.unload()
+    # Step 1: Cancel the second worker loop
+    if _turbo_worker_task is not None:
+        _turbo_worker_task.cancel()
+        try:
+            await _turbo_worker_task
+        except asyncio.CancelledError:
+            pass
+        _turbo_worker_task = None
 
-    # Step 2: Restore single-GPU config
-    config.FLUX_DEVICE = "cuda:0"
-    flux._device = "cuda:0"
-    # Do NOT eagerly reload Flux on cuda:0 -- lazy load on next image request
+    # Step 2: Evict dual-GPU LTX, restore single-GPU config
+    manager.evict_all()
+    config.GPU_DEVICES = config.NORMAL_GPU_DEVICES  # ["cuda:0"]
+    manager.load_all()
+    _last_gpu_tenant = "ltx"
 
     # Step 3: Reload ACE on cuda:1
     if config.LOAD_ACE:
@@ -1027,7 +1051,7 @@ async def _exit_turbo_mode() -> None:
             await _ace_systemctl("start")
             logger.info("Turbo exit: ACE restarted via systemctl")
         except Exception:
-            logger.warning("Turbo exit: ACE restart failed -- will retry on next request")
+            logger.warning("Turbo exit: ACE restart failed — will retry on next request")
 
     # Step 4: Reload JoyAI on cuda:1
     if config.LOAD_JOYAI:
@@ -1035,10 +1059,10 @@ async def _exit_turbo_mode() -> None:
             await joyai.load()
             logger.info("Turbo exit: JoyAI reloaded on cuda:1")
         except JoyAIError:
-            logger.warning("Turbo exit: JoyAI reload failed -- non-critical")
+            logger.warning("Turbo exit: JoyAI reload failed — non-critical")
 
     _turbo_active = False
-    logger.info("Turbo mode DEACTIVATED: single-GPU swap restored")
+    logger.info("TURBO MODE OFF: single-GPU swap restored, ACE+JoyAI reloading on cuda:1")
 
 
 class TurboRequest(BaseModel):
@@ -2538,10 +2562,60 @@ async def _fire_batch_webhook(batch: BatchJob) -> None:
     logger.warning("Batch %s webhook failed after 3 retries to %s", batch.id, batch.callback_url)
 
 
+async def _process_batch_item(batch, i: int, item) -> None:
+    """Process a single batch item. Used by both turbo (no lock) and normal mode.
+
+    In turbo mode, SplitModelManager._acquire_worker() serializes per-GPU.
+    In normal mode, the caller holds _inference_lock before calling this.
+    """
+    t0 = time.monotonic()
+    try:
+        job = _batch_item_to_job(item, batch.api_key)
+        if not _turbo_active:
+            # Single-GPU: ensure correct tenant before dispatch
+            if _is_image_type(item.type):
+                await _ensure_flux_ready()
+            else:
+                await _ensure_ltx_resident()
+        result_bytes = await _dispatch_job(job)
+
+        upload_id, storage_uri = uploads.create()
+        uploads.save(upload_id, result_bytes)
+        elapsed = time.monotonic() - t0
+
+        batch.results.append(BatchItemResult(
+            index=i, type=item.type, status="completed",
+            result_uri=storage_uri,
+            media_type=_JOB_MEDIA_TYPES.get(JobType(item.type), "application/octet-stream"),
+            elapsed_s=round(elapsed, 2),
+        ))
+        batch.completed_count += 1
+
+        if history and batch.api_key:
+            asyncio.create_task(_save_batch_item_history(
+                history, job, result_bytes, storage_uri))
+
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        batch.results.append(BatchItemResult(
+            index=i, type=item.type, status="failed",
+            error=str(exc)[:500], elapsed_s=round(elapsed, 2),
+        ))
+        batch.failed_count += 1
+        logger.exception("Batch %s item %d failed", batch.id, i)
+
+
 async def batch_worker() -> None:
-    """Background worker that processes batches from the batch queue."""
+    """Background worker that processes batches from the batch queue.
+
+    In turbo mode: dispatches 2 items concurrently via asyncio.gather
+    (one per GPU worker). SplitModelManager._acquire_worker() assigns
+    each job to a different GPU.
+
+    In normal mode: dispatches 1 item at a time, holding _inference_lock,
+    with swap logic (_ensure_ltx_resident / _ensure_flux_ready).
+    """
     logger.info("Batch worker started")
-    consecutive_ooms = 0
 
     while True:
         batch_id = await _batch_queue.get()
@@ -2552,86 +2626,33 @@ async def batch_worker() -> None:
 
         batch.status = BatchStatus.PROCESSING
         batch.started_at = time.monotonic()
-        logger.info("Processing batch %s (%d items)", batch.id, batch.total)
-        consecutive_ooms = 0
+        logger.info("Processing batch %s (%d items, turbo=%s)", batch.id, batch.total, _turbo_active)
 
-        for i, item in enumerate(batch.items):
-            # Check cancellation between items
+        items = list(enumerate(batch.items))
+        idx = 0
+        while idx < len(items):
             if batch.status == BatchStatus.CANCELLED:
-                for j in range(i, len(batch.items)):
+                for j in range(idx, len(items)):
                     batch.results.append(BatchItemResult(
-                        index=j, type=batch.items[j].type,
+                        index=items[j][0], type=items[j][1].type,
                         status="cancelled",
                     ))
                 break
 
-            batch.current_index = i
-            t0 = time.monotonic()
-
-            try:
-                job = _batch_item_to_job(item, batch.api_key)
-
-                if batch.turbo and _turbo_active:
-                    lock = _flux_lock if _is_image_type(item.type) else _ltx_lock
-                else:
-                    lock = _inference_lock
-
-                async with lock:
-                    if not (batch.turbo and _turbo_active):
-                        # Single-GPU: ensure correct tenant
-                        if _is_image_type(item.type):
-                            await _ensure_flux_ready()
-                        else:
-                            await _ensure_ltx_resident()
-                    result_bytes = await _dispatch_job(job)
-
-                # Save result
-                upload_id, storage_uri = uploads.create()
-                uploads.save(upload_id, result_bytes)
-                elapsed = time.monotonic() - t0
-
-                batch.results.append(BatchItemResult(
-                    index=i, type=item.type, status="completed",
-                    result_uri=storage_uri,
-                    media_type=_JOB_MEDIA_TYPES.get(JobType(item.type), "application/octet-stream"),
-                    elapsed_s=round(elapsed, 2),
-                ))
-                batch.completed_count += 1
-                consecutive_ooms = 0
-
-                # Fire-and-forget history save
-                if history and batch.api_key:
-                    asyncio.create_task(_save_batch_item_history(
-                        history, job, result_bytes, storage_uri))
-
-            except Exception as exc:
-                elapsed = time.monotonic() - t0
-                is_oom = "out of memory" in str(exc).lower()
-                batch.results.append(BatchItemResult(
-                    index=i, type=item.type, status="failed",
-                    error=str(exc)[:500], elapsed_s=round(elapsed, 2),
-                ))
-                batch.failed_count += 1
-                logger.exception("Batch %s item %d failed", batch.id, i)
-
-                if is_oom:
-                    consecutive_ooms += 1
-                    # Clean up after OOM
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    if consecutive_ooms >= 3:
-                        logger.error("Batch %s: 3 consecutive OOMs, aborting", batch.id)
-                        # Mark remaining as failed
-                        for j in range(i + 1, len(batch.items)):
-                            batch.results.append(BatchItemResult(
-                                index=j, type=batch.items[j].type,
-                                status="failed", error="repeated_oom",
-                            ))
-                            batch.failed_count += 1
-                        break
-                else:
-                    consecutive_ooms = 0
+            if _turbo_active:
+                # Turbo: dispatch 2 items concurrently (one per GPU worker)
+                chunk = items[idx:idx+2]
+                batch.current_index = chunk[0][0]
+                tasks = [_process_batch_item(batch, i, item) for i, item in chunk]
+                await asyncio.gather(*tasks)
+                idx += len(chunk)
+            else:
+                # Normal: 1 at a time with inference lock
+                i, item = items[idx]
+                batch.current_index = i
+                async with _inference_lock:
+                    await _process_batch_item(batch, i, item)
+                idx += 1
 
         # Final status
         batch.completed_at = time.monotonic()
@@ -2647,7 +2668,6 @@ async def batch_worker() -> None:
         logger.info("Batch %s finished: %d/%d completed in %.1fs",
                      batch.id, batch.completed_count, batch.total, total_elapsed)
 
-        # Webhook callback
         if batch.callback_url:
             asyncio.create_task(_fire_batch_webhook(batch))
 

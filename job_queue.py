@@ -224,8 +224,15 @@ async def worker_loop(
     dispatch_fn: Callable,
     uploads: UploadStore,
     history: "HistoryStore | None" = None,
+    turbo_check: Callable[[], bool] | None = None,
 ) -> None:
-    """Background worker that processes jobs from the queue."""
+    """Background worker that processes jobs from the queue.
+
+    In turbo mode (turbo_check returns True), the inference lock is SKIPPED
+    because SplitModelManager._acquire_worker() handles per-GPU serialization
+    via worker.lock. This allows 2 worker_loop instances to dispatch 2 video
+    jobs concurrently on 2 GPUs.
+    """
     logger.info("Queue worker started")
     while True:
         job_id = await queue.get()
@@ -241,8 +248,14 @@ async def worker_loop(
 
         result_bytes: bytes | None = None
         try:
-            async with inference_lock:
+            if turbo_check and turbo_check():
+                # Turbo: skip inference lock — 2 LTX workers handle per-GPU
+                # serialization via SplitModelManager._acquire_worker(). Both
+                # worker_loop instances can dispatch concurrently.
                 result_bytes = await dispatch_fn(job)
+            else:
+                async with inference_lock:
+                    result_bytes = await dispatch_fn(job)
 
             # Dispatch returned bytes; the final step is moving them into the
             # upload store and flipping status. Surface this as "saving" so

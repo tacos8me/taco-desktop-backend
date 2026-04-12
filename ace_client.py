@@ -20,6 +20,7 @@ Submit-poll-fetch flow:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import urllib.parse
@@ -218,8 +219,7 @@ class AceClient:
                 # (e.g. "/v1/audio?path=%2Fmnt%2F...%2Faudio.mp3").
                 result_str = r.get("result", "[]")
                 try:
-                    import json as _json
-                    result_items = _json.loads(result_str) if isinstance(result_str, str) else result_str
+                    result_items = json.loads(result_str) if isinstance(result_str, str) else result_str
                 except (ValueError, TypeError):
                     result_items = []
                 if not result_items or not isinstance(result_items, list):
