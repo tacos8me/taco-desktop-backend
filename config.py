@@ -100,6 +100,7 @@ JOB_RESULT_TTL_SECONDS = 600  # 10 minutes
 # Turbo mode — dual-GPU inference
 TURBO_GPU_DEVICES = ["cuda:0", "cuda:1"]   # devices available in turbo mode
 NORMAL_GPU_DEVICES = ["cuda:0"]             # devices in normal single-GPU mode
+AUTO_TURBO_IDLE_MINUTES = int(os.environ.get("AUTO_TURBO_IDLE_MINUTES", "30"))
 
 # Batch queue
 MAX_BATCH_QUEUE_DEPTH = 5                   # max concurrent batch submissions

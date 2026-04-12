@@ -66,6 +66,35 @@ _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None  # second worker_loop for concurrent dispatch
 
+# cuda:1 activity tracker for auto-turbo. Updated on every successful
+# JoyAI edit or ACE music completion. Initialized to now so the 30-min
+# idle timer doesn't fire immediately at startup.
+_last_cuda1_activity: float = time.monotonic()
+
+
+def _cuda1_idle_seconds() -> float:
+    """Seconds since last JoyAI/ACE activity on cuda:1."""
+    return time.monotonic() - _last_cuda1_activity
+
+
+def _touch_cuda1_activity() -> None:
+    """Mark cuda:1 as recently active (resets the auto-turbo idle timer)."""
+    global _last_cuda1_activity
+    _last_cuda1_activity = time.monotonic()
+
+
+async def _auto_exit_turbo_if_active(reason: str) -> None:
+    """If turbo is active, gracefully exit to reclaim cuda:1 for JoyAI/ACE.
+
+    Called by JoyAI-edit and music handlers instead of returning 503.
+    Blocks for ~15s while turbo exits, then the caller proceeds normally.
+    """
+    if _turbo_active:
+        logger.info("Auto-turbo exit: %s request reclaiming cuda:1 (idle timer will re-engage later)", reason)
+        async with _inference_lock:
+            await _exit_turbo_mode()
+        _touch_cuda1_activity()  # request arrival = activity
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -144,6 +173,7 @@ async def _run_music_job(job: Job) -> None:
         job.progress = 1.0
         job.phase = None
         elapsed = time.monotonic() - (job.started_at or job.created_at)
+        _touch_cuda1_activity()
         logger.info("Music job %s completed in %.1fs", job.id, elapsed)
     except AceError as exc:
         job.status = JobStatus.FAILED
@@ -226,8 +256,7 @@ async def _dispatch_job(job: Job) -> bytes:
             model = p.get("model", "flux2-klein")
             if model == "joyai-edit":
                 # JoyAI is on cuda:1 sidecar -- no GPU swap needed
-                if _turbo_active:
-                    raise JoyAIError("turbo_mode_active: JoyAI unavailable while turbo is enabled", 503)
+                await _auto_exit_turbo_if_active("joyai-edit")
                 if not config.LOAD_JOYAI:
                     raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
                 await joyai.load()  # idempotent — ensures sidecar pipeline is loaded on cuda:1
@@ -242,7 +271,7 @@ async def _dispatch_job(job: Job) -> bytes:
                 # set one phase transition. Client UIs will show "encoding" for
                 # the whole duration.
                 on_progress(0.90, phase="encoding")
-                return await joyai.edit(
+                result = await joyai.edit(
                     prompt=p["prompt"],
                     image_path=image_paths[0],
                     width=p["width"],
@@ -251,6 +280,8 @@ async def _dispatch_job(job: Job) -> bytes:
                     guidance_scale=p.get("guidance_scale", 4.0),
                     seed=p.get("seed"),
                 )
+                _touch_cuda1_activity()
+                return result
             else:
                 await _ensure_flux_ready()
                 torch.cuda.set_device(config.FLUX_DEVICE)
@@ -1385,12 +1416,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
     # joyai-edit routes to the out-of-process sidecar; the flux-backed
     # models still require LOAD_FLUX.
     if body.model == "joyai-edit":
-        if _turbo_active:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled. Disable turbo first."},
-                headers={"Retry-After": "10"},
-            )
+        await _auto_exit_turbo_if_active("joyai-edit (v1)")
         if len(body.image_uris) != 1:
             return _error(422, "joyai-edit requires exactly one image_uri")
         if not config.LOAD_JOYAI:
@@ -1461,12 +1487,7 @@ async def image_edit(body: ImageEditRequest) -> Response:
 async def generate_music(body: MusicGenerationRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
-    if _turbo_active:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled. Disable turbo first."},
-            headers={"Retry-After": "10"},
-        )
+    await _auto_exit_turbo_if_active("music (v1)")
     if not config.LOAD_ACE:
         return _error(503, "Music generation not enabled (LOAD_ACE=0)")
     # Validate task-type requirements
@@ -2664,6 +2685,26 @@ async def batch_worker() -> None:
 
         batch.status = BatchStatus.PROCESSING
         batch.started_at = time.monotonic()
+
+        # Auto-turbo: if cuda:1 has been idle long enough and the batch is
+        # large enough to benefit, engage dual-GPU mode automatically.
+        # Turbo persists until a JoyAI/ACE request reclaims cuda:1.
+        idle_min = _cuda1_idle_seconds() / 60
+        if (
+            not _turbo_active
+            and idle_min >= config.AUTO_TURBO_IDLE_MINUTES
+            and len(batch.items) >= 2
+        ):
+            logger.info(
+                "Auto-turbo: cuda:1 idle %.0f min, engaging for batch %s (%d items)",
+                idle_min, batch.id, len(batch.items),
+            )
+            try:
+                async with _inference_lock:
+                    await _enter_turbo_mode()
+            except Exception:
+                logger.warning("Auto-turbo entry failed — processing batch in single-GPU mode", exc_info=True)
+
         logger.info("Processing batch %s (%d items, turbo=%s)", batch.id, batch.total, _turbo_active)
 
         items = list(enumerate(batch.items))
