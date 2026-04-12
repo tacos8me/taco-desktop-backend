@@ -647,3 +647,122 @@ If all 3 retries fail, log a warning and move on. No dead-letter queue.
 7. **Webhook delivery** — optional, can be deferred.
 
 Each step is independently shippable. Steps 1-3 can be done without turbo mode (batches run on single GPU with normal swap).
+
+---
+
+## LTX Model Parameters Reference
+
+### Transformer states
+
+The `DenoiserWorker.ensure_transformer(state, user_lora)` method in `split_model_manager.py` manages six named transformer states. Each state specifies a base checkpoint and zero or more preset LoRAs fused at load time.
+
+| State | Checkpoint | LoRA | Strength | Used By |
+|-------|-----------|------|----------|---------|
+| `dev` | `ltx-2.3-22b-dev.safetensors` | none | -- | pro stage 1 (t2v, i2v, a2v), retake |
+| `distilled` | `ltx-2.3-22b-distilled.safetensors` | none | -- | fast i2v stage 1, fast a2v stage 1, fast t2v pass 2 |
+| `dev_lora` | `ltx-2.3-22b-dev.safetensors` | `distilled-lora-384` | 1.0 | pro/i2v/a2v stage 2 |
+| `dev_lora_025` | `ltx-2.3-22b-dev.safetensors` | `distilled-lora-384` | 0.25 | hq stage 1 |
+| `dev_lora_050` | `ltx-2.3-22b-dev.safetensors` | `distilled-lora-384` | 0.50 | hq stage 2 |
+| `dev_lora_020` | `ltx-2.3-22b-dev.safetensors` | `distilled-lora-384` | 0.20 | fast t2v pass 1 |
+
+All states use BF16 precision. LoRAs are fused via `LoraPathStrengthAndSDOps` with `LTXV_LORA_COMFY_RENAMING_MAP` at load time (permanent fusion -- no unfuse).
+
+### Model pipeline details
+
+**`ltx-2-3-fast` (text-to-video)** -- 2-pass split-schedule, 8 total steps, no CFG:
+
+1. Pass 1: `dev_lora_020` (dev + distilled LoRA @ 0.2), `simple_denoising_func`, first 4 steps of `DISTILLED_SIGMA_VALUES`
+2. Evict transformer, swap to `distilled`
+3. Pass 2: `distilled`, `simple_denoising_func`, last 4 steps of `DISTILLED_SIGMA_VALUES`
+4. Upsample 2x via spatial upscaler
+5. Stage 2: `distilled` (no swap -- already loaded), 5 distilled steps (`_STAGE_2_SIGMAS`), `simple_denoising_func`
+
+**`ltx-2-3-fast` (image-to-video / audio-to-video)** -- single-pass, 8 steps, no CFG:
+
+1. Stage 1: `distilled`, `simple_denoising_func`, 8 steps (`DISTILLED_SIGMA_VALUES`)
+2. Upsample 2x via spatial upscaler
+3. Stage 2: `distilled` (no swap), 5 distilled steps (`_STAGE_2_SIGMAS`), `simple_denoising_func`
+
+Note: i2v/a2v fast does NOT use the 2-pass split with `dev_lora_020`. Only t2v fast uses the split schedule.
+
+**`ltx-2-3-pro`** -- 2-stage, 30 euler steps + CFG + STG:
+
+1. Stage 1: `dev` (30 euler steps, `LTX2Scheduler` token-adapted sigmas, `multi_modal_guider_factory_denoising_func` with CFG + STG)
+2. Upsample 2x via spatial upscaler
+3. Stage 2: `dev_lora` (dev + distilled LoRA @ 1.0), 5 distilled steps (`_STAGE_2_SIGMAS`), `simple_denoising_func`
+
+**`ltx-2-3-hq`** -- 2-stage, res2s sampler, 15 steps + CFG + STG:
+
+1. Stage 1: `dev_lora_025` (dev + distilled LoRA @ 0.25), `Res2sDiffusionStep`, 15 res2s steps via `LTX2Scheduler` (NFE = 2 * 15 + 1 = 31), `multi_modal_guider_denoising_func` with CFG + STG
+2. Upsample 2x via spatial upscaler
+3. Stage 2: `dev_lora_050` (dev + distilled LoRA @ 0.50), 5 distilled steps (`_STAGE_2_SIGMAS`), res2s loop, `simple_denoising_func`
+
+**Retake** -- single-stage, 30 euler steps, dev transformer:
+
+1. Evict transformer to make room for VAE encode of input video
+2. `dev` transformer, 30 euler steps, `multi_modal_guider_denoising_func` with CFG + STG, temporal region masking
+
+### Sigma schedules
+
+```
+DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]  # 8 steps
+_STAGE_2_SIGMAS        = [0.909375, 0.727, 0.546, 0.364, 0.182, 0.0]                               # 5 steps
+```
+
+Stage 2 uses 5 steps instead of the upstream default of 3 (`STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]`). More steps resolve fast motion better during super-resolution.
+
+### User LoRA integration
+
+User-supplied LoRAs are appended to whatever preset LoRA tuple the state already defines. In `ensure_transformer`:
+
+```python
+if user_lora:
+    path, strength = user_lora
+    loras = loras + (LoraPathStrengthAndSDOps(
+        path=path, strength=strength,
+        sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+    ),)
+```
+
+The combined `loras` tuple is passed to `ModelLedger(... loras=loras)`, which fuses all adapters into the transformer at load time. Fusion is permanent -- there is no `unfuse` operation. Changing the LoRA file or strength requires a full transformer reload.
+
+Cache key is `(transformer_state, user_lora_tuple)` where `user_lora_tuple` is `(path, strength)` or `None`. A cache hit (same state + same user LoRA) skips the reload entirely.
+
+Request field: `lora: {id, strength}` on `TextToVideoRequest`, `ImageToVideoRequest`, `AudioToVideoRequest`, `RetakeRequest`. The `LoRAInput` Pydantic model defines `id: str` (resolved from `/v1/loras` registry) and `strength: float` (default 1.0, range 0.0--2.0).
+
+### Checkpoint file sizes
+
+All files in `/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/`:
+
+| File | Size |
+|------|------|
+| `ltx-2.3-22b-dev.safetensors` | 43 GB |
+| `ltx-2.3-22b-distilled.safetensors` | 43 GB |
+| `ltx-2.3-22b-distilled-lora-384.safetensors` | 7.1 GB |
+| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | 950 MB |
+| `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` | 950 MB |
+| `ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors` | 1.1 GB |
+| `ltx-2.3-temporal-upscaler-x2-1.0.safetensors` | 250 MB |
+
+Config references (`config.py`):
+- `DEV_CHECKPOINT` = `ltx-2.3-22b-dev.safetensors`
+- `DISTILLED_CHECKPOINT` = `ltx-2.3-22b-distilled.safetensors`
+- `DISTILLED_LORA` = `ltx-2.3-22b-distilled-lora-384.safetensors`
+- `SPATIAL_UPSAMPLER` = `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`
+
+### Auto-turbo
+
+The `AUTO_TURBO_IDLE_MINUTES` config (default: 30, env-overridable) controls automatic turbo mode engagement for batch processing.
+
+**Idle timer**: `_last_cuda1_activity` tracks the monotonic timestamp of the last JoyAI edit or ACE music completion. `_cuda1_idle_seconds()` returns the elapsed time since that event. Initialized to `time.monotonic()` at import so the 30-minute timer does not fire immediately at startup.
+
+**Auto-engage**: When `batch_worker` picks up a batch, it checks three conditions:
+1. Turbo is not already active
+2. cuda:1 idle time >= `AUTO_TURBO_IDLE_MINUTES`
+3. Batch has >= 2 items
+
+If all pass, it acquires `_inference_lock` and calls `_enter_turbo_mode()`. If turbo entry fails (ACE stop fails, etc.), the batch proceeds in single-GPU mode with a warning log.
+
+**Auto-exit**: When a JoyAI-edit or ACE music request arrives while turbo is active, `_auto_exit_turbo_if_active(reason)` gracefully exits turbo mode (~15s), then the request proceeds normally. This resets `_last_cuda1_activity`, so the idle timer restarts from zero.
+
+**Flow**: idle 30 min -> batch arrives -> auto-engage turbo -> batch runs on dual GPU -> JoyAI/ACE request arrives -> auto-exit turbo -> cuda:1 returns to ACE/JoyAI -> idle timer restarts.
