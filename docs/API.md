@@ -6,6 +6,8 @@
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
 
 > 🚀 **New to the API?** Start with **[docs/QUICKSTART.md](./QUICKSTART.md)** — a 5-minute guide for frontend devs. This doc is the exhaustive spec.
+>
+> **See also:** [GPU architecture & swap protocol](./gpu-architecture.md) · [Model specs & latency](./models.md) · [Configuration & env vars](./configuration.md)
 
 > **Maintenance rule:** Any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes) MUST update this file in the same commit. This doc is the contract.
 
@@ -1039,6 +1041,14 @@ Returns the full-size generation. Media type is `video/mp4` for video jobs, `ima
 ### `GET /v2/history/{generation_id}/thumbnail`
 
 Returns `image/jpeg` (256 px wide). For video jobs, the thumbnail is the first frame extracted via PyAV. `404` if no thumbnail was produced (very old entries, or decode failures).
+
+### `DELETE /v2/history/{generation_id}`
+
+Removes a history entry and its associated result/thumbnail files. Scoped to the caller's API key — returns `404` both when the entry doesn't exist and when it belongs to another key (so the ID space can't be probed).
+
+- `200 {"ok": true}` on success.
+- `401` if no API key.
+- `404` if not found or owned by another key.
 
 ---
 
