@@ -188,9 +188,20 @@ class HistoryStore:
         key_hash = _hash_key(api_key)
         # Support category shortcuts: "image" → all image types, "video" → all video types
         if job_type == "image":
+            # NOTE: `LIKE '%-image%'` (the previous filter) silently dropped
+            # every `image-edit` row because that type doesn't contain a
+            # dash before "image" — only `text-to-image` and `image-to-image`
+            # match the leading-dash pattern. With the joyai-edit char
+            # rotation work that's thousands of missing rows per user.
+            #
+            # Correct intent: "all image-producing types, excluding video".
+            # `image-to-video` also mentions "image", so we have to exclude
+            # video explicitly rather than assume "image in the name = still".
             rows = self._conn.execute(
                 """SELECT * FROM generations
-                   WHERE api_key_hash = ? AND job_type LIKE '%-image%'
+                   WHERE api_key_hash = ?
+                     AND job_type LIKE '%image%'
+                     AND job_type NOT LIKE '%video%'
                    ORDER BY created_at DESC LIMIT ? OFFSET ?""",
                 (key_hash, limit, offset),
             ).fetchall()
