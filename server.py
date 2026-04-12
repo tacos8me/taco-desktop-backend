@@ -1068,18 +1068,46 @@ async def _ace_systemctl(action: str) -> None:
     )
 
 
+_turbo_manager: SplitModelManager | None = None  # independent LTX instance on cuda:1
+
+
+async def _dispatch_job_turbo(job: Job) -> bytes:
+    """Route a job to the TURBO manager (cuda:1). Same as _dispatch_job but
+    uses _turbo_manager instead of manager, and only supports video types."""
+    p = job.params
+
+    def on_progress(progress: float, phase: str | None = None) -> None:
+        if job.status == JobStatus.CANCELLED:
+            return
+        job.progress = progress
+        if phase is not None:
+            job.phase = phase
+
+    torch.cuda.set_device("cuda:1")
+    match job.type:
+        case JobType.TEXT_TO_VIDEO:
+            return await _turbo_manager.generate_text_to_video(**p, on_progress=on_progress)
+        case JobType.IMAGE_TO_VIDEO:
+            return await _turbo_manager.generate_image_to_video(**p, on_progress=on_progress)
+        case JobType.AUDIO_TO_VIDEO:
+            return await _turbo_manager.generate_audio_to_video(**p, on_progress=on_progress)
+        case JobType.RETAKE:
+            return await _turbo_manager.retake(**p, on_progress=on_progress)
+        case _:
+            raise ValueError(f"Turbo mode only supports video jobs, got {job.type}")
+
+
 async def _enter_turbo_mode() -> None:
-    """Enable dual-GPU LTX: 2 denoiser workers, 2 video jobs at a time.
+    """Enable turbo: load a SECOND independent LTX pipeline on cuda:1.
 
-    cuda:0 gets encoder hub + denoiser worker 0.
-    cuda:1 gets denoiser worker 1 (shares encoder hub on cuda:0 for text encoding).
-    A second worker_loop is started so the queue can dispatch 2 jobs concurrently.
-    SplitModelManager._acquire_worker() handles per-GPU serialization.
+    Two completely separate SplitModelManager instances — no shared state,
+    no cross-GPU tensor transfers. Each GPU runs its own full pipeline.
+    A second worker_loop dispatches to _turbo_manager on cuda:1.
 
-    Flux, ACE, and JoyAI are ALL unavailable during turbo — their requests get 503.
+    Flux, ACE, and JoyAI are unavailable during turbo.
     Caller must hold _inference_lock.
     """
-    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
+    global _turbo_active, _turbo_worker_task, _turbo_manager, _last_gpu_tenant
 
     if _turbo_active:
         return  # idempotent
@@ -1101,33 +1129,36 @@ async def _enter_turbo_mode() -> None:
         except JoyAIError:
             logger.warning("Turbo: JoyAI unload failed — continuing (non-critical)")
 
-    # Step 3: Evict Flux from cuda:0 (LTX needs full GPU for encoder hub + denoiser)
+    # Step 3: Evict Flux from cuda:0 (LTX needs full GPU)
     flux.unload()
 
-    # Step 4: Load dual-GPU LTX — encoder hub on cuda:0, 2 denoiser workers
-    manager.evict_all()
-    config.GPU_DEVICES = config.TURBO_GPU_DEVICES  # ["cuda:0", "cuda:1"]
-    manager.load_all()
+    # Step 4: Load a SECOND independent LTX pipeline on cuda:1.
+    # Temporarily override GPU_DEVICES so the new manager loads on cuda:1.
+    saved_devices = config.GPU_DEVICES
+    config.GPU_DEVICES = ["cuda:1"]
+    _turbo_manager = SplitModelManager()
+    _turbo_manager.load_all()
+    config.GPU_DEVICES = saved_devices  # restore for primary manager
     _last_gpu_tenant = "ltx"
 
-    # Step 5: Start a second worker loop so the queue can dispatch 2 jobs concurrently.
-    # Both workers pull from _job_queue. In turbo mode, worker_loop skips _inference_lock
-    # because SplitModelManager._acquire_worker() serializes per-GPU via worker.lock.
+    # Step 5: Start a second worker_loop dispatching to _turbo_manager.
+    # Both workers pull from _job_queue. The turbo worker skips _inference_lock
+    # because it uses a completely independent manager + GPU.
     _turbo_active = True
     _turbo_worker_task = asyncio.create_task(
-        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo, uploads, history,
                     turbo_check=lambda: _turbo_active),
         name="turbo-worker",
     )
-    logger.info("TURBO MODE ON: 2 LTX workers on %s, 2 concurrent video jobs", config.TURBO_GPU_DEVICES)
+    logger.info("TURBO MODE ON: 2 independent LTX pipelines (cuda:0 + cuda:1), 2 concurrent video jobs")
 
 
 async def _exit_turbo_mode() -> None:
-    """Restore single-GPU mode: 1 LTX worker on cuda:0, ACE+JoyAI back on cuda:1.
+    """Destroy the second LTX pipeline, restore cuda:1 for ACE+JoyAI.
 
     Caller must hold _inference_lock.
     """
-    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
+    global _turbo_active, _turbo_worker_task, _turbo_manager, _last_gpu_tenant
 
     if not _turbo_active:
         return  # idempotent
@@ -1141,10 +1172,13 @@ async def _exit_turbo_mode() -> None:
             pass
         _turbo_worker_task = None
 
-    # Step 2: Evict dual-GPU LTX, restore single-GPU config
-    manager.evict_all()
-    config.GPU_DEVICES = config.NORMAL_GPU_DEVICES  # ["cuda:0"]
-    manager.load_all()
+    # Step 2: Destroy the second LTX pipeline, free cuda:1
+    if _turbo_manager is not None:
+        _turbo_manager.evict_all()
+        _turbo_manager = None
+    import gc; gc.collect()
+    torch.cuda.synchronize(torch.device("cuda:1"))
+    torch.cuda.empty_cache()
     _last_gpu_tenant = "ltx"
 
     # Step 3: Reload ACE on cuda:1
@@ -2655,10 +2689,11 @@ async def _fire_batch_webhook(batch: BatchJob) -> None:
     logger.warning("Batch %s webhook failed after 3 retries to %s", batch.id, batch.callback_url)
 
 
-async def _process_batch_item(batch, i: int, item) -> None:
+async def _process_batch_item(batch, i: int, item, dispatch_fn=None) -> None:
     """Process a single batch item. Used by both turbo (no lock) and normal mode.
 
-    In turbo mode, SplitModelManager._acquire_worker() serializes per-GPU.
+    In turbo mode, `dispatch_fn` alternates between _dispatch_job (cuda:0)
+    and _dispatch_job_turbo (cuda:1) so 2 items run on different GPUs.
     In normal mode, the caller holds _inference_lock before calling this.
     """
     t0 = time.monotonic()
@@ -2670,7 +2705,8 @@ async def _process_batch_item(batch, i: int, item) -> None:
                 await _ensure_flux_ready()
             else:
                 await _ensure_ltx_resident()
-        result_bytes = await _dispatch_job(job)
+        fn = dispatch_fn or _dispatch_job
+        result_bytes = await fn(job)
 
         upload_id, storage_uri = uploads.create()
         uploads.save(upload_id, result_bytes)
@@ -2753,10 +2789,15 @@ async def batch_worker() -> None:
                 break
 
             if _turbo_active:
-                # Turbo: dispatch 2 items concurrently (one per GPU worker)
+                # Turbo: dispatch 2 items concurrently — one on each GPU.
+                # First item → _dispatch_job (cuda:0), second → _dispatch_job_turbo (cuda:1).
                 chunk = items[idx:idx+2]
                 batch.current_index = chunk[0][0]
-                tasks = [_process_batch_item(batch, i, item) for i, item in chunk]
+                dispatchers = [_dispatch_job, _dispatch_job_turbo]
+                tasks = [
+                    _process_batch_item(batch, i, item, dispatch_fn=dispatchers[ci])
+                    for ci, (i, item) in enumerate(chunk)
+                ]
                 await asyncio.gather(*tasks)
                 idx += len(chunk)
             else:
