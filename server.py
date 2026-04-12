@@ -154,6 +154,13 @@ async def _run_music_job(job: Job) -> None:
     job.phase = "generating"
     result_bytes: bytes | None = None
     try:
+        # Free JoyAI's 50 GB on cuda:1 if loaded — gives ACE more headroom.
+        # joyai.load() before the next edit request will reload it on demand.
+        try:
+            await joyai.unload()
+        except Exception:
+            pass
+
         p = job.params
         ace_params = _build_ace_params(p)
         est = _estimate_music_time(p)
@@ -1605,6 +1612,11 @@ async def generate_music(body: MusicGenerationRequest) -> Response:
     params.pop("source_audio_uri", None)
     params.pop("reference_audio_uri", None)
     try:
+        # Free JoyAI's 50 GB on cuda:1 — reloads on next joyai-edit request
+        try:
+            await joyai.unload()
+        except Exception:
+            pass
         ace_params = _build_ace_params(params)
         audio_bytes = await ace.generate(params=ace_params)
         media_type = _AUDIO_MEDIA_TYPES.get(body.audio_format, "audio/mpeg")
