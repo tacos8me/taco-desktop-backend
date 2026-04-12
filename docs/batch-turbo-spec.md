@@ -47,10 +47,10 @@ class BatchRequest(BaseModel):
 @dataclass
 class BatchJob:
     id: str                          # batch_xxx (different prefix from job IDs)
-    items: list[BatchItem]
-    status: BatchStatus              # queued | processing | completed | partial | failed | cancelled
-    api_key: str
-    created_at: float
+    items: list[BatchItem]           # list[Any] in code to avoid circular import
+    status: BatchStatus = BatchStatus.QUEUED
+    api_key: str = ""
+    created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
     completed_at: float | None = None
     total: int = 0                   # len(items)
@@ -59,6 +59,8 @@ class BatchJob:
     current_index: int = 0           # which item is currently running
     results: list[BatchItemResult] = field(default_factory=list)
     turbo: bool = False              # was turbo mode active when batch started?
+    priority: str = "normal"
+    callback_url: str | None = None
 
 class BatchStatus(StrEnum):
     QUEUED = "queued"
@@ -72,7 +74,7 @@ class BatchStatus(StrEnum):
 class BatchItemResult:
     index: int
     type: str
-    status: Literal["completed", "failed", "cancelled"]
+    status: str  # "completed" | "failed" | "cancelled"
     result_uri: str | None = None
     media_type: str | None = None
     error: str | None = None
@@ -82,6 +84,25 @@ class BatchItemResult:
 ---
 
 ## 2. `POST /v2/batch` — Submit batch
+
+### Supported item types
+
+| `type` | Pydantic validator | LoRA registry | Notes |
+|--------|--------------------|---------------|-------|
+| `text-to-image` | `TextToImageRequest` | `flux_lora_registry` | `width`/`height` snapped to multiples of 16 |
+| `image-to-image` | `ImageToImageRequest` | `flux_lora_registry` | `image_uri` resolved to filesystem path |
+| `image-edit` | `ImageEditRequest` | `flux_lora_registry` | `image_uris` resolved to filesystem paths |
+| `text-to-video` | `TextToVideoRequest` | `lora_registry` | `resolution` + `duration` converted to `width`/`height`/`num_frames` |
+| `image-to-video` | `ImageToVideoRequest` | `lora_registry` | `resolution` + `duration` converted; `image_uri` resolved |
+
+### Param preprocessing (`_batch_item_to_job`)
+
+The batch endpoint applies the same preprocessing as the individual v2 handlers before creating a `Job` for dispatch:
+
+1. **LoRA resolution**: `lora: {id, strength}` is resolved to `lora_path` (filesystem path) + `lora_strength` (float) via the appropriate registry (Flux LoRA for image types, LTX LoRA for video types). Unknown LoRA IDs raise `ValueError`, failing the item.
+2. **Video params**: `resolution` (e.g. `"1920x1080"`) is converted to `width`/`height`. `duration` (seconds) is converted to `num_frames` via `_duration_to_frames(duration, fps)`. `camera_motion` is appended to the prompt as `[camera_motion]`. `seed` is auto-generated if missing. `generate_audio` defaults to `false`.
+3. **Image params**: `width`/`height` are snapped to multiples of 16. `seed` is auto-generated if missing.
+4. **URI resolution**: `image_uri` (image-to-image, image-to-video) and `image_uris` (image-edit) are resolved from `storage://` URIs to filesystem paths.
 
 ### Request
 
@@ -94,11 +115,112 @@ Content-Type: application/json
   "items": [
     {"type": "text-to-image", "params": {"prompt": "...", "model": "flux2-klein", "width": 1024, "height": 1024}},
     {"type": "text-to-image", "params": {"prompt": "...", "model": "flux2-klein", "width": 1024, "height": 1024}},
-    {"type": "text-to-video", "params": {"prompt": "...", "model": "ltx-2-3-fast", "resolution": "1920x1080", "duration": 5}}
+    {"type": "text-to-video", "params": {"prompt": "...", "model": "ltx-2-3-fast", "resolution": "1920x1080", "duration": 5, "fps": 24}}
   ],
   "priority": "normal"
 }
 ```
+
+### Example: batch with LoRA (video)
+
+```json
+{
+  "items": [
+    {
+      "type": "text-to-video",
+      "params": {
+        "prompt": "A person walking through a forest",
+        "model": "ltx-2-3-fast",
+        "resolution": "1920x1080",
+        "duration": 5,
+        "fps": 24,
+        "lora": {"id": "my-style-lora", "strength": 0.8}
+      }
+    },
+    {
+      "type": "text-to-video",
+      "params": {
+        "prompt": "A bird flying over mountains",
+        "model": "ltx-2-3-fast",
+        "resolution": "1920x1080",
+        "duration": 3,
+        "fps": 24,
+        "lora": {"id": "my-style-lora", "strength": 0.8}
+      }
+    }
+  ]
+}
+```
+
+The `lora.id` must match an ID from `GET /v1/loras` (for video types) or `GET /v1/flux-loras` (for image types). The server resolves IDs to filesystem paths internally via `_batch_item_to_job`. LoRA strength changes between items are free for Flux (adapter mode), but cause a full transformer reload for LTX (fusion mode).
+
+### Example: batch with LoRA (image)
+
+```json
+{
+  "items": [
+    {
+      "type": "text-to-image",
+      "params": {
+        "prompt": "A portrait in oil painting style",
+        "model": "flux2-dev",
+        "width": 1024,
+        "height": 1024,
+        "turbo": true,
+        "lora": {"id": "oil-painting", "strength": 0.7}
+      }
+    },
+    {
+      "type": "image-edit",
+      "params": {
+        "prompt": "Make the background a sunset",
+        "model": "flux2-klein",
+        "image_uris": ["storage://abc123"],
+        "width": 1024,
+        "height": 1024
+      }
+    }
+  ]
+}
+```
+
+### Example: mixed batch (images + videos)
+
+```json
+{
+  "items": [
+    {
+      "type": "text-to-image",
+      "params": {"prompt": "A cat on a roof", "model": "flux2-klein", "width": 1024, "height": 1024}
+    },
+    {
+      "type": "image-to-video",
+      "params": {
+        "prompt": "The cat jumps down from the roof",
+        "image_uri": "storage://def456",
+        "model": "ltx-2-3-fast",
+        "resolution": "1920x1080",
+        "duration": 4,
+        "fps": 24
+      }
+    }
+  ]
+}
+```
+
+Note: the server sorts items by type before processing (all images first, then all videos) to minimize GPU swaps. Within image items, Klein items are sorted before Dev to minimize Flux model reloads.
+
+### Per-type required params
+
+**text-to-image**: `prompt`, `model` (`flux2-dev` | `flux2-klein`), `width`, `height`. Optional: `num_inference_steps`, `guidance_scale`, `seed`, `turbo`, `lora`.
+
+**image-to-image**: `prompt`, `image_uri`, `model`, `width`, `height`. Optional: `num_inference_steps`, `guidance_scale`, `seed`, `turbo`, `lora`.
+
+**image-edit**: `prompt`, `image_uris` (list of `storage://` URIs), `model`. Optional: `width`, `height`, `num_inference_steps`, `guidance_scale`, `seed`, `lora`.
+
+**text-to-video**: `prompt`, `model` (`ltx-2-3-fast` | `ltx-2-3-pro` | `ltx-2-3-hq`), `resolution`, `duration`, `fps`. Optional: `generate_audio`, `camera_motion`, `lora`, `enhance_prompt`.
+
+**image-to-video**: `prompt`, `model`, `resolution`, `duration`, `fps`. Either `image_uri` or `keyframes` required. Optional: `image_strength`, `generate_audio`, `lora`, `enhance_prompt`.
 
 ### Response — `202 Accepted`
 
@@ -115,7 +237,7 @@ Content-Type: application/json
 
 | Status | Condition |
 |--------|-----------|
-| 400 | Empty items list, invalid item type |
+| 400 | Invalid item type |
 | 422 | Invalid params on any item (validated eagerly before queuing) |
 | 429 | Batch queue full (`MAX_BATCH_QUEUE_DEPTH` exceeded). `Retry-After: 30` |
 | 503 | System paused. `Retry-After: 300` |
@@ -123,6 +245,8 @@ Content-Type: application/json
 ### Validation strategy
 
 Validate all items eagerly on submission (parse each `params` dict through the corresponding Pydantic model: `TextToImageRequest`, `ImageToVideoRequest`, etc.). If any item fails validation, reject the entire batch with the index + error. This prevents queuing a batch that will partially fail on item 47 of 50.
+
+Note: validation catches schema errors (missing required fields, wrong types, out-of-range values) but does NOT validate LoRA IDs or `storage://` URIs at submission time. These are resolved at dispatch time by `_batch_item_to_job` and will fail the individual item (not the whole batch) if invalid.
 
 ---
 
@@ -174,67 +298,50 @@ Cancels remaining items. Already-completed items are preserved. Returns:
 
 ## 4. `_enter_turbo_mode()` — Claim dual GPU
 
-This is the sequence of operations to enter turbo mode (claim cuda:1 for taco-backend inference alongside cuda:0):
+Turbo mode uses an **LTX sidecar** (a separate process managed via systemctl) to run video jobs on cuda:1, while Flux/LTX image jobs continue on cuda:0 in-process. This avoids moving Flux between GPUs and the complexity of dual in-process managers.
 
 ```python
 async def _enter_turbo_mode() -> None:
-    """Claim cuda:1 for inference. Caller must hold _inference_lock."""
-    global _turbo_active
+    """Enable turbo: tell the LTX sidecar to load its pipeline on cuda:1.
+    Caller must hold _inference_lock."""
+    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
 
     if _turbo_active:
         return  # idempotent
 
-    # Step 1: Unload ACE from cuda:1
-    # ACE runs as an external sidecar (like JoyAI). Ask it to release GPU memory.
-    try:
-        await ace_client.unload()  # POST /unload to ACE sidecar
-        logger.info("Turbo: ACE unloaded from cuda:1")
-    except Exception:
-        logger.exception("Turbo: ACE unload failed — aborting turbo entry")
-        raise RuntimeError("turbo_entry_failed: could not unload ACE from cuda:1")
+    # Step 1: Stop ACE on cuda:1 (via systemctl, not HTTP)
+    if config.LOAD_ACE:
+        await _ace_systemctl("stop")
 
     # Step 2: Unload JoyAI from cuda:1
-    try:
-        await joyai.unload()
-        logger.info("Turbo: JoyAI unloaded from cuda:1")
-    except JoyAIError:
-        logger.warning("Turbo: JoyAI unload failed — continuing (non-critical)")
+    if config.LOAD_JOYAI:
+        await joyai.unload()  # non-critical, logged warning on failure
 
-    # Step 3: Verify cuda:1 is free
-    # Quick nvidia-smi check: cuda:1 should be < 1 GB used
-    free_mb = _get_gpu_free_mb(1)
-    if free_mb < 90_000:  # 90 GB threshold on a 96 GB card
-        logger.warning("Turbo: cuda:1 has only %d MB free after unloads", free_mb)
+    # Step 3: Evict Flux from cuda:0 (LTX needs full GPU)
+    flux.unload()
 
-    # Step 4: Update device config for dual-GPU
-    # LTX stays on cuda:0, Flux moves to cuda:1 (or vice versa — see topology note)
-    config.FLUX_DEVICE = "cuda:1"
-    flux.unload()  # Unload from cuda:0
-    flux.load(device="cuda:1")  # Reload on cuda:1
+    # Step 4: Tell the LTX sidecar to load its pipeline on cuda:1
+    await ltx_sidecar.load()
 
-    # Step 5: Disable mutual exclusion — both can run concurrently now
+    # Step 5: Start a second worker_loop dispatching to the sidecar
     _turbo_active = True
-    logger.info("Turbo mode ACTIVE: Flux on cuda:1, LTX on cuda:0")
+    _turbo_worker_task = asyncio.create_task(
+        worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo, ...),
+        name="turbo-worker",
+    )
 ```
 
-### Why Flux moves (not LTX)
+### Why the sidecar approach (not in-process)
 
-LTX's `SplitModelManager` is deeply wired to `GPU_DEVICES[0]` and reloading it is expensive (25-30s cold). Flux's `enable_model_cpu_offload(device=...)` accepts a device argument, making it trivial to redirect. Moving Flux to cuda:1 costs ~15-60s for the first forward pass (offload hook setup), but subsequent requests are fast.
+LTX's `SplitModelManager` is deeply wired to `GPU_DEVICES[0]`. Running a second in-process LTX manager on cuda:1 would require duplicating the entire encoder hub + transformer state. Instead, the LTX sidecar is a separate lightweight process that runs the same LTX pipeline independently on cuda:1. Communication is via HTTP (`ltx_sidecar_client.py`). Flux is evicted during turbo because the sidecar + in-process LTX both need GPU memory; Flux lazy-reloads on the first post-turbo image request.
 
 ### Concurrent dispatch in turbo mode
 
-When `_turbo_active`, the dispatcher needs two independent locks:
+In turbo mode, two workers pull from the same `_job_queue`:
+- The primary `worker_loop` dispatches via `_dispatch_job` (in-process, cuda:0)
+- The turbo `worker_loop` dispatches via `_dispatch_job_turbo` (HTTP to sidecar, cuda:1)
 
-```python
-_flux_lock = asyncio.Lock()   # guards cuda:1 during turbo
-_ltx_lock  = asyncio.Lock()   # guards cuda:0 during turbo
-```
-
-The existing `_inference_lock` is still used for non-turbo mode and for turbo entry/exit (mode transitions). In turbo mode, the worker loop routes:
-- `IMAGE_*` jobs -> acquire `_flux_lock`, run on cuda:1
-- `VIDEO_*` jobs -> acquire `_ltx_lock`, run on cuda:0
-
-This allows one image and one video job to run concurrently.
+For batch processing specifically, the `batch_worker` dispatches 2 items concurrently via `asyncio.gather`: one to `_dispatch_job` (cuda:0) and one to `_dispatch_job_turbo` (cuda:1).
 
 ---
 
@@ -242,128 +349,96 @@ This allows one image and one video job to run concurrently.
 
 ```python
 async def _exit_turbo_mode() -> None:
-    """Release cuda:1 back to ACE/JoyAI. Caller must hold _inference_lock."""
-    global _turbo_active
+    """Unload the LTX sidecar pipeline, restore cuda:1 for ACE+JoyAI.
+    Caller must hold _inference_lock."""
+    global _turbo_active, _turbo_worker_task
 
     if not _turbo_active:
         return  # idempotent
 
-    # Step 1: Wait for any in-flight turbo jobs to finish
-    # (caller should ensure both _flux_lock and _ltx_lock are free)
+    # Step 1: Cancel the second worker loop
+    if _turbo_worker_task is not None:
+        _turbo_worker_task.cancel()
+        await _turbo_worker_task  # swallow CancelledError
 
-    # Step 2: Unload Flux from cuda:1
-    flux.unload()
+    # Step 2: Tell the sidecar to free cuda:1 GPU memory
+    await ltx_sidecar.unload()
 
-    # Step 3: Restore single-GPU config
-    config.FLUX_DEVICE = "cuda:0"
-    # Do NOT eagerly reload Flux on cuda:0 — lazy load on next image request
+    # Step 3: Restart ACE on cuda:1 (via systemctl)
+    if config.LOAD_ACE:
+        await _ace_systemctl("start")
 
-    # Step 4: Reload ACE on cuda:1
-    try:
-        await ace_client.load()
-        logger.info("Turbo exit: ACE reloaded on cuda:1")
-    except Exception:
-        logger.warning("Turbo exit: ACE reload failed — will retry on next request")
-
-    # Step 5: Reload JoyAI on cuda:1
+    # Step 4: Reload JoyAI on cuda:1
     if config.LOAD_JOYAI:
-        try:
-            await joyai.load()
-            logger.info("Turbo exit: JoyAI reloaded on cuda:1")
-        except JoyAIError:
-            logger.warning("Turbo exit: JoyAI reload failed — non-critical")
+        await joyai.load()
 
     _turbo_active = False
-    logger.info("Turbo mode DEACTIVATED: single-GPU swap restored")
 ```
 
 ---
 
 ## 6. `batch_worker()` coroutine
 
-The batch worker runs alongside the existing `worker_loop`. It processes items from a separate `_batch_queue`.
+The batch worker runs alongside the existing `worker_loop`. It processes items from a separate `_batch_queue`. Individual items are processed by `_process_batch_item()`, which handles job creation, dispatch, result storage, and error handling.
 
 ```python
-async def batch_worker(
-    batch_store: BatchStore,
-    queue: asyncio.Queue[str],
-    inference_lock: asyncio.Lock,
-    dispatch_fn: Callable,
-    uploads: UploadStore,
-    history: HistoryStore | None = None,
-) -> None:
-    """Background worker that processes batches from the batch queue."""
-    logger.info("Batch worker started")
+async def batch_worker() -> None:
+    """Background worker that processes batches from the batch queue.
+
+    In turbo mode: dispatches 2 items concurrently via asyncio.gather
+    (one to _dispatch_job on cuda:0, one to _dispatch_job_turbo on cuda:1).
+
+    In normal mode: dispatches 1 item at a time, holding _inference_lock,
+    with swap logic (_ensure_ltx_resident / _ensure_flux_ready).
+    """
     while True:
-        batch_id = await queue.get()
+        batch_id = await _batch_queue.get()
         batch = batch_store.get(batch_id)
         if batch is None or batch.status == BatchStatus.CANCELLED:
-            queue.task_done()
+            _batch_queue.task_done()
             continue
 
         batch.status = BatchStatus.PROCESSING
         batch.started_at = time.monotonic()
-        logger.info("Processing batch %s (%d items)", batch.id, batch.total)
 
-        for i, item in enumerate(batch.items):
-            # Check cancellation between items
+        # Auto-turbo: if cuda:1 idle long enough, engage dual-GPU
+        idle_min = _cuda1_idle_seconds() / 60
+        if (not _turbo_active
+            and idle_min >= config.AUTO_TURBO_IDLE_MINUTES
+            and len(batch.items) >= 2):
+            try:
+                async with _inference_lock:
+                    await _enter_turbo_mode()
+            except Exception:
+                pass  # proceed in single-GPU mode
+
+        items = list(enumerate(batch.items))
+        idx = 0
+        while idx < len(items):
             if batch.status == BatchStatus.CANCELLED:
-                # Mark remaining as cancelled
-                for j in range(i, len(batch.items)):
+                for j in range(idx, len(items)):
                     batch.results.append(BatchItemResult(
-                        index=j, type=batch.items[j].type,
-                        status="cancelled",
-                    ))
+                        index=items[j][0], type=items[j][1].type,
+                        status="cancelled"))
                 break
 
-            batch.current_index = i
-            t0 = time.monotonic()
-
-            try:
-                # Build a synthetic Job for the dispatch function
-                job = _batch_item_to_job(item, batch.api_key)
-
-                if batch.turbo and _turbo_active:
-                    # Turbo: pick the right per-device lock
-                    lock = _flux_lock if _is_image_type(item.type) else _ltx_lock
-                else:
-                    lock = inference_lock
-
-                async with lock:
-                    if not batch.turbo:
-                        # Single-GPU: ensure correct tenant
-                        if _is_image_type(item.type):
-                            await _ensure_flux_ready()
-                        else:
-                            await _ensure_ltx_resident()
-                    result_bytes = await dispatch_fn(job)
-
-                # Save result
-                upload_id, storage_uri = uploads.create()
-                uploads.save(upload_id, result_bytes)
-                elapsed = time.monotonic() - t0
-
-                batch.results.append(BatchItemResult(
-                    index=i, type=item.type, status="completed",
-                    result_uri=storage_uri,
-                    media_type=_MEDIA_TYPES.get(JobType(item.type), "application/octet-stream"),
-                    elapsed_s=round(elapsed, 2),
-                ))
-                batch.completed_count += 1
-
-                # Fire-and-forget history save
-                if history and batch.api_key:
-                    asyncio.create_task(_save_batch_item_history(
-                        history, job, result_bytes, storage_uri))
-
-            except Exception as exc:
-                elapsed = time.monotonic() - t0
-                batch.results.append(BatchItemResult(
-                    index=i, type=item.type, status="failed",
-                    error=str(exc)[:500], elapsed_s=round(elapsed, 2),
-                ))
-                batch.failed_count += 1
-                logger.exception("Batch %s item %d failed", batch.id, i)
+            if _turbo_active:
+                # Turbo: 2 items concurrently — cuda:0 + cuda:1 (sidecar)
+                chunk = items[idx:idx+2]
+                dispatchers = [_dispatch_job, _dispatch_job_turbo]
+                tasks = [
+                    _process_batch_item(batch, i, item, dispatch_fn=dispatchers[ci])
+                    for ci, (i, item) in enumerate(chunk)
+                ]
+                await asyncio.gather(*tasks)
+                idx += len(chunk)
+            else:
+                # Normal: 1 at a time with inference lock
+                i, item = items[idx]
+                batch.current_index = i
+                async with _inference_lock:
+                    await _process_batch_item(batch, i, item)
+                idx += 1
 
         # Final status
         batch.completed_at = time.monotonic()
@@ -375,15 +450,9 @@ async def batch_worker(
             else:
                 batch.status = BatchStatus.PARTIAL
 
-        total_elapsed = batch.completed_at - (batch.started_at or batch.created_at)
-        logger.info("Batch %s finished: %d/%d completed in %.1fs",
-                     batch.id, batch.completed_count, batch.total, total_elapsed)
-
-        # Webhook callback
         if batch.callback_url:
             asyncio.create_task(_fire_batch_webhook(batch))
-
-        queue.task_done()
+        _batch_queue.task_done()
 ```
 
 ### Swap optimization
@@ -562,23 +631,18 @@ Possible failure modes and handling:
 
 | Failure | Recovery |
 |---------|----------|
-| ACE `POST /unload` returns 500 | Abort turbo entry. Return 500 to client. Log error. Do NOT partially claim cuda:1. |
-| ACE sidecar unreachable (network timeout) | Same as above — treat as failure, do not enter turbo. |
-| JoyAI unload fails | Continue — JoyAI is non-critical. Log warning. cuda:1 memory may be partially claimed. |
-| cuda:1 still has >6 GB used after unloads | Log warning but proceed. Flux's `enable_model_cpu_offload` will page in/out, so partial occupancy is survivable (just slower). |
-| Flux fails to load on cuda:1 | Abort turbo. Restore ACE on cuda:1. Return 500. |
+| ACE `systemctl stop` fails | Abort turbo entry. Return 500 to client. Log error. Do NOT partially claim cuda:1. |
+| JoyAI unload fails | Continue — JoyAI is non-critical. Log warning. |
+| LTX sidecar `load()` fails | Abort turbo. Restart ACE on cuda:1. Return 500. |
+| LTX sidecar unreachable | Same as above — treat as failure, do not enter turbo. |
 
-Turbo entry is atomic from the client's perspective: either fully succeeds (200) or fully fails (500) with rollback.
+Turbo entry is atomic from the client's perspective: either fully succeeds (200) or fully fails (500) with rollback. For auto-turbo (batch_worker), a failed entry logs a warning and the batch proceeds in single-GPU mode.
 
 ### 10.3 ACE/JoyAI request during turbo mode
 
-When turbo is active, ACE and JoyAI are unloaded. Requests for `model: "joyai-edit"` or music generation should return:
+When turbo is active, ACE and JoyAI are unloaded. JoyAI-edit and music requests call `_auto_exit_turbo_if_active(reason)`, which gracefully exits turbo mode (~15s) then proceeds with the request normally. This resets `_last_cuda1_activity`, so the auto-turbo idle timer restarts from zero.
 
-```json
-{"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled. Disable turbo first.", "status": 503}
-```
-
-with `Retry-After: 10` header.
+The auto-exit is transparent to the client -- they don't see a 503 or need to retry.
 
 ### 10.4 System pause during active batch
 

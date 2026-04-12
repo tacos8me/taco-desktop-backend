@@ -645,12 +645,32 @@ def _batch_item_to_job(item: BatchItem, api_key: str) -> Job:
     """Create a synthetic Job from a BatchItem for dispatch.
 
     Pre-processes params the same way the v2 endpoint handlers do:
-    resolution → width/height, duration → num_frames, camera_motion → prompt.
+    resolution → width/height, duration → num_frames, camera_motion → prompt,
+    lora {id,strength} → lora_path + lora_strength, storage:// URIs → paths.
     Without this, _dispatch_job passes raw pydantic fields (resolution, duration)
     to the manager which expects pre-resolved values (width, height, num_frames).
     """
     job_type, _ = _BATCH_TYPE_MAP[item.type]
     p = dict(item.params)
+
+    # LoRA resolution: convert {id, strength} → lora_path + lora_strength
+    if "lora" in p and p["lora"] is not None:
+        lora_input = p.pop("lora")
+        lora_id = lora_input["id"] if isinstance(lora_input, dict) else lora_input.id
+        lora_str = lora_input.get("strength", 1.0) if isinstance(lora_input, dict) else lora_input.strength
+        if _is_image_type(item.type):
+            info = flux_lora_registry.get(lora_id)
+            if info is None:
+                raise ValueError(f"Flux LoRA not found: {lora_id}")
+            p["lora_path"] = str(flux_lora_registry.resolve_path(lora_id))
+        else:
+            info = lora_registry.get(lora_id)
+            if info is None:
+                raise ValueError(f"LoRA not found: {lora_id}")
+            p["lora_path"] = str(lora_registry.resolve_path(lora_id))
+        p["lora_strength"] = lora_str
+    else:
+        p.pop("lora", None)
 
     # Video items: resolve resolution + duration → width/height/num_frames
     if item.type in ("text-to-video", "image-to-video", "audio-to-video"):
@@ -669,7 +689,7 @@ def _batch_item_to_job(item: BatchItem, api_key: str) -> Job:
             p["seed"] = random.randint(0, 2**32 - 1)
         p.setdefault("generate_audio", False)
 
-    # Image items: snap dims to multiples of 16
+    # Image items: snap dims to multiples of 16, resolve storage:// URIs
     if item.type in ("text-to-image", "image-to-image", "image-edit"):
         if "width" in p:
             p["width"] = (p["width"] // 16) * 16
@@ -677,6 +697,16 @@ def _batch_item_to_job(item: BatchItem, api_key: str) -> Job:
             p["height"] = (p["height"] // 16) * 16
         if "seed" not in p or p["seed"] is None:
             p["seed"] = random.randint(0, 2**32 - 1)
+
+    # Resolve storage:// URIs → filesystem paths (same as v2 handlers)
+    if item.type == "image-to-image" and "image_uri" in p:
+        p["image_path"] = str(uploads.resolve(p.pop("image_uri")))
+    if item.type == "image-edit" and "image_uris" in p:
+        p["image_paths"] = [str(uploads.resolve(uri)) for uri in p.pop("image_uris")]
+    if item.type == "image-to-video" and "image_uri" in p:
+        image_uri = p.pop("image_uri")
+        if image_uri:
+            p["image_path"] = str(uploads.resolve(image_uri))
 
     return Job(
         id=make_job_id(),
