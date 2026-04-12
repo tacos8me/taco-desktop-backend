@@ -1767,6 +1767,19 @@ async def v2_history_thumbnail(generation_id: str, request: Request) -> Response
     return FileResponse(path=str(path), media_type="image/jpeg")
 
 
+@app.delete("/v2/history/{generation_id}")
+async def v2_history_delete(generation_id: str, request: Request) -> JSONResponse:
+    """Remove a history entry + its result/thumbnail files. Scoped to the
+    caller's API key — returns 404 both when the entry doesn't exist and
+    when it belongs to another key, so the ID space can't be probed."""
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    if not history.delete(generation_id, api_key):
+        return _error(404, "Not found")
+    return JSONResponse(content={"ok": True})
+
+
 def _extract_api_key(request: Request) -> str | None:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):

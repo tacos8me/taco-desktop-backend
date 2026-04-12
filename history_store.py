@@ -224,6 +224,49 @@ class HistoryStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def delete(self, generation_id: str, api_key: str) -> bool:
+        """Delete a single history entry and its on-disk files.
+
+        Returns True if a row was deleted, False if the entry doesn't exist
+        or belongs to a different API key. The caller is responsible for
+        surfacing 404 in the latter case — we don't distinguish "not yours"
+        from "not there" so keys can't probe each other's IDs.
+        """
+        key_hash = _hash_key(api_key)
+        row = self._conn.execute(
+            "SELECT result_uri, thumbnail_uri FROM generations WHERE id = ? AND api_key_hash = ?",
+            (generation_id, key_hash),
+        ).fetchone()
+        if row is None:
+            return False
+
+        # Unlink the result file (completed generations only — failed rows
+        # have no result_uri). Best-effort: missing files are fine, the row
+        # still gets removed.
+        if row["result_uri"]:
+            uid = row["result_uri"].replace("storage://", "")
+            p = config.UPLOAD_DIR / uid
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    logger.warning("Failed to unlink result file %s", p, exc_info=True)
+        if row["thumbnail_uri"]:
+            tid = row["thumbnail_uri"].replace("thumb://", "")
+            p = config.THUMBNAIL_DIR / tid
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    logger.warning("Failed to unlink thumbnail file %s", p, exc_info=True)
+
+        self._conn.execute(
+            "DELETE FROM generations WHERE id = ? AND api_key_hash = ?",
+            (generation_id, key_hash),
+        )
+        self._conn.commit()
+        return True
+
     def cleanup(self, max_age_days: int | None = None) -> int:
         """Remove old entries and their files. Returns count removed."""
         days = max_age_days or config.HISTORY_RETENTION_DAYS
