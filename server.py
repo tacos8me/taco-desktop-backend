@@ -296,6 +296,29 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 else:
                     logger.warning("ACE sidecar unreachable at %s: %s", config.ACE_SIDECAR_URL, exc)
 
+    # Warm the OS page cache for checkpoint files not loaded at startup.
+    # The dev checkpoint is already cached (just loaded for the encoder hub +
+    # denoiser). The distilled checkpoint, LoRA, and upsamplers are cold until
+    # the first fast/hq/pro request — pre-reading them eliminates the 7-30s
+    # cold→warm variance on the first model swap.
+    async def _warmup_page_cache() -> None:
+        import subprocess
+        warmup_files = [
+            config.DISTILLED_CHECKPOINT,  # 43 GB — used by fast model
+            config.DISTILLED_LORA,        # 7 GB — used by pro/hq stage 2
+            config.SPATIAL_UPSAMPLER,     # 1 GB — used by all video gens
+        ]
+        for path in warmup_files:
+            if Path(path).exists():
+                t0 = time.monotonic()
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["dd", f"if={path}", "of=/dev/null", "bs=1M"],
+                    capture_output=True, timeout=120,
+                )
+                logger.info("Page cache warm: %s (%.1fs)", Path(path).name, time.monotonic() - t0)
+    asyncio.create_task(_warmup_page_cache(), name="page-cache-warmup")
+
     worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
                     turbo_check=lambda: _turbo_active),
