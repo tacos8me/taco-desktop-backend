@@ -648,10 +648,10 @@ section h2 {
     <button class="btn" onclick="callEndpoint('POST','/v1/flux/unload')">Unload Flux</button>
     <button class="btn" onclick="callEndpoint('POST','/v1/flux/reload')">Reload Flux</button>
   </div>
-  <div class="btn-row-label">Turbo Mode</div>
+  <div class="btn-row-label">Turbo Mode <span id="turboStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(off)</span></div>
   <div class="btn-grid">
-    <button class="btn" disabled title="Coming in Phase 3 — dual-GPU turbo with batch scheduler">Turbo Mode ON</button>
-    <button class="btn" disabled title="Coming in Phase 3 — dual-GPU turbo with batch scheduler">Turbo Mode OFF</button>
+    <button class="btn btn-success" id="btnTurboOn" onclick="toggleTurbo(true)" title="Claim cuda:1 for dual-GPU inference (disables ACE + JoyAI)">Turbo Mode ON</button>
+    <button class="btn btn-danger" id="btnTurboOff" onclick="toggleTurbo(false)" title="Release cuda:1 back to ACE/JoyAI">Turbo Mode OFF</button>
   </div>
 </section>
 
@@ -893,12 +893,59 @@ function updateGpuTenant(data) {
 async function pollGpu() {
   try {
     const res = await fetch("/v1/system/gpu", { headers: getAuthHeaders() });
-    if (!res.ok) return; // endpoint doesn't exist yet — silently skip
+    if (!res.ok) return;
     const data = await res.json();
     if (data.gpus && data.gpus.length >= 1) updateGpuCard(0, data.gpus[0]);
     if (data.gpus && data.gpus.length >= 2) updateGpuCard(1, data.gpus[1]);
+    // Update turbo state from GPU endpoint
+    updateTurboState(data);
   } catch {
-    // Endpoint not yet available — leave placeholder data
+    // Endpoint not yet available
+  }
+}
+
+function updateTurboState(data) {
+  const statusEl = document.getElementById("turboStatus");
+  const btnOn = document.getElementById("btnTurboOn");
+  const btnOff = document.getElementById("btnTurboOff");
+  if (data.turbo) {
+    statusEl.textContent = "(active)";
+    statusEl.style.color = "var(--success)";
+    btnOn.disabled = true;
+    btnOff.disabled = false;
+  } else {
+    statusEl.textContent = "(off)";
+    statusEl.style.color = "var(--text-dim)";
+    btnOn.disabled = false;
+    btnOff.disabled = true;
+  }
+  // Update gpu1 tenant badge based on turbo state
+  const gpu1Tenant = document.getElementById("gpu1Tenant");
+  if (data.gpu1_tenant) {
+    const tenant = data.gpu1_tenant;
+    const labels = { flux: "Flux (Turbo)", ace: "ACE + JoyAI", idle: "Idle" };
+    gpu1Tenant.textContent = labels[tenant] || tenant;
+    const clsMap = { flux: "tenant-flux", ace: "tenant-ace", idle: "tenant-idle" };
+    gpu1Tenant.className = "gpu-tenant " + (clsMap[tenant] || "tenant-idle");
+  }
+}
+
+async function toggleTurbo(enable) {
+  const headers = { "Content-Type": "application/json", ...getAuthHeaders() };
+  try {
+    const res = await fetch("/v1/system/turbo", {
+      method: "POST", headers,
+      body: JSON.stringify({ enable }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast("Turbo " + (enable ? "enabled" : "disabled"), "ok");
+      pollGpu(); // Refresh immediately
+    } else {
+      toast("Turbo toggle failed: " + (data.error || res.status), "err");
+    }
+  } catch (err) {
+    toast("Turbo toggle error: " + err.message, "err");
   }
 }
 

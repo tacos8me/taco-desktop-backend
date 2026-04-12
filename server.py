@@ -10,7 +10,7 @@ import random
 import secrets as _secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +30,8 @@ from flux_lora_registry import FluxLoRARegistry
 from job_queue import (
     Job, JobStatus, JobType, JobStore, make_job_id, make_flux_callback,
     worker_loop, cleanup_loop,
+    BatchStatus, BatchItemResult, BatchJob, BatchStore, make_batch_id,
+    _MEDIA_TYPES as _JOB_MEDIA_TYPES,
 )
 from history_store import HistoryStore
 
@@ -55,6 +57,15 @@ _paused = False
 # Job queue
 job_store = JobStore()
 _job_queue: asyncio.Queue[str] = asyncio.Queue()
+
+# Batch queue
+batch_store = BatchStore()
+_batch_queue: asyncio.Queue[str] = asyncio.Queue()
+
+# Turbo mode — dual-GPU inference
+_turbo_active: bool = False
+_flux_lock = asyncio.Lock()   # guards cuda:1 during turbo
+_ltx_lock = asyncio.Lock()    # guards cuda:0 during turbo
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -205,6 +216,8 @@ async def _dispatch_job(job: Job) -> bytes:
             model = p.get("model", "flux2-klein")
             if model == "joyai-edit":
                 # JoyAI is on cuda:1 sidecar -- no GPU swap needed
+                if _turbo_active:
+                    raise JoyAIError("turbo_mode_active: JoyAI unavailable while turbo is enabled", 503)
                 if not config.LOAD_JOYAI:
                     raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
                 # joyai-edit: exactly one image_path, ignores lora, chat-template
@@ -292,12 +305,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         cleanup_loop(job_store, uploads),
         name="queue-cleanup",
     )
-    logger.info("Job queue started.")
+    batch_worker_task = asyncio.create_task(
+        batch_worker(),
+        name="batch-worker",
+    )
+    batch_cleanup_task = asyncio.create_task(
+        batch_cleanup_loop(),
+        name="batch-cleanup",
+    )
+    logger.info("Job queue + batch worker started.")
 
     yield
 
     worker_task.cancel()
     cleanup_task.cancel()
+    batch_worker_task.cancel()
+    batch_cleanup_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -501,6 +524,55 @@ _AUDIO_MEDIA_TYPES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Batch request models
+# ---------------------------------------------------------------------------
+
+_BATCH_ITEM_TYPES = Literal[
+    "text-to-image", "image-to-image", "image-edit",
+    "text-to-video", "image-to-video",
+]
+
+
+class BatchItem(BaseModel):
+    """One generation request inside a batch."""
+    type: _BATCH_ITEM_TYPES
+    params: dict[str, Any]
+
+
+class BatchRequest(BaseModel):
+    """Submit a batch of generation jobs."""
+    items: list[BatchItem] = Field(..., min_length=1, max_length=50)
+    priority: Literal["normal", "high"] = "normal"
+    callback_url: str | None = None
+
+
+# Map batch item type string -> (JobType, Pydantic validator model)
+_BATCH_TYPE_MAP: dict[str, tuple[JobType, type[BaseModel]]] = {
+    "text-to-image": (JobType.TEXT_TO_IMAGE, TextToImageRequest),
+    "image-to-image": (JobType.IMAGE_TO_IMAGE, ImageToImageRequest),
+    "image-edit": (JobType.IMAGE_EDIT, ImageEditRequest),
+    "text-to-video": (JobType.TEXT_TO_VIDEO, TextToVideoRequest),
+    "image-to-video": (JobType.IMAGE_TO_VIDEO, ImageToVideoRequest),
+}
+
+
+def _is_image_type(type_str: str) -> bool:
+    """Return True for image generation types."""
+    return type_str in ("text-to-image", "image-to-image", "image-edit")
+
+
+def _batch_item_to_job(item: BatchItem, api_key: str) -> Job:
+    """Create a synthetic Job from a BatchItem for dispatch."""
+    job_type, _ = _BATCH_TYPE_MAP[item.type]
+    return Job(
+        id=make_job_id(),
+        type=job_type,
+        params=item.params,
+        api_key=api_key,
+    )
+
+
 def _build_ace_params(p: dict) -> dict:
     """Translate MusicGenerationRequest params to ACE /release_task fields."""
     ace_p = {
@@ -645,31 +717,67 @@ async def dashboard():
     return HTMLResponse(content=dash_path.read_text(), media_type="text/html")
 
 
+_gpu_cache: dict | None = None
+_gpu_cache_time: float = 0.0
+
+
+async def _query_gpu_info() -> list[dict]:
+    """Run nvidia-smi and parse GPU info."""
+    import subprocess
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,memory.used,memory.total,temperature.gpu,utilization.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True, text=True, timeout=5,
+    )
+    gpus = []
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 7:
+            gpus.append({
+                "index": int(parts[0]),
+                "name": parts[1],
+                "memory_used_mb": int(parts[2]),
+                "memory_total_mb": int(parts[3]),
+                "temperature_c": int(parts[4]) if parts[4] not in ("[N/A]", "[Not Supported]") and parts[4].isdigit() else None,
+                "utilization_pct": int(parts[5]) if parts[5] not in ("[N/A]", "[Not Supported]") and parts[5].isdigit() else None,
+                "power_draw_w": float(parts[6]) if parts[6] not in ("[N/A]", "[Not Supported]") else None,
+            })
+        elif len(parts) >= 5:
+            gpus.append({
+                "index": int(parts[0]),
+                "name": parts[1],
+                "memory_used_mb": int(parts[2]),
+                "memory_total_mb": int(parts[3]),
+                "temperature_c": int(parts[4]) if parts[4].isdigit() else None,
+            })
+    return gpus
+
+
 @app.get("/v1/system/gpu")
 async def system_gpu() -> dict:
-    """nvidia-smi GPU telemetry for the dashboard."""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,temperature.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        gpus = []
-        for line in result.stdout.strip().split("\n"):
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 5:
-                gpus.append({
-                    "index": int(parts[0]),
-                    "name": parts[1],
-                    "memory_used_mb": int(parts[2]),
-                    "memory_total_mb": int(parts[3]),
-                    "temperature_c": int(parts[4]) if parts[4].isdigit() else None,
-                })
-        return {"gpus": gpus}
-    except Exception as exc:
-        logger.warning("nvidia-smi failed: %s", exc)
-        return {"gpus": [], "error": str(exc)}
+    """nvidia-smi GPU telemetry for the dashboard (2s cache)."""
+    global _gpu_cache, _gpu_cache_time
+    now = time.monotonic()
+    if _gpu_cache is None or (now - _gpu_cache_time) > 2.0:
+        try:
+            gpus = await _query_gpu_info()
+            _gpu_cache = {
+                "gpus": gpus,
+                "turbo": _turbo_active,
+                "gpu0_tenant": _last_gpu_tenant or "idle",
+                "gpu1_tenant": "flux" if _turbo_active else ("ace" if config.LOAD_ACE else "idle"),
+            }
+            _gpu_cache_time = now
+        except Exception as exc:
+            logger.warning("nvidia-smi failed: %s", exc)
+            return {"gpus": [], "turbo": _turbo_active, "error": str(exc)}
+    return _gpu_cache
 
 
 @app.get("/health")
@@ -701,6 +809,9 @@ async def system_pause() -> dict:
         return {"status": "already_paused"}
     try:
         async with _inference_lock:
+            # Exit turbo mode first if active
+            if _turbo_active:
+                await _exit_turbo_mode()
             # Cancel queued (not yet processing) jobs
             while not _job_queue.empty():
                 try:
@@ -709,6 +820,15 @@ async def system_pause() -> dict:
                     if job and job.status == JobStatus.QUEUED:
                         job.status = JobStatus.FAILED
                         job.error = "System paused"
+                except asyncio.QueueEmpty:
+                    break
+            # Cancel queued batches
+            while not _batch_queue.empty():
+                try:
+                    bid = _batch_queue.get_nowait()
+                    b = batch_store.get(bid)
+                    if b and b.status == BatchStatus.QUEUED:
+                        b.status = BatchStatus.CANCELLED
                 except asyncio.QueueEmpty:
                     break
             _paused = True
@@ -820,6 +940,143 @@ async def flux_reload() -> dict:
     except Exception:
         logger.exception("Flux reload failed")
         return JSONResponse(status_code=500, content={"error": "flux_reload_failed"})
+
+
+# ---------------------------------------------------------------------------
+# Turbo Mode (dual-GPU) — Phase 3
+# ---------------------------------------------------------------------------
+
+
+def _get_gpu_free_mb(gpu_index: int) -> int:
+    """Quick check of free VRAM on a GPU via torch.cuda."""
+    try:
+        free, total = torch.cuda.mem_get_info(gpu_index)
+        return free // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+async def _ace_systemctl(action: str) -> None:
+    """Start/stop ACE sidecar via systemctl --user."""
+    import subprocess
+    await asyncio.to_thread(
+        subprocess.run,
+        ["systemctl", "--user", action, "ace-step"],
+        capture_output=True, text=True, timeout=15,
+    )
+
+
+async def _enter_turbo_mode() -> None:
+    """Claim cuda:1 for inference. Caller must hold _inference_lock."""
+    global _turbo_active
+
+    if _turbo_active:
+        return  # idempotent
+
+    # Step 1: Unload ACE from cuda:1
+    if config.LOAD_ACE:
+        try:
+            await _ace_systemctl("stop")
+            logger.info("Turbo: ACE stopped via systemctl")
+        except Exception:
+            logger.exception("Turbo: ACE stop failed -- aborting turbo entry")
+            raise RuntimeError("turbo_entry_failed: could not stop ACE on cuda:1")
+
+    # Step 2: Unload JoyAI from cuda:1
+    if config.LOAD_JOYAI:
+        try:
+            await joyai.unload()
+            logger.info("Turbo: JoyAI unloaded from cuda:1")
+        except JoyAIError:
+            logger.warning("Turbo: JoyAI unload failed -- continuing (non-critical)")
+
+    # Step 3: Verify cuda:1 is free
+    free_mb = _get_gpu_free_mb(1)
+    if free_mb < 90_000:
+        logger.warning("Turbo: cuda:1 has only %d MB free after unloads", free_mb)
+
+    # Step 4: Move Flux to cuda:1
+    flux.unload()
+    config.FLUX_DEVICE = "cuda:1"
+    flux._device = "cuda:1"
+    # Don't eagerly reload -- lazy load on next image request
+
+    # Step 5: Enable turbo
+    _turbo_active = True
+    logger.info("Turbo mode ACTIVE: Flux on cuda:1, LTX on cuda:0")
+
+
+async def _exit_turbo_mode() -> None:
+    """Release cuda:1 back to ACE/JoyAI. Caller must hold _inference_lock."""
+    global _turbo_active
+
+    if not _turbo_active:
+        return  # idempotent
+
+    # Step 1: Unload Flux from cuda:1
+    flux.unload()
+
+    # Step 2: Restore single-GPU config
+    config.FLUX_DEVICE = "cuda:0"
+    flux._device = "cuda:0"
+    # Do NOT eagerly reload Flux on cuda:0 -- lazy load on next image request
+
+    # Step 3: Reload ACE on cuda:1
+    if config.LOAD_ACE:
+        try:
+            await _ace_systemctl("start")
+            logger.info("Turbo exit: ACE restarted via systemctl")
+        except Exception:
+            logger.warning("Turbo exit: ACE restart failed -- will retry on next request")
+
+    # Step 4: Reload JoyAI on cuda:1
+    if config.LOAD_JOYAI:
+        try:
+            await joyai.load()
+            logger.info("Turbo exit: JoyAI reloaded on cuda:1")
+        except JoyAIError:
+            logger.warning("Turbo exit: JoyAI reload failed -- non-critical")
+
+    _turbo_active = False
+    logger.info("Turbo mode DEACTIVATED: single-GPU swap restored")
+
+
+class TurboRequest(BaseModel):
+    enable: bool
+
+
+@app.post("/v1/system/turbo")
+async def system_turbo(body: TurboRequest) -> JSONResponse:
+    """Toggle turbo mode (claim/release cuda:1 for dual-GPU inference)."""
+    if _paused:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "system_paused", "message": "Cannot toggle turbo while paused."},
+            headers={"Retry-After": "300"},
+        )
+    if body.enable and _turbo_active:
+        return JSONResponse(status_code=409, content={"error": "already_enabled", "turbo": True})
+    if not body.enable and not _turbo_active:
+        return JSONResponse(status_code=409, content={"error": "already_disabled", "turbo": False})
+
+    try:
+        async with _inference_lock:
+            if body.enable:
+                await _enter_turbo_mode()
+            else:
+                await _exit_turbo_mode()
+        return JSONResponse(content={
+            "turbo": _turbo_active,
+            "flux_device": config.FLUX_DEVICE,
+            "ltx_device": config.LTX_DEVICE,
+            "ace_status": "unloaded" if _turbo_active else ("loaded" if config.LOAD_ACE else "disabled"),
+            "joyai_status": "unloaded" if _turbo_active else ("loaded" if config.LOAD_JOYAI else "disabled"),
+        })
+    except RuntimeError as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    except Exception:
+        logger.exception("Turbo toggle failed")
+        return JSONResponse(status_code=500, content={"error": "turbo_toggle_failed"})
 
 
 @app.post("/v1/text-to-video")
@@ -1067,6 +1324,12 @@ async def image_edit(body: ImageEditRequest) -> Response:
     # joyai-edit routes to the out-of-process sidecar; the flux-backed
     # models still require LOAD_FLUX.
     if body.model == "joyai-edit":
+        if _turbo_active:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled. Disable turbo first."},
+                headers={"Retry-After": "10"},
+            )
         if len(body.image_uris) != 1:
             return _error(422, "joyai-edit requires exactly one image_uri")
         if not config.LOAD_JOYAI:
@@ -1136,6 +1399,12 @@ async def image_edit(body: ImageEditRequest) -> Response:
 async def generate_music(body: MusicGenerationRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
+    if _turbo_active:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled. Disable turbo first."},
+            headers={"Retry-After": "10"},
+        )
     if not config.LOAD_ACE:
         return _error(503, "Music generation not enabled (LOAD_ACE=0)")
     # Validate task-type requirements
@@ -1484,6 +1753,12 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
 async def v2_music(body: MusicGenerationRequest, request: Request) -> JSONResponse:
     if _paused:
         return JSONResponse(status_code=503, content={"error": "system_paused"}, headers={"Retry-After": "300"})
+    if _turbo_active:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled. Disable turbo first."},
+            headers={"Retry-After": "10"},
+        )
     if not config.LOAD_ACE:
         return _error(503, "Music generation not enabled (LOAD_ACE=0)")
     # Validate task-type requirements
@@ -2080,6 +2355,322 @@ def _extract_api_key(request: Request) -> str | None:
     if auth.startswith("Bearer "):
         return auth[7:]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Batch Endpoints — Phase 3
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v2/batch")
+async def v2_batch_submit(body: BatchRequest, request: Request) -> JSONResponse:
+    """Submit a batch of generation jobs. Returns 202 with batch_id."""
+    if _paused:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "system_paused", "message": "System is paused for maintenance."},
+            headers={"Retry-After": "300"},
+        )
+    if batch_store.active_count() >= config.MAX_BATCH_QUEUE_DEPTH:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "batch_queue_full", "message": "Batch queue is full. Try again later."},
+            headers={"Retry-After": "30"},
+        )
+
+    # Validate all items eagerly — parse through corresponding Pydantic model
+    for i, item in enumerate(body.items):
+        if item.type not in _BATCH_TYPE_MAP:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid item type at index {i}: {item.type}"},
+            )
+        _, validator_model = _BATCH_TYPE_MAP[item.type]
+        try:
+            validator_model(**item.params)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"error": f"Validation failed at item {i} ({item.type}): {exc}"},
+            )
+
+    auth = request.headers.get("Authorization", "")
+    api_key = auth[7:] if auth.startswith("Bearer ") else ""
+
+    # Swap optimization: sort all images before all videos, group by model within images
+    image_items = [it for it in body.items if _is_image_type(it.type)]
+    video_items = [it for it in body.items if not _is_image_type(it.type)]
+    # Within image items, sort klein before dev to minimize Flux model reloads
+    image_items.sort(key=lambda it: it.params.get("model", "flux2-klein"))
+    sorted_items = image_items + video_items
+
+    batch = BatchJob(
+        id=make_batch_id(),
+        items=sorted_items,
+        api_key=api_key,
+        total=len(sorted_items),
+        turbo=_turbo_active,
+        priority=body.priority,
+        callback_url=body.callback_url,
+    )
+    batch_store.add(batch)
+    _batch_queue.put_nowait(batch.id)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "batch_id": batch.id,
+            "status": "queued",
+            "total": batch.total,
+            "queue_position": max(0, batch_store.active_count() - 1),
+        },
+    )
+
+
+@app.get("/v2/batch/{batch_id}")
+async def v2_batch_status(batch_id: str) -> JSONResponse:
+    """Poll batch status + partial results."""
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        return _error(404, "Batch not found")
+    return JSONResponse(content={
+        "batch_id": batch.id,
+        "status": batch.status,
+        "total": batch.total,
+        "completed_count": batch.completed_count,
+        "failed_count": batch.failed_count,
+        "current_index": batch.current_index,
+        "turbo": batch.turbo,
+        "results": [
+            {
+                "index": r.index,
+                "type": r.type,
+                "status": r.status,
+                "result_uri": r.result_uri,
+                "media_type": r.media_type,
+                "error": r.error,
+                "elapsed_s": r.elapsed_s,
+            }
+            for r in batch.results
+        ],
+        "created_at": batch.created_at,
+        "started_at": batch.started_at,
+        "completed_at": batch.completed_at,
+    })
+
+
+@app.delete("/v2/batch/{batch_id}")
+async def v2_batch_cancel(batch_id: str) -> JSONResponse:
+    """Cancel remaining items in a batch."""
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        return _error(404, "Batch not found")
+    if batch.status in (BatchStatus.COMPLETED, BatchStatus.FAILED, BatchStatus.CANCELLED):
+        return JSONResponse(status_code=409, content={
+            "error": "batch_already_finished",
+            "batch_id": batch.id,
+            "status": batch.status,
+        })
+    cancelled_count = batch.total - batch.completed_count - batch.failed_count
+    if batch.status == BatchStatus.PROCESSING:
+        # Currently running item will finish, then batch_worker sees cancelled status
+        cancelled_count = max(0, cancelled_count - 1)
+    batch.status = BatchStatus.CANCELLED
+    return JSONResponse(content={
+        "batch_id": batch.id,
+        "status": "cancelled",
+        "completed_count": batch.completed_count,
+        "cancelled_count": cancelled_count,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Batch worker coroutine
+# ---------------------------------------------------------------------------
+
+
+async def _save_batch_item_history(
+    hist: "HistoryStore", job: Job, result_bytes: bytes, storage_uri: str,
+) -> None:
+    """Fire-and-forget history save for a single batch item."""
+    try:
+        p = job.params or {}
+        await asyncio.to_thread(hist.save,
+            job_id=job.id, api_key=job.api_key, job_type=job.type,
+            prompt=p.get("prompt", ""), model=p.get("model"),
+            width=p.get("width", 0), height=p.get("height", 0),
+            turbo=p.get("turbo", False), status=JobStatus.COMPLETED,
+            result_uri=storage_uri, result_bytes=result_bytes,
+            created_at=time.time(), completed_at=time.time(), error=None,
+        )
+    except Exception:
+        logger.warning("Failed to save batch item %s to history", job.id, exc_info=True)
+
+
+async def _fire_batch_webhook(batch: BatchJob) -> None:
+    """Fire-and-forget webhook with 3 retries."""
+    import httpx
+    payload = {
+        "batch_id": batch.id,
+        "status": batch.status,
+        "total": batch.total,
+        "completed_count": batch.completed_count,
+        "failed_count": batch.failed_count,
+        "results": [
+            {"index": r.index, "type": r.type, "status": r.status,
+             "result_uri": r.result_uri, "media_type": r.media_type,
+             "error": r.error, "elapsed_s": r.elapsed_s}
+            for r in batch.results
+        ],
+    }
+    backoff = [1, 5, 15]
+    for attempt, delay in enumerate(backoff):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(batch.callback_url, json=payload)
+                if resp.is_success:
+                    logger.info("Batch %s webhook delivered on attempt %d", batch.id, attempt + 1)
+                    return
+        except Exception:
+            pass
+        if attempt < len(backoff) - 1:
+            await asyncio.sleep(delay)
+    logger.warning("Batch %s webhook failed after 3 retries to %s", batch.id, batch.callback_url)
+
+
+async def batch_worker() -> None:
+    """Background worker that processes batches from the batch queue."""
+    logger.info("Batch worker started")
+    consecutive_ooms = 0
+
+    while True:
+        batch_id = await _batch_queue.get()
+        batch = batch_store.get(batch_id)
+        if batch is None or batch.status == BatchStatus.CANCELLED:
+            _batch_queue.task_done()
+            continue
+
+        batch.status = BatchStatus.PROCESSING
+        batch.started_at = time.monotonic()
+        logger.info("Processing batch %s (%d items)", batch.id, batch.total)
+        consecutive_ooms = 0
+
+        for i, item in enumerate(batch.items):
+            # Check cancellation between items
+            if batch.status == BatchStatus.CANCELLED:
+                for j in range(i, len(batch.items)):
+                    batch.results.append(BatchItemResult(
+                        index=j, type=batch.items[j].type,
+                        status="cancelled",
+                    ))
+                break
+
+            batch.current_index = i
+            t0 = time.monotonic()
+
+            try:
+                job = _batch_item_to_job(item, batch.api_key)
+
+                if batch.turbo and _turbo_active:
+                    lock = _flux_lock if _is_image_type(item.type) else _ltx_lock
+                else:
+                    lock = _inference_lock
+
+                async with lock:
+                    if not (batch.turbo and _turbo_active):
+                        # Single-GPU: ensure correct tenant
+                        if _is_image_type(item.type):
+                            await _ensure_flux_ready()
+                        else:
+                            await _ensure_ltx_resident()
+                    result_bytes = await _dispatch_job(job)
+
+                # Save result
+                upload_id, storage_uri = uploads.create()
+                uploads.save(upload_id, result_bytes)
+                elapsed = time.monotonic() - t0
+
+                batch.results.append(BatchItemResult(
+                    index=i, type=item.type, status="completed",
+                    result_uri=storage_uri,
+                    media_type=_JOB_MEDIA_TYPES.get(JobType(item.type), "application/octet-stream"),
+                    elapsed_s=round(elapsed, 2),
+                ))
+                batch.completed_count += 1
+                consecutive_ooms = 0
+
+                # Fire-and-forget history save
+                if history and batch.api_key:
+                    asyncio.create_task(_save_batch_item_history(
+                        history, job, result_bytes, storage_uri))
+
+            except Exception as exc:
+                elapsed = time.monotonic() - t0
+                is_oom = "out of memory" in str(exc).lower()
+                batch.results.append(BatchItemResult(
+                    index=i, type=item.type, status="failed",
+                    error=str(exc)[:500], elapsed_s=round(elapsed, 2),
+                ))
+                batch.failed_count += 1
+                logger.exception("Batch %s item %d failed", batch.id, i)
+
+                if is_oom:
+                    consecutive_ooms += 1
+                    # Clean up after OOM
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if consecutive_ooms >= 3:
+                        logger.error("Batch %s: 3 consecutive OOMs, aborting", batch.id)
+                        # Mark remaining as failed
+                        for j in range(i + 1, len(batch.items)):
+                            batch.results.append(BatchItemResult(
+                                index=j, type=batch.items[j].type,
+                                status="failed", error="repeated_oom",
+                            ))
+                            batch.failed_count += 1
+                        break
+                else:
+                    consecutive_ooms = 0
+
+        # Final status
+        batch.completed_at = time.monotonic()
+        if batch.status != BatchStatus.CANCELLED:
+            if batch.failed_count == 0:
+                batch.status = BatchStatus.COMPLETED
+            elif batch.completed_count == 0:
+                batch.status = BatchStatus.FAILED
+            else:
+                batch.status = BatchStatus.PARTIAL
+
+        total_elapsed = batch.completed_at - (batch.started_at or batch.created_at)
+        logger.info("Batch %s finished: %d/%d completed in %.1fs",
+                     batch.id, batch.completed_count, batch.total, total_elapsed)
+
+        # Webhook callback
+        if batch.callback_url:
+            asyncio.create_task(_fire_batch_webhook(batch))
+
+        _batch_queue.task_done()
+
+
+async def batch_cleanup_loop() -> None:
+    """Periodically remove expired batch metadata."""
+    ttl = config.BATCH_RESULT_TTL_SECONDS
+    logger.info("Batch cleanup loop started (TTL=%ds)", ttl)
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        to_remove: list[str] = []
+        for batch in batch_store.all_batches():
+            if batch.status in (BatchStatus.COMPLETED, BatchStatus.FAILED,
+                                BatchStatus.CANCELLED, BatchStatus.PARTIAL):
+                if batch.completed_at and (now - batch.completed_at) > ttl:
+                    to_remove.append(batch.id)
+        for bid in to_remove:
+            batch_store.remove(bid)
+        if to_remove:
+            logger.info("Cleaned up %d expired batches", len(to_remove))
 
 
 # ---------------------------------------------------------------------------

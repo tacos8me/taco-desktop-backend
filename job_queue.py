@@ -20,6 +20,86 @@ from upload_store import UploadStore
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Batch models
+# ---------------------------------------------------------------------------
+
+
+class BatchStatus(StrEnum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    PARTIAL = "partial"        # some items succeeded, some failed
+    FAILED = "failed"          # all items failed
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class BatchItemResult:
+    index: int
+    type: str
+    status: str  # "completed" | "failed" | "cancelled"
+    result_uri: str | None = None
+    media_type: str | None = None
+    error: str | None = None
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class BatchJob:
+    id: str                          # batch_xxx (different prefix from job IDs)
+    items: list[Any]                 # list[BatchItem] — avoid circular import
+    status: BatchStatus = BatchStatus.QUEUED
+    api_key: str = ""
+    created_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
+    completed_at: float | None = None
+    total: int = 0                   # len(items)
+    completed_count: int = 0
+    failed_count: int = 0
+    current_index: int = 0           # which item is currently running
+    results: list[BatchItemResult] = field(default_factory=list)
+    turbo: bool = False              # was turbo mode active when batch started?
+    priority: str = "normal"
+    callback_url: str | None = None
+
+
+class BatchStore:
+    """In-memory batch storage keyed by batch ID."""
+
+    def __init__(self) -> None:
+        self._batches: dict[str, BatchJob] = {}
+
+    def add(self, batch: BatchJob) -> None:
+        self._batches[batch.id] = batch
+
+    def get(self, batch_id: str) -> BatchJob | None:
+        return self._batches.get(batch_id)
+
+    def remove(self, batch_id: str) -> None:
+        self._batches.pop(batch_id, None)
+
+    def active_count(self) -> int:
+        """Number of batches that are queued or processing."""
+        return sum(
+            1 for b in self._batches.values()
+            if b.status in (BatchStatus.QUEUED, BatchStatus.PROCESSING)
+        )
+
+    def all_batches(self) -> list[BatchJob]:
+        return list(self._batches.values())
+
+
+def make_batch_id() -> str:
+    """Generate an unguessable batch ID with batch_ prefix."""
+    return "batch_" + secrets.token_urlsafe(16)
+
+
+# ---------------------------------------------------------------------------
+# Job models
+# ---------------------------------------------------------------------------
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     PROCESSING = "processing"

@@ -97,6 +97,15 @@ FLUX_LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/flux_loras")
 MAX_QUEUE_DEPTH = 10
 JOB_RESULT_TTL_SECONDS = 600  # 10 minutes
 
+# Turbo mode — dual-GPU inference
+TURBO_GPU_DEVICES = ["cuda:0", "cuda:1"]   # devices available in turbo mode
+NORMAL_GPU_DEVICES = ["cuda:0"]             # devices in normal single-GPU mode
+
+# Batch queue
+MAX_BATCH_QUEUE_DEPTH = 5                   # max concurrent batch submissions
+MAX_BATCH_ITEMS = 50                        # max items per batch
+BATCH_RESULT_TTL_SECONDS = 1800             # 30 min (batches are larger, keep longer)
+
 # Server
 HOST = "0.0.0.0"
 PORT = 8090
