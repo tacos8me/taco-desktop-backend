@@ -45,61 +45,6 @@ os.environ.setdefault("HF_HOME", "/mnt/nvme-1/huggingface")
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# fastsafetensors GPU-direct loading for Klein (7x faster on PCIe 5.0)
-# ---------------------------------------------------------------------------
-# Monkey-patches safetensors.torch.load_file so that, inside a
-# `_gpu_direct_loading(device)` context, CPU-targeted loads are redirected
-# to GPU-direct DMA via fastsafetensors. Only active during Klein pipeline
-# construction — Dev (CPU offload) and all other code use the standard path.
-
-import safetensors.torch as _sft
-
-_original_load_file = _sft.load_file
-_gpu_direct_device: str | None = None
-
-
-@contextmanager
-def _gpu_direct_loading(device: str):
-    """Redirect safetensors CPU loads to GPU-direct via fastsafetensors."""
-    global _gpu_direct_device
-    _gpu_direct_device = device
-    try:
-        yield
-    finally:
-        _gpu_direct_device = None
-
-
-def _patched_load_file(filename, device="cpu", **kwargs):
-    if _gpu_direct_device is not None and str(device) == "cpu":
-        try:
-            from fastsafetensors import SafeTensorsFileLoader
-
-            t0 = time.perf_counter()
-            loader = SafeTensorsFileLoader(
-                pg=None, device=_gpu_direct_device, max_threads=16, set_numa=True,
-            )
-            loader.add_filenames({0: [filename]})
-            fb = loader.copy_files_to_device()
-            keys = loader.get_keys()
-            sd = {k: fb.get_tensor(k).clone() for k in keys}
-            loader.close()
-            size_gb = sum(v.nbytes for v in sd.values()) / 1e9
-            elapsed = time.perf_counter() - t0
-            logger.info(
-                "fastsafetensors GPU-direct: %s → %d tensors (%.1f GB) in %.2fs (%.1f GB/s)",
-                Path(filename).name, len(sd), size_gb, elapsed,
-                size_gb / max(elapsed, 0.001),
-            )
-            return sd
-        except Exception:
-            logger.warning("fastsafetensors failed, falling back to standard loader", exc_info=True)
-    return _original_load_file(filename, device=device, **kwargs)
-
-
-# Install the patch at import time — scoped to Klein via _gpu_direct_device flag
-_sft.load_file = _patched_load_file
-
 
 @contextmanager
 def _timed(label: str):
@@ -176,21 +121,14 @@ class FluxManager:
             if model_name == "flux2-klein":
                 from diffusers import Flux2KleinKVPipeline
                 klein_ckpt, klein_snap = self._resolve_klein_checkpoint()
-                # GPU-direct loading via fastsafetensors: all safetensors files
-                # inside from_single_file + from_pretrained load directly to
-                # cuda:0 at 41-48 GB/s (vs 7-14 GB/s standard CPU staging).
-                # pipe.to() below becomes a near-noop since weights are already
-                # on the target device. The context manager scopes the patch so
-                # Dev (CPU offload) and LoRA loading are unaffected.
-                with _gpu_direct_loading(self._device):
-                    transformer = Flux2Transformer2DModel.from_single_file(
-                        klein_ckpt, torch_dtype=torch.bfloat16,
-                        config=str(klein_snap / "transformer"),
-                    )
-                    pipe = Flux2KleinKVPipeline.from_pretrained(
-                        str(klein_snap), transformer=transformer,
-                        torch_dtype=torch.bfloat16, local_files_only=True,
-                    )
+                transformer = Flux2Transformer2DModel.from_single_file(
+                    klein_ckpt, torch_dtype=torch.bfloat16,
+                    config=str(klein_snap / "transformer"),
+                )
+                pipe = Flux2KleinKVPipeline.from_pretrained(
+                    str(klein_snap), transformer=transformer,
+                    torch_dtype=torch.bfloat16, local_files_only=True,
+                )
                 if user_lora_path:
                     self._load_user_lora_adapter(pipe, user_lora_path)
                 # VAE: force float32 — AutoencoderKLFlux2._decode() silently ignores
@@ -199,8 +137,6 @@ class FluxManager:
                 # in bf16. Extra VRAM cost is ~320 MB (the VAE's 321 MB params doubled).
                 self._force_vae_fp32(pipe)
                 # Klein fits in full bf16 on 96 GB — keep all components resident.
-                # With GPU-direct loading above, most weights are already on device;
-                # .to() handles remaining metadata + non-tensor state.
                 pipe = pipe.to(self._device)
             else:
                 from diffusers import Flux2Pipeline
