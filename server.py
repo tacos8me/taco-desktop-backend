@@ -710,10 +710,37 @@ def _batch_item_to_job(item: BatchItem, api_key: str) -> Job:
         p["image_path"] = str(uploads.resolve(p.pop("image_uri")))
     if item.type == "image-edit" and "image_uris" in p:
         p["image_paths"] = [str(uploads.resolve(uri)) for uri in p.pop("image_uris")]
-    if item.type == "image-to-video" and "image_uri" in p:
-        image_uri = p.pop("image_uri")
-        if image_uri:
-            p["image_path"] = str(uploads.resolve(image_uri))
+    # i2v: convert image_uri/keyframes to the keyframes list format that
+    # generate_image_to_video expects: [{"image_path": str, "frame_index": int, "strength": float}]
+    if item.type == "image-to-video":
+        if "keyframes" in p and p["keyframes"]:
+            # Multi-keyframe: resolve each storage:// URI to filesystem path
+            kfs = p.pop("keyframes")
+            resolved = []
+            for kf in kfs:
+                kf_dict = kf if isinstance(kf, dict) else kf.model_dump()
+                fi = kf_dict.get("frame_index", 0)
+                if fi == "first": fi = 0
+                elif fi == "middle": fi = p.get("num_frames", 73) // 2
+                elif fi == "last": fi = p.get("num_frames", 73) - 1
+                elif isinstance(fi, int) and fi < 0: fi = p.get("num_frames", 73) + fi
+                resolved.append({
+                    "image_path": str(uploads.resolve(kf_dict["image_uri"])),
+                    "frame_index": fi,
+                    "strength": kf_dict.get("strength", 1.0),
+                })
+            p["keyframes"] = resolved
+        elif "image_uri" in p and p["image_uri"]:
+            # Single start frame: convert to keyframe at frame 0
+            image_uri = p.pop("image_uri")
+            strength = p.pop("image_strength", 0.85)
+            p["keyframes"] = [{
+                "image_path": str(uploads.resolve(image_uri)),
+                "frame_index": 0,
+                "strength": strength,
+            }]
+        p.pop("image_uri", None)
+        p.pop("image_strength", None)
 
     return Job(
         id=make_job_id(),
