@@ -39,7 +39,7 @@ GEMMA_ROOT = _GEMMA_VARIANTS.get(GEMMA_VARIANT, _GEMMA_VARIANTS["default"])
 # Both LTX and Flux live on cuda:0 but are mutually exclusive (LTX active ~79 GB
 # + Flux active ~81 GB > 96 GB). The server dispatcher auto-swaps by evicting
 # LTX before any Flux forward pass and (re)loading LTX before any video request.
-# cuda:1 is reserved for external training runs — taco-backend never touches it.
+# cuda:1 runs ACE + JoyAI sidecars (or LTX sidecar in turbo/dual-GPU mode).
 LTX_DEVICE = "cuda:0"
 FLUX_DEVICE = "cuda:0"
 LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
@@ -64,8 +64,20 @@ CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
 CHAR_VISION_MODEL = "gemma-4-31b-it"       # Vision model for Char mode ranking
 
-# SplitModelManager: encoder hub + denoiser on single GPU
+# Dual-GPU LTX: dedicate BOTH GPUs to LTX video generation.
+# Two independent users can generate videos simultaneously (one per GPU).
+# Disables Flux, ACE, and JoyAI — cuda:1 is fully allocated to LTX.
+DUAL_GPU_LTX = os.environ.get("DUAL_GPU_LTX", "").lower() in ("1", "true", "yes")
+
+# SplitModelManager: encoder hub + denoiser on cuda:0 (in-process).
+# DUAL_GPU_LTX uses the LTX sidecar on cuda:1 for the second worker
+# (separate process avoids CUDA illegal memory access from concurrent
+# multi-GPU ops in the same process).
 GPU_DEVICES = [LTX_DEVICE]
+if DUAL_GPU_LTX:
+    LOAD_FLUX = False
+    LOAD_JOYAI = False
+    LOAD_ACE = False
 
 # Flux models
 FLUX_MODELS = {
@@ -102,9 +114,11 @@ MAX_QUEUE_DEPTH = 10
 JOB_RESULT_TTL_SECONDS = 600  # 10 minutes
 
 # Turbo mode — dual-GPU inference
-TURBO_GPU_DEVICES = ["cuda:0", "cuda:1"]   # devices available in turbo mode
-NORMAL_GPU_DEVICES = ["cuda:0"]             # devices in normal single-GPU mode
 AUTO_TURBO_IDLE_MINUTES = int(os.environ.get("AUTO_TURBO_IDLE_MINUTES", "15"))
+
+# torch.compile: compile transformer blocks for Inductor-optimized inference.
+# First request after load takes ~60-120s warmup. Default OFF — set TORCH_COMPILE=1 to enable.
+ENABLE_TORCH_COMPILE = os.environ.get("TORCH_COMPILE", "").lower() in ("1", "true", "yes")
 
 # Batch queue
 MAX_BATCH_QUEUE_DEPTH = 5                   # max concurrent batch submissions

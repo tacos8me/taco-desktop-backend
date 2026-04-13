@@ -64,6 +64,7 @@ batch_store = BatchStore()
 _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 
 # Turbo mode — dual-GPU LTX inference (2 concurrent video jobs)
+_VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE}
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None  # second worker_loop for concurrent dispatch
 
@@ -141,6 +142,8 @@ async def _ensure_ltx_resident() -> None:
 
 async def _ensure_flux_ready() -> None:
     """Ensure Flux is ready (pipeline exists) on cuda:0. Caller must hold _inference_lock."""
+    if config.DUAL_GPU_LTX:
+        raise RuntimeError("Flux disabled in dual-GPU LTX mode")
     await _evict_other_tenants("flux")
     if not flux.is_ready:
         logger.info("Auto-swap: loading Flux on %s", config.FLUX_DEVICE)
@@ -236,19 +239,15 @@ async def _dispatch_job(job: Job) -> bytes:
     match job.type:
         case JobType.TEXT_TO_VIDEO:
             await _ensure_ltx_resident()
-            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_text_to_video(**p, on_progress=on_progress)
         case JobType.IMAGE_TO_VIDEO:
             await _ensure_ltx_resident()
-            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_image_to_video(**p, on_progress=on_progress)
         case JobType.AUDIO_TO_VIDEO:
             await _ensure_ltx_resident()
-            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.generate_audio_to_video(**p, on_progress=on_progress)
         case JobType.RETAKE:
             await _ensure_ltx_resident()
-            torch.cuda.set_device(config.LTX_DEVICE)
             return await manager.retake(**p, on_progress=on_progress)
         case JobType.TEXT_TO_IMAGE:
             await _ensure_flux_ready()
@@ -384,7 +383,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
-                    turbo_check=lambda: _turbo_active),
+                    turbo_check=lambda job: _turbo_active and job.type in _VIDEO_JOB_TYPES),
         name="queue-worker",
     )
     cleanup_task = asyncio.create_task(
@@ -399,6 +398,24 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         batch_cleanup_loop(),
         name="batch-cleanup",
     )
+    # Dual-GPU LTX: use LTX sidecar on cuda:1 for second concurrent worker.
+    # Must be a separate process — concurrent CUDA ops on different GPUs in
+    # the same process cause illegal memory access.
+    dual_worker_task = None
+    if config.DUAL_GPU_LTX:
+        global _turbo_active
+        try:
+            await ltx_sidecar.load()
+            _turbo_active = True  # bypass _inference_lock, route 2nd worker to sidecar
+            dual_worker_task = asyncio.create_task(
+                worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo,
+                            uploads, history, turbo_check=lambda job: True),
+                name="queue-worker-gpu1",
+            )
+            logger.info("Dual-GPU LTX: sidecar on cuda:1, 2 concurrent video workers active")
+        except Exception:
+            logger.warning("Dual-GPU LTX: sidecar load failed — running single-GPU", exc_info=True)
+
     logger.info("Job queue + batch worker started.")
 
     yield
@@ -407,6 +424,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     cleanup_task.cancel()
     batch_worker_task.cancel()
     batch_cleanup_task.cancel()
+    if dual_worker_task:
+        dual_worker_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -948,7 +967,11 @@ async def system_gpu() -> dict:
                 "gpus": gpus,
                 "turbo": _turbo_active,
                 "gpu0_tenant": _last_gpu_tenant or "idle",
-                "gpu1_tenant": "flux" if _turbo_active else ("ace" if config.LOAD_ACE else "idle"),
+                "gpu1_tenant": (
+                    "ltx-sidecar" if config.DUAL_GPU_LTX else
+                    ("ltx-sidecar" if _turbo_active else
+                     ("ace+joyai" if (config.LOAD_ACE or config.LOAD_JOYAI) else "idle"))
+                ),
             }
             _gpu_cache_time = now
         except Exception as exc:
@@ -1145,6 +1168,8 @@ async def _ace_systemctl(action: str) -> None:
 
 async def _dispatch_job_turbo(job: Job) -> bytes:
     """Route a video job to the LTX sidecar on cuda:1."""
+    if job.type not in _VIDEO_JOB_TYPES:
+        raise ValueError(f"Turbo worker cannot handle {job.type} — only video jobs supported")
     p = job.params
     return await ltx_sidecar.generate(
         job_type=job.type,
@@ -1209,7 +1234,7 @@ async def _enter_turbo_mode() -> None:
     _turbo_active = True
     _turbo_worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo, uploads, history,
-                    turbo_check=lambda: _turbo_active),
+                    turbo_check=lambda job: _turbo_active),
         name="turbo-worker",
     )
     logger.info("TURBO MODE ON: LTX sidecar on cuda:1, 2 concurrent video jobs")
@@ -2664,6 +2689,7 @@ async def v2_batch_status(batch_id: str) -> JSONResponse:
                 "type": r.type,
                 "status": r.status,
                 "result_uri": r.result_uri,
+                "result_url": f"/v2/batch/{batch.id}/result/{r.index}" if r.status == "completed" and r.result_uri else None,
                 "media_type": r.media_type,
                 "error": r.error,
                 "elapsed_s": r.elapsed_s,
@@ -2674,6 +2700,28 @@ async def v2_batch_status(batch_id: str) -> JSONResponse:
         "started_at": batch.started_at,
         "completed_at": batch.completed_at,
     })
+
+
+@app.get("/v2/batch/{batch_id}/result/{index}")
+async def v2_batch_item_result(batch_id: str, index: int) -> Response:
+    """Download the result file for a completed batch item."""
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        return _error(404, "Batch not found")
+    for r in batch.results:
+        if r.index == index and r.status == "completed" and r.result_uri:
+            try:
+                path = uploads.resolve(r.result_uri)
+                if not path.exists():
+                    raise FileNotFoundError()
+                return FileResponse(
+                    path=str(path),
+                    media_type=r.media_type or "application/octet-stream",
+                    headers={"Cache-Control": "no-store"},
+                )
+            except FileNotFoundError:
+                return _error(404, "Result file expired or not found")
+    return _error(404, "Batch item not found or not completed")
 
 
 @app.delete("/v2/batch/{batch_id}")
@@ -2855,8 +2903,10 @@ async def batch_worker() -> None:
                 break
 
             if _turbo_active:
-                # Turbo: dispatch 2 items concurrently — one on each GPU.
-                # First item → _dispatch_job (cuda:0), second → _dispatch_job_turbo (cuda:1).
+                # Dual-GPU / turbo: dispatch 2 items concurrently.
+                # In DUAL_GPU_LTX mode, both go through _dispatch_job — the
+                # in-process _acquire_worker() routes each to a different GPU.
+                # In sidecar turbo, first → _dispatch_job, second → _dispatch_job_turbo.
                 chunk = items[idx:idx+2]
                 batch.current_index = chunk[0][0]
                 dispatchers = [_dispatch_job, _dispatch_job_turbo]

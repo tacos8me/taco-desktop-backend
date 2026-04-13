@@ -21,6 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from dataclasses import replace as _replace
+
+# --- ltx_core (stable across upstream updates) ---
+from ltx_core.batch_split import BatchSplitAdapter
 from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.guiders import (
     MultiModalGuider,
@@ -28,15 +32,47 @@ from ltx_core.components.guiders import (
     create_multimodal_guider_factory,
 )
 from ltx_core.components.noisers import GaussianNoiser
+from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+from ltx_core.model.audio_vae import (
+    AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+    AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+    VOCODER_COMFY_KEYS_FILTER,
+    AudioDecoderConfigurator,
+    AudioEncoderConfigurator,
+    VocoderConfigurator,
+)
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
-from ltx_core.model.upsampler import upsample_video
-from ltx_core.model.video_vae import TilingConfig, decode_video as vae_decode_video, get_video_chunks_number
+from ltx_core.model.transformer import LTXV_MODEL_COMFY_RENAMING_MAP, LTXModelConfigurator, X0Model
+from ltx_core.model.transformer.compiling import COMPILE_TRANSFORMER, modify_sd_ops_for_compilation
+from ltx_core.model.upsampler import LatentUpsamplerConfigurator, upsample_video
+from ltx_core.model.video_vae import (
+    VAE_DECODER_COMFY_KEYS_FILTER,
+    VAE_ENCODER_COMFY_KEYS_FILTER,
+    TilingConfig,
+    VideoDecoderConfigurator,
+    VideoEncoderConfigurator,
+    get_video_chunks_number,
+)
 from ltx_core.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig
-from ltx_core.tools import VideoLatentShape
+from ltx_core.text_encoders.gemma import (
+    EMBEDDINGS_PROCESSOR_KEY_OPS,
+    GEMMA_LLM_KEY_OPS,
+    GEMMA_MODEL_OPS,
+    EmbeddingsProcessorConfigurator,
+    GemmaTextEncoderConfigurator,
+    module_ops_from_gemma_root,
+)
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
+from ltx_core.tools import AudioLatentTools, VideoLatentShape, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
+from ltx_core.utils import find_matching_file
+
+# --- ltx_pipelines (new API) ---
 from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.constants import (
     DEFAULT_NEGATIVE_PROMPT,
@@ -45,34 +81,28 @@ from ltx_pipelines.utils.constants import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     detect_params,
 )
-from ltx_pipelines.retake import TemporalRegionMask
+from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     combined_image_conditionings,
-    denoise_audio_video,
-    denoise_video_only,
-    encode_prompts,
-    multi_modal_guider_denoising_func,
-    multi_modal_guider_factory_denoising_func,
-    noise_audio_state,
-    noise_video_state,
-    simple_denoising_func,
+    create_noised_state,
+    generate_enhanced_prompt,
 )
 from ltx_pipelines.utils.media_io import (
     decode_audio_from_file,
+    decode_video_from_file,
     encode_video,
     get_videostream_metadata,
-    load_video_conditioning,
+    video_preprocess,
 )
-from ltx_pipelines.utils.model_ledger import ModelLedger
 from ltx_pipelines.utils.samplers import (
     euler_denoising_loop,
     gradient_estimating_euler_denoising_loop,
     res2s_audio_video_denoising_loop,
 )
+from ltx_pipelines.utils.types import PipelineComponents
 
 _USE_GE_EULER = os.environ.get("USE_GE_EULER", "").lower() in ("1", "true", "yes")
-from ltx_pipelines.utils.types import PipelineComponents
 
 import config
 
@@ -83,65 +113,61 @@ _DEV_PARAMS = detect_params(config.DEV_CHECKPOINT)
 
 # skip_step=0: full STG on every step. skip_step=1 saved 33% NFE but created
 # temporal oscillation in guidance signal, contributing to ghost trails during fast motion.
-from dataclasses import replace as _replace
 
 # ---------------------------------------------------------------------------
-# CachingModelLedger — returns pre-loaded models instead of disk I/O
+# CachingModelFactory — cached models with lazy-load from SingleGPUModelBuilder
 # ---------------------------------------------------------------------------
 
 
-class CachingModelLedger:
-    """Drop-in for ModelLedger that returns cached model instances.
+class CachingModelFactory:
+    """Server-optimized model cache using SingleGPUModelBuilder for lazy-loading.
 
-    When pipeline code calls ``ledger.transformer()`` then ``del transformer``,
-    the cached reference keeps the model alive on GPU.  ``cleanup_memory()``
-    frees allocator cache but not the weights themselves.
-
-    Models not pre-cached (decoders, upsampler, vocoder) are loaded on-demand
-    from ``_source_ledger`` to keep baseline VRAM low.
+    Pre-loaded models (text encoder, transformer, etc.) are stored in ``_cache``
+    and returned directly. Decoders/upsampler are built on-demand via
+    ``SingleGPUModelBuilder`` to keep baseline VRAM low.
     """
 
     def __init__(self, device: torch.device, cache: dict[str, object],
-                 source_ledger: object = None) -> None:
+                 builders: dict[str, SingleGPUModelBuilder] | None = None) -> None:
         self.device = device
         self.dtype = torch.bfloat16
         self._cache = cache
-        self._source_ledger = source_ledger
+        self._builders = builders or {}
 
-    def _lazy(self, key: str, loader_name: str):
+    def _lazy(self, key: str):
         val = self._cache.get(key)
-        if val is None and self._source_ledger is not None:
+        if val is None and key in self._builders:
             logger.info("Lazy-loading %s on %s", key, self.device)
-            val = getattr(self._source_ledger, loader_name)()
+            val = self._builders[key].build(device=self.device, dtype=self.dtype).to(self.device).eval()
             self._cache[key] = val
         return val
 
     def text_encoder(self):
-        return self._cache["text_encoder"]
+        return self._cache.get("text_encoder")
 
     def gemma_embeddings_processor(self):
-        return self._cache["embeddings_processor"]
+        return self._cache.get("embeddings_processor")
 
     def video_encoder(self):
-        return self._lazy("video_encoder", "video_encoder")
+        return self._lazy("video_encoder")
 
     def audio_encoder(self):
-        return self._cache["audio_encoder"]
+        return self._cache.get("audio_encoder")
 
     def transformer(self):
         return self._cache.get("transformer")
 
     def spatial_upsampler(self):
-        return self._lazy("spatial_upsampler", "spatial_upsampler")
+        return self._lazy("spatial_upsampler")
 
     def video_decoder(self):
-        return self._lazy("video_decoder", "video_decoder")
+        return self._lazy("video_decoder")
 
     def audio_decoder(self):
-        return self._lazy("audio_decoder", "audio_decoder")
+        return self._lazy("audio_decoder")
 
     def vocoder(self):
-        return self._lazy("vocoder", "vocoder")
+        return self._lazy("vocoder")
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +179,13 @@ class CachingModelLedger:
 class DenoiserWorker:
     """Per-GPU worker with its own transformer, decoders, and swap state."""
     device: torch.device
-    ledger: CachingModelLedger
+    ledger: CachingModelFactory
     components: PipelineComponents
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     transformer_state: str = ""
     _user_lora: tuple[str, float] | None = None
     transformer: object = None
     cache: dict[str, object] = field(default_factory=dict)
-    _model_ledger: object = None  # ModelLedger for lazy-loading decoders/upsampler
 
     def evict_transformer(self) -> None:
         """Remove transformer from GPU to free VRAM for heavy operations like VAE encode."""
@@ -237,12 +262,29 @@ class DenoiserWorker:
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
 
-        ledger = ModelLedger(
-            dtype=torch.bfloat16, device=self.device,
-            checkpoint_path=checkpoint, gemma_root_path=config.GEMMA_ROOT,
-            spatial_upsampler_path=config.SPATIAL_UPSAMPLER, loras=loras,
+        # Build transformer via SingleGPUModelBuilder (replaces ModelLedger)
+        sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
+        module_ops: tuple = ()
+        build_loras = tuple(loras)
+        if config.ENABLE_TORCH_COMPILE:
+            module_ops = (COMPILE_TRANSFORMER,)
+            sd_ops = modify_sd_ops_for_compilation(sd_ops)
+            build_loras = tuple(
+                LoraPathStrengthAndSDOps(
+                    path=l.path, strength=l.strength,
+                    sd_ops=modify_sd_ops_for_compilation(l.sd_ops) if l.sd_ops is not None else l.sd_ops,
+                )
+                for l in loras
+            )
+
+        builder = SingleGPUModelBuilder(
+            model_path=checkpoint,
+            model_class_configurator=LTXModelConfigurator,
+            model_sd_ops=sd_ops,
+            loras=build_loras,
+            module_ops=module_ops,
         )
-        new_transformer = ledger.transformer()
+        new_transformer = X0Model(builder.build(device=self.device, dtype=torch.bfloat16)).to(self.device).eval()
         self.transformer = new_transformer
         self.cache["transformer"] = new_transformer
         self.ledger._cache["transformer"] = new_transformer
@@ -255,10 +297,11 @@ class DenoiserWorker:
 # Helpers
 # ---------------------------------------------------------------------------
 
-DECODE_TILING = TilingConfig(
-    spatial_config=None,
-    temporal_config=TemporalTilingConfig(tile_size_in_frames=128, tile_overlap_in_frames=32),
-)
+# Use upstream default tiling config — the tiling implementation was rewritten in
+# the block-based refactor (cosine S-curve blending, weight accumulation). Our old
+# config (128 frames / 32 overlap / no spatial) produced checkerboard artifacts
+# with the new implementation.
+DECODE_TILING = TilingConfig.default()
 
 # Skip tiling for videos ≤257 frames (~10s at 24fps). Single-pass decode = no tile
 # boundary artifacts at all. cuDNN 9.20 fixes the conv3d workspace bug so this fits
@@ -308,8 +351,8 @@ def _emit_phase(on_progress, progress: float, phase: str) -> None:
 
 
 def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iterator[torch.Tensor]:
-    """Decode video in bfloat16 (standard)."""
-    yield from vae_decode_video(latent, decoder, tiling, generator)
+    """Decode video via VideoDecoder.decode_video method."""
+    yield from decoder.decode_video(latent, tiling, generator)
 
 
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
@@ -351,7 +394,7 @@ class SplitModelManager:
     def __init__(self) -> None:
         self._workers: list[DenoiserWorker] = []
         self._encoder_device: torch.device | None = None
-        self._encoder_ledger: CachingModelLedger | None = None
+        self._encoder_ledger: CachingModelFactory | None = None
         # No explicit encode lock needed — CUDA serializes ops on the default
         # stream per-device. Text encoding (0.4s) may wait at most 1 denoising
         # step (~1.5s) when GPU:0 is concurrently denoising. Acceptable tradeoff.
@@ -361,39 +404,18 @@ class SplitModelManager:
         return len(self._workers) > 0
 
     def evict_all(self) -> None:
-        """Free all GPU memory — evict transformer + encoder hub on all workers.
-
-        Previously this left ~22 GB of encoder-hub weights resident on the LTX
-        device after a pause/unload, because each `DenoiserWorker` holds TWO
-        strong references to its source `ModelLedger` (one on `worker._model_ledger`
-        directly, and one indirectly via `worker.ledger._source_ledger` on the
-        `CachingModelLedger` wrapper). The ledger's internal registry and builders
-        then keep the loaded weight tensors pinned on the GPU, and no amount of
-        `gc.collect()` + `empty_cache()` can reclaim them while those references
-        exist. Explicitly setting both to `None` per worker breaks the chain so
-        the ledger, its registry, and the underlying weights can actually be
-        garbage collected.
-        """
+        """Free all GPU memory — evict transformer + encoder hub on all workers."""
         for worker in self._workers:
             worker.evict_transformer()
-            # Drop all cached models (worker.cache and worker.ledger._cache are
-            # the SAME dict object by reference — clearing one clears both).
             for key in list(worker.cache.keys()):
                 worker.cache[key] = None
-            # CRITICAL: clear both strong refs to the source ModelLedger. Without
-            # these, the ledger's registry + weight builders pin ~22 GB of
-            # encoder-hub weights (Gemma text encoder + VAE + spatial upsampler)
-            # on the worker's device indefinitely.
-            worker._model_ledger = None
-            worker.ledger._source_ledger = None
+            # Clear builder refs so weight tensors can be GC'd
+            worker.ledger._builders.clear()
         self._workers.clear()
         if self._encoder_ledger is not None:
             for key in list(self._encoder_ledger._cache.keys()):
                 self._encoder_ledger._cache[key] = None
-            # The encoder-hub wrapper was constructed without source_ledger so
-            # this is usually None already, but zero it defensively in case the
-            # constructor changes or a future refactor adds one.
-            self._encoder_ledger._source_ledger = None
+            self._encoder_ledger._builders.clear()
             self._encoder_ledger = None
         gc.collect()
         for device_name in config.GPU_DEVICES:
@@ -404,50 +426,94 @@ class SplitModelManager:
     def load_all(self) -> None:
         self._workers.clear()
         devices = [torch.device(d) for d in config.GPU_DEVICES]
+        checkpoint = config.DEV_CHECKPOINT
 
         # --- Shared encoder hub on GPU:0 ---
         self._encoder_device = devices[0]
         logger.info("Loading shared encoder hub on %s ...", devices[0])
-        enc_ledger = ModelLedger(
-            dtype=torch.bfloat16, device=devices[0],
-            checkpoint_path=config.DEV_CHECKPOINT,
-            gemma_root_path=config.GEMMA_ROOT,
-            spatial_upsampler_path=config.SPATIAL_UPSAMPLER,
-            loras=(),
-        )
-        enc_video_encoder = enc_ledger.video_encoder()  # kept for retake conditioning
+
+        # Build encoder components directly via SingleGPUModelBuilder
+        gemma_module_ops = module_ops_from_gemma_root(config.GEMMA_ROOT)
+        model_folder = find_matching_file(config.GEMMA_ROOT, "model*.safetensors").parent
+        gemma_weight_paths = tuple(str(p) for p in model_folder.rglob("*.safetensors"))
+
+        text_encoder = SingleGPUModelBuilder(
+            model_path=gemma_weight_paths,
+            model_class_configurator=GemmaTextEncoderConfigurator,
+            model_sd_ops=GEMMA_LLM_KEY_OPS,
+            module_ops=(GEMMA_MODEL_OPS, *gemma_module_ops),
+        ).build(device=devices[0], dtype=torch.bfloat16).to(devices[0]).eval()
+
+        embeddings_processor = SingleGPUModelBuilder(
+            model_path=checkpoint,
+            model_class_configurator=EmbeddingsProcessorConfigurator,
+            model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
+        ).build(device=devices[0], dtype=torch.bfloat16).to(devices[0]).eval()
+
+        enc_video_encoder = SingleGPUModelBuilder(
+            model_path=checkpoint,
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=devices[0], dtype=torch.bfloat16).to(devices[0]).eval()
+
+        audio_encoder = SingleGPUModelBuilder(
+            model_path=checkpoint,
+            model_class_configurator=AudioEncoderConfigurator,
+            model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=devices[0], dtype=torch.bfloat16).to(devices[0]).eval()
+
         encoder_cache = {
-            "text_encoder": enc_ledger.text_encoder(),
-            "embeddings_processor": enc_ledger.gemma_embeddings_processor(),
+            "text_encoder": text_encoder,
+            "embeddings_processor": embeddings_processor,
             "video_encoder": enc_video_encoder,
-            "audio_encoder": enc_ledger.audio_encoder(),
+            "audio_encoder": audio_encoder,
         }
-        self._encoder_ledger = CachingModelLedger(devices[0], encoder_cache)
+        self._encoder_ledger = CachingModelFactory(devices[0], encoder_cache)
 
         # --- Denoiser worker on each GPU ---
         # Only pre-load transformer + video_encoder on GPU. Decoders/upsampler
         # are loaded on-demand (after transformer is evicted, freeing ~44GB).
-        # This keeps baseline at ~50GB instead of ~70GB, leaving room for inference.
         for device in devices:
             logger.info("Loading denoiser worker on %s ...", device)
-            den_ledger = ModelLedger(
-                dtype=torch.bfloat16, device=device,
-                checkpoint_path=config.DEV_CHECKPOINT,
-                gemma_root_path=config.GEMMA_ROOT,
-                spatial_upsampler_path=config.SPATIAL_UPSAMPLER,
-                loras=(),
-            )
-            transformer = den_ledger.transformer()
+
+            # Build transformer (with optional torch.compile)
+            sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
+            module_ops: tuple = ()
+            if config.ENABLE_TORCH_COMPILE:
+                module_ops = (COMPILE_TRANSFORMER,)
+                sd_ops = modify_sd_ops_for_compilation(sd_ops)
+            transformer = X0Model(
+                SingleGPUModelBuilder(
+                    model_path=checkpoint,
+                    model_class_configurator=LTXModelConfigurator,
+                    model_sd_ops=sd_ops,
+                    module_ops=module_ops,
+                ).build(device=device, dtype=torch.bfloat16)
+            ).to(device).eval()
+
             # GPU:0 reuses encoder hub's video_encoder to avoid ~5GB duplication
-            vid_enc = enc_video_encoder if device == devices[0] else den_ledger.video_encoder()
+            vid_enc = enc_video_encoder if device == devices[0] else SingleGPUModelBuilder(
+                model_path=checkpoint,
+                model_class_configurator=VideoEncoderConfigurator,
+                model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+            ).build(device=device, dtype=torch.bfloat16).to(device).eval()
+
             cache = {
                 "transformer": transformer,
                 "video_encoder": vid_enc,
             }
+            # Lazy-load builders for components freed after decode (video_encoder,
+            # spatial_upsampler evicted between stages; decoders loaded on demand).
+            lazy_builders = {
+                "video_encoder": SingleGPUModelBuilder(model_path=checkpoint, model_class_configurator=VideoEncoderConfigurator, model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER),
+                "video_decoder": SingleGPUModelBuilder(model_path=checkpoint, model_class_configurator=VideoDecoderConfigurator, model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER),
+                "audio_decoder": SingleGPUModelBuilder(model_path=checkpoint, model_class_configurator=AudioDecoderConfigurator, model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER),
+                "vocoder": SingleGPUModelBuilder(model_path=checkpoint, model_class_configurator=VocoderConfigurator, model_sd_ops=VOCODER_COMFY_KEYS_FILTER),
+                "spatial_upsampler": SingleGPUModelBuilder(model_path=config.SPATIAL_UPSAMPLER, model_class_configurator=LatentUpsamplerConfigurator),
+            }
             worker = DenoiserWorker(
                 device=device,
-                ledger=CachingModelLedger(device, cache, source_ledger=den_ledger),
-                _model_ledger=den_ledger,
+                ledger=CachingModelFactory(device, cache, builders=lazy_builders),
                 components=PipelineComponents(dtype=torch.bfloat16, device=device),
                 transformer_state="dev",
                 transformer=transformer,
@@ -507,6 +573,8 @@ class SplitModelManager:
 
     async def _acquire_worker(self) -> DenoiserWorker:
         """Wait for and return the first unlocked worker."""
+        if not self._workers:
+            raise RuntimeError("No LTX workers available — call load_all() first")
         while True:
             for worker in self._workers:
                 if not worker.lock.locked():
@@ -518,7 +586,6 @@ class SplitModelManager:
 
     def _contexts_to_device(self, contexts, target: torch.device):
         """Move EmbeddingsProcessorOutput tensors to target device."""
-        from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
         return [
             EmbeddingsProcessorOutput(
                 video_encoding=ctx.video_encoding.to(target),
@@ -528,27 +595,75 @@ class SplitModelManager:
             for ctx in contexts
         ]
 
+    # --- Prompt encoding (replaces upstream encode_prompts) ---
+
+    def _encode_prompts(self, prompts: list[str], *, enhance_first_prompt: bool = False, enhance_prompt_image: str | None = None, enhance_prompt_seed: int = 42) -> list[EmbeddingsProcessorOutput]:
+        """Encode prompts through cached Gemma text encoder + embeddings processor."""
+        text_encoder = self._encoder_ledger.text_encoder()
+        if enhance_first_prompt:
+            prompts = list(prompts)
+            prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], image_path=enhance_prompt_image, seed=enhance_prompt_seed)
+        raw_outputs = [text_encoder.encode(p) for p in prompts]
+        torch.cuda.synchronize()
+        embeddings_processor = self._encoder_ledger.gemma_embeddings_processor()
+        return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+
+    # --- State creation helper (replaces denoise_audio_video / denoise_video_only) ---
+
+    @staticmethod
+    def _create_av_states(
+        pixel_shape: VideoPixelShape, fps: float, noiser, dtype, device,
+        video_conds=None, audio_conds=None,
+        initial_video=None, initial_audio=None,
+        video_noise_scale: float = 1.0, audio_noise_scale: float = 1.0,
+        freeze_audio: bool = False,
+    ):
+        """Create noised video + audio latent states for denoising.
+
+        Returns (video_state, audio_state, video_tools, audio_tools).
+        """
+        v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
+        v_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
+        video_state = create_noised_state(
+            v_tools, video_conds or [], noiser, dtype, device,
+            noise_scale=video_noise_scale, initial_latent=initial_video,
+        )
+
+        a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
+        a_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
+        # Frozen audio must have noise_scale=0.0 — the old denoise_video_only
+        # explicitly zeroed it. Adding noise then freezing the mask means the
+        # transformer sees noisy audio conditioning every step, corrupting video.
+        effective_audio_noise = 0.0 if freeze_audio else audio_noise_scale
+        audio_state = create_noised_state(
+            a_tools, audio_conds or [], noiser, dtype, device,
+            noise_scale=effective_audio_noise, initial_latent=initial_audio,
+        )
+        if freeze_audio:
+            audio_state = _replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
+
+        return video_state, audio_state, v_tools, a_tools
+
     # --- Generation flows ---
 
     @staticmethod
-    def _wrap_denoise(denoise_fn, on_progress, total_steps, offset=0.0, scale=1.0):
-        """Wrap a denoise_fn to report progress on each step.
+    def _wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=1.0):
+        """Wrap a Denoiser to report progress on each step.
 
-        Cap is 0.90 (was 0.99 in v1.1.4): the top 10% of the progress bar is
-        reserved for post-denoise phases (decoding, encoding, saving) that are
-        emitted explicitly by the `_run_*` methods below. This makes the
-        previously-invisible 10–20 s VAE-decode-plus-ffmpeg-encode tail show up
-        as phase labels instead of a frozen 95%.
+        Cap is 0.90: the top 10% of the progress bar is reserved for
+        post-denoise phases (decoding, encoding, saving).
         """
-        step_count = [0]  # mutable counter for closure
+        step_count = [0]
 
-        def wrapped(*args, **kwargs):
-            result = denoise_fn(*args, **kwargs)
-            step_count[0] += 1
-            p = offset + min(step_count[0] / max(total_steps, 1), 1.0) * scale
-            on_progress(min(p, 0.90))
-            return result
-        return wrapped
+        class ProgressDenoiser:
+            def __call__(self, transformer, video_state, audio_state, sigmas, step_index):
+                result = denoiser(transformer, video_state, audio_state, sigmas, step_index)
+                step_count[0] += 1
+                p = offset + min(step_count[0] / max(total_steps, 1), 1.0) * scale
+                on_progress(min(p, 0.90))
+                return result
+
+        return ProgressDenoiser()
 
     @torch.inference_mode()
     def _run_t2v(
@@ -566,12 +681,12 @@ class SplitModelManager:
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
         if is_fast:
-            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -588,62 +703,65 @@ class SplitModelManager:
 
         transformer = worker.ledger.transformer()
 
+        # Create initial states for stage 1
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_1_shape, fps, noiser, dtype, device, video_conds=stage_1_cond,
+        )
+
         if is_fast:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
             split_at = 4  # Reddit audio fix: split schedule at step 4
             s1_steps = len(sigmas) - 1
 
-            def denoising_loop(sigmas, video_state, audio_state, stepper):
-                nonlocal transformer
-                # Pass 1: dev + LoRA 0.2, simple denoise (no CFG — saves 2-3x memory)
-                sigmas_1 = sigmas[:split_at + 1]
-                dfn_1 = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn_1 = self._wrap_denoise(dfn_1, on_progress, s1_steps, offset=0.0, scale=0.35)
-                video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_1)
+            # Pass 1: dev + LoRA 0.2, simple denoise (no CFG — saves 2-3x memory)
+            denoiser_1 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+            if on_progress:
+                denoiser_1 = self._wrap_denoiser(denoiser_1, on_progress, split_at, offset=0.0, scale=0.35)
+            sigmas_1 = sigmas[:split_at + 1]
+            video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_1)
 
-                # Free pass 1 model + activations before loading pass 2
-                del dfn_1
-                transformer = None
-                worker.evict_transformer()
-                gc.collect()
-                torch.cuda.empty_cache()
+            # Free pass 1 model + activations before loading pass 2
+            del denoiser_1
+            transformer = None
+            worker.evict_transformer()
+            gc.collect()
+            torch.cuda.empty_cache()
 
-                # Swap to distilled for pass 2
-                worker.ensure_transformer("distilled", user_lora=user_lora)
-                transformer = worker.ledger.transformer()
+            # Swap to distilled for pass 2
+            worker.ensure_transformer("distilled", user_lora=user_lora)
+            transformer = worker.ledger.transformer()
 
-                # Pass 2: distilled with simple denoise (last 4 steps)
-                sigmas_2 = sigmas[split_at:]
-                dfn_2 = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn_2 = self._wrap_denoise(dfn_2, on_progress, s1_steps, offset=0.35, scale=0.35)
-                return euler_denoising_loop(sigmas=sigmas_2, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn_2)
+            # Pass 2: distilled with simple denoise (last 4 steps)
+            denoiser_2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+            if on_progress:
+                denoiser_2 = self._wrap_denoiser(denoiser_2, on_progress, s1_steps - split_at, offset=0.35, scale=0.35)
+            sigmas_2 = sigmas[split_at:]
+            video_state, audio_state = euler_denoising_loop(sigmas=sigmas_2, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_2)
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
             sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
-            def denoising_loop(sigmas, video_state, audio_state, stepper):
-                dfn = multi_modal_guider_factory_denoising_func(
-                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                    audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
-                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
+            denoiser = FactoryGuidedDenoiser(
+                v_context=v_context_p, a_context=a_context_p,
+                video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
+            )
+            if on_progress:
+                denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+            video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
 
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
-            sigmas=sigmas, stepper=stepper, denoising_loop_fn=denoising_loop,
-            components=worker.components, dtype=dtype, device=device,
-        )
+        # Post-process stage 1
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free transformer (~22GB) before upsample — not needed for upsample_video
         stage_1_latent = video_state.latent[:1]
         stage_1_audio_latent = audio_state.latent
-        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, v_tools, a_tools
         cleanup_memory()
 
         upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
@@ -659,25 +777,31 @@ class SplitModelManager:
         distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
-        def stage2_loop(sigmas, video_state, audio_state, stepper):
-            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, s2_steps, offset=0.7, scale=0.25)
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
-
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
-            sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
-            components=worker.components, dtype=dtype, device=device,
-            noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=stage_1_audio_latent,
+        # Stage 2: create states with upscaled video as initial latent
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_2_shape, fps, noiser, dtype, device,
+            video_conds=stage_2_cond,
+            video_noise_scale=float(distilled_sigmas[0]),
+            audio_noise_scale=float(distilled_sigmas[0]),
+            initial_video=upscaled, initial_audio=stage_1_audio_latent,
         )
+
+        denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        if on_progress:
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
+        video_state, audio_state = euler_denoising_loop(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
+
+        # Post-process stage 2
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free everything before decode — evict transformer + cached models to reclaim VRAM
         video_latent = video_state.latent
         audio_latent = audio_state.latent
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
-        del transformer, stage2_loop, distilled_sigmas, video_encoder
+        del transformer, denoiser_s2, distilled_sigmas, video_encoder, v_tools, a_tools
         worker.evict_transformer()
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
@@ -708,7 +832,7 @@ class SplitModelManager:
 
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
-        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+        ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -730,29 +854,33 @@ class SplitModelManager:
         # res2s: 2 NFE per step + 1 final
         s1_nfe = 2 * hq_params.num_inference_steps + 1
 
-        def denoising_loop(sigmas, video_state, audio_state, stepper):
-            dfn = multi_modal_guider_denoising_func(
-                video_guider=MultiModalGuider(params=hq_params.video_guider_params, negative_context=v_context_n),
-                audio_guider=MultiModalGuider(params=hq_params.audio_guider_params, negative_context=a_context_n),
-                v_context=v_context_p, a_context=a_context_p, transformer=transformer,
-            )
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, s1_nfe, offset=0.0, scale=0.7)
-            return res2s_audio_video_denoising_loop(
-                sigmas=sigmas, video_state=video_state, audio_state=audio_state,
-                stepper=stepper, denoise_fn=dfn,
-            )
-
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
-            sigmas=sigmas, stepper=stepper, denoising_loop_fn=denoising_loop,
-            components=worker.components, dtype=dtype, device=device,
+        # Create initial states for stage 1
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_1_shape, fps, noiser, dtype, device, video_conds=stage_1_cond,
         )
+
+        denoiser = GuidedDenoiser(
+            v_context=v_context_p, a_context=a_context_p,
+            video_guider=MultiModalGuider(params=hq_params.video_guider_params, negative_context=v_context_n),
+            audio_guider=MultiModalGuider(params=hq_params.audio_guider_params, negative_context=a_context_n),
+        )
+        if on_progress:
+            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_nfe, offset=0.0, scale=0.7)
+        video_state, audio_state = res2s_audio_video_denoising_loop(
+            sigmas=sigmas, video_state=video_state, audio_state=audio_state,
+            stepper=stepper, transformer=transformer, denoiser=denoiser,
+        )
+
+        # Post-process stage 1
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free transformer before upsample — not needed for upsample_video
         stage_1_latent = video_state.latent[:1]
         stage_1_audio_latent = audio_state.latent
-        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoiser, v_tools, a_tools
         cleanup_memory()
 
         upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
@@ -767,28 +895,34 @@ class SplitModelManager:
         # res2s stage 2: 2 NFE per step + 1 final (3 distilled steps = 2 actual steps)
         s2_nfe = 2 * (len(distilled_sigmas) - 1) + 1
 
-        def stage2_loop(sigmas, video_state, audio_state, stepper):
-            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, s2_nfe, offset=0.7, scale=0.25)
-            return res2s_audio_video_denoising_loop(
-                sigmas=sigmas, video_state=video_state, audio_state=audio_state,
-                stepper=stepper, denoise_fn=dfn,
-            )
-
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
-            sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
-            components=worker.components, dtype=dtype, device=device,
-            noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=stage_1_audio_latent,
+        # Stage 2: create states with upscaled video as initial latent
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_2_shape, fps, noiser, dtype, device,
+            video_conds=stage_2_cond,
+            video_noise_scale=float(distilled_sigmas[0]),
+            audio_noise_scale=float(distilled_sigmas[0]),
+            initial_video=upscaled, initial_audio=stage_1_audio_latent,
         )
+
+        denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        if on_progress:
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_nfe, offset=0.7, scale=0.25)
+        video_state, audio_state = res2s_audio_video_denoising_loop(
+            sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state,
+            stepper=stepper, transformer=transformer, denoiser=denoiser_s2,
+        )
+
+        # Post-process stage 2
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free everything before decode — evict transformer + cached models to reclaim VRAM
         video_latent = video_state.latent
         audio_latent = audio_state.latent
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
-        del transformer, stage2_loop, distilled_sigmas, video_encoder
+        del transformer, denoiser_s2, distilled_sigmas, video_encoder, v_tools, a_tools
         worker.evict_transformer()
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
@@ -823,13 +957,14 @@ class SplitModelManager:
 
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
+        _enhance_image = images[0].path if images else None
         if is_fast:
-            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -848,37 +983,39 @@ class SplitModelManager:
         if is_fast:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
-
-            def denoising_loop(sigmas, video_state, audio_state, stepper):
-                dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
             sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
-            def denoising_loop(sigmas, video_state, audio_state, stepper):
-                dfn = multi_modal_guider_factory_denoising_func(
-                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                    audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
-                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
-
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
-            sigmas=sigmas, stepper=stepper, denoising_loop_fn=denoising_loop,
-            components=worker.components, dtype=dtype, device=device,
+        # Create initial states for stage 1
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_1_shape, fps, noiser, dtype, device, video_conds=stage_1_cond,
         )
+
+        if is_fast:
+            denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        else:
+            denoiser = FactoryGuidedDenoiser(
+                v_context=v_context_p, a_context=a_context_p,
+                video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
+            )
+        if on_progress:
+            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+        video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+
+        # Post-process stage 1
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free transformer before upsample — not needed for upsample_video
         stage_1_latent = video_state.latent[:1]
         stage_1_audio_latent = audio_state.latent
-        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoising_loop
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoiser, v_tools, a_tools
         cleanup_memory()
 
         upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
@@ -894,25 +1031,31 @@ class SplitModelManager:
         distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
-        def stage2_loop(sigmas, video_state, audio_state, stepper):
-            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, s2_steps, offset=0.7, scale=0.25)
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
-
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
-            sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
-            components=worker.components, dtype=dtype, device=device,
-            noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=stage_1_audio_latent,
+        # Stage 2: create states with upscaled video as initial latent
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_2_shape, fps, noiser, dtype, device,
+            video_conds=stage_2_cond,
+            video_noise_scale=float(distilled_sigmas[0]),
+            audio_noise_scale=float(distilled_sigmas[0]),
+            initial_video=upscaled, initial_audio=stage_1_audio_latent,
         )
+
+        denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        if on_progress:
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
+        video_state, audio_state = euler_denoising_loop(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
+
+        # Post-process stage 2
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free everything before decode — evict transformer to reclaim ~22GB VRAM
         video_latent = video_state.latent
         audio_latent = audio_state.latent
         del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
-        del transformer, stage2_loop, distilled_sigmas
+        del transformer, denoiser_s2, distilled_sigmas, v_tools, a_tools
         worker.evict_transformer()
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
@@ -943,13 +1086,14 @@ class SplitModelManager:
 
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
+        _enhance_image = image_path
         if is_fast:
-            (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
+            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -957,9 +1101,19 @@ class SplitModelManager:
 
         # Audio encoding on GPU:0, then transfer to worker device
         decoded_audio = decode_audio_from_file(audio_path, self._encoder_device, max_duration=num_frames / fps)
+        if decoded_audio is None:
+            raise ValueError("No audio track found in the provided file")
         encoded_audio_latent = vae_encode_audio(decoded_audio, self._encoder_ledger.audio_encoder())
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / fps, channels=8, mel_bins=16)
         encoded_audio_latent = encoded_audio_latent[:, :, :audio_shape.frames].to(device)
+        actual_frames = encoded_audio_latent.shape[2]
+        if actual_frames < audio_shape.frames:
+            pad = torch.zeros(
+                encoded_audio_latent.shape[0], encoded_audio_latent.shape[1],
+                audio_shape.frames - actual_frames, encoded_audio_latent.shape[3],
+                device=encoded_audio_latent.device, dtype=encoded_audio_latent.dtype,
+            )
+            encoded_audio_latent = torch.cat([encoded_audio_latent, pad], dim=2)
 
         images: list[ImageConditioningInput] = []
         if image_path is not None:
@@ -978,37 +1132,43 @@ class SplitModelManager:
         if is_fast:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
-
-            def stage1_loop(sigmas, video_state, audio_state, stepper):
-                dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
             sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
-            def stage1_loop(sigmas, video_state, audio_state, stepper):
-                dfn = multi_modal_guider_factory_denoising_func(
-                    video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
-                    audio_guider_factory=create_multimodal_guider_factory(params=MultiModalGuiderParams(), negative_context=None),
-                    v_context=v_context_p, a_context=a_context_p, transformer=transformer)
-                if on_progress:
-                    dfn = self._wrap_denoise(dfn, on_progress, s1_steps, offset=0.0, scale=0.7)
-                return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
-
-        video_state = denoise_video_only(
-            output_shape=stage_1_shape, conditionings=stage_1_cond, noiser=noiser,
-            sigmas=sigmas, stepper=stepper, denoising_loop_fn=stage1_loop,
-            components=worker.components, dtype=dtype, device=device,
-            initial_audio_latent=encoded_audio_latent,
+        # Create initial states for stage 1 (audio frozen)
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_1_shape, fps, noiser, dtype, device, video_conds=stage_1_cond,
+            initial_audio=encoded_audio_latent, freeze_audio=True,
         )
+
+        if is_fast:
+            denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        else:
+            # Static guiders (not factory) — matches upstream A2VidPipelineTwoStage.
+            # Factory guiders resolve per-step from sigma which weakens audio coupling
+            # at low sigma values. Static guiders maintain consistent audio-video
+            # guidance strength across all denoising steps.
+            denoiser = GuidedDenoiser(
+                v_context=v_context_p, a_context=a_context_p,
+                video_guider=MultiModalGuider(params=params.video_guider_params, negative_context=v_context_n),
+                audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
+            )
+        if on_progress:
+            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+        video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+
+        # Post-process stage 1
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free transformer before upsample — not needed for upsample_video
         stage_1_latent = video_state.latent[:1]
-        del video_state, stage_1_cond, sigmas, transformer, stage1_loop
+        del video_state, audio_state, stage_1_cond, sigmas, transformer, denoiser, v_tools, a_tools
         cleanup_memory()
 
         upscaled = upsample_video(latent=stage_1_latent, video_encoder=video_encoder, upsampler=worker.ledger.spatial_upsampler())
@@ -1023,24 +1183,30 @@ class SplitModelManager:
         distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
-        def stage2_loop(sigmas, video_state, audio_state, stepper):
-            dfn = simple_denoising_func(video_context=v_context_p, audio_context=a_context_p, transformer=transformer)
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, s2_steps, offset=0.7, scale=0.25)
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
-
-        video_state = denoise_video_only(
-            output_shape=stage_2_shape, conditionings=stage_2_cond, noiser=noiser,
-            sigmas=distilled_sigmas, stepper=stepper, denoising_loop_fn=stage2_loop,
-            components=worker.components, dtype=dtype, device=device,
-            noise_scale=distilled_sigmas[0], initial_video_latent=upscaled,
-            initial_audio_latent=encoded_audio_latent,
+        # Stage 2: create states with upscaled video as initial latent (audio frozen)
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_2_shape, fps, noiser, dtype, device,
+            video_conds=stage_2_cond,
+            video_noise_scale=float(distilled_sigmas[0]),
+            initial_video=upscaled, initial_audio=encoded_audio_latent,
+            freeze_audio=True,
         )
+
+        denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        if on_progress:
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
+        video_state, audio_state = euler_denoising_loop(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
+
+        # Post-process stage 2
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Free everything before decode — evict transformer to reclaim ~22GB VRAM
         video_latent = video_state.latent
-        del video_state, stage_2_cond, upscaled
-        del transformer, stage2_loop, distilled_sigmas
+        del video_state, audio_state, stage_2_cond, upscaled
+        del transformer, denoiser_s2, distilled_sigmas, v_tools, a_tools
         worker.evict_transformer()
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
@@ -1069,12 +1235,13 @@ class SplitModelManager:
         regenerate_audio = mode in ("replace_audio_and_video", "replace_audio")
 
         # Get video metadata
-        fps_vid, num_frames, vid_width, vid_height = get_videostream_metadata(video_path)
+        meta = get_videostream_metadata(video_path)
+        fps_vid, num_frames, vid_width, vid_height = meta.fps, meta.frames, meta.width, meta.height
 
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
         params = _DEV_PARAMS
-        ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
+        ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT])
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         self._page_encoder_to_cpu()  # free ~25 GB for denoising + decode
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
@@ -1086,7 +1253,8 @@ class SplitModelManager:
 
         # Encode input video on GPU:0, transfer to worker device
         video_encoder_enc = self._encoder_ledger.video_encoder()
-        video_conditioning = load_video_conditioning(video_path, height=vid_height, width=vid_width, frame_cap=num_frames, dtype=dtype, device=self._encoder_device)
+        frame_gen = decode_video_from_file(path=video_path, device=self._encoder_device, max_duration=num_frames / fps_vid)
+        video_conditioning = video_preprocess(frame_gen, vid_height, vid_width, dtype, self._encoder_device)
         initial_video_latent = video_encoder_enc(video_conditioning.to(self._encoder_device, dtype=dtype)).to(device)
         del video_conditioning
         cleanup_memory()
@@ -1123,16 +1291,6 @@ class SplitModelManager:
 
         transformer = worker.ledger.transformer()
 
-        # Build denoising function with guiders (retake is single-stage, maps 0-0.95)
-        def retake_loop(sigmas, video_state, audio_state, stepper):
-            dfn = multi_modal_guider_denoising_func(
-                video_guider=MultiModalGuider(params=params.video_guider_params, negative_context=v_context_n),
-                audio_guider=MultiModalGuider(params=params.audio_guider_params, negative_context=a_context_n),
-                v_context=v_context_p, a_context=a_context_p, transformer=transformer)
-            if on_progress:
-                dfn = self._wrap_denoise(dfn, on_progress, total_steps, offset=0.0, scale=0.95)
-            return euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, denoise_fn=dfn)
-
         # Build temporal conditionings: mask=1 inside [start, end) for regen, mask=0 for preserve
         video_conditionings = [
             TemporalRegionMask(
@@ -1151,26 +1309,29 @@ class SplitModelManager:
                 )
             ]
 
-        # Noise video and audio states separately with per-modality temporal masks
-        video_state, video_tools = noise_video_state(
-            output_shape=output_shape, noiser=noiser,
-            conditionings=video_conditionings,
-            components=worker.components, dtype=dtype, device=device,
-            initial_latent=initial_video_latent,
-        )
-        audio_state, audio_tools = noise_audio_state(
-            output_shape=output_shape, noiser=noiser,
-            conditionings=audio_conditionings,
-            components=worker.components, dtype=dtype, device=device,
-            initial_latent=initial_audio_latent,
-        )
+        # Create noised video and audio states with per-modality temporal masks
+        v_shape = VideoLatentShape.from_pixel_shape(output_shape)
+        v_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps_vid)
+        video_state = create_noised_state(v_tools, video_conditionings, noiser, dtype, device, initial_latent=initial_video_latent)
 
-        video_state, audio_state = retake_loop(sigmas, video_state, audio_state, stepper)
+        a_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+        a_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
+        audio_state = create_noised_state(a_tools, audio_conditionings, noiser, dtype, device, initial_latent=initial_audio_latent)
 
-        video_state = video_tools.clear_conditioning(video_state)
-        video_state = video_tools.unpatchify(video_state)
-        audio_state = audio_tools.clear_conditioning(audio_state)
-        audio_state = audio_tools.unpatchify(audio_state)
+        # Build denoiser with guiders (retake is single-stage, maps 0-0.95)
+        denoiser = GuidedDenoiser(
+            v_context=v_context_p, a_context=a_context_p,
+            video_guider=MultiModalGuider(params=params.video_guider_params, negative_context=v_context_n),
+            audio_guider=MultiModalGuider(params=params.audio_guider_params, negative_context=a_context_n),
+        )
+        if on_progress:
+            denoiser = self._wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=0.95)
+        video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
 
         # Evict transformer (~22GB) before VAE decode to avoid OOM
         del transformer

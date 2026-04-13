@@ -224,7 +224,7 @@ async def worker_loop(
     dispatch_fn: Callable,
     uploads: UploadStore,
     history: "HistoryStore | None" = None,
-    turbo_check: Callable[[], bool] | None = None,
+    turbo_check: Callable[[Job], bool] | Callable[[], bool] | None = None,
 ) -> None:
     """Background worker that processes jobs from the queue.
 
@@ -232,6 +232,10 @@ async def worker_loop(
     because SplitModelManager._acquire_worker() handles per-GPU serialization
     via worker.lock. This allows 2 worker_loop instances to dispatch 2 video
     jobs concurrently on 2 GPUs.
+
+    turbo_check receives the Job being dispatched so it can decide per-job
+    whether the lock is needed (e.g. Flux image jobs still need the lock
+    even when turbo is active for video jobs).
     """
     logger.info("Queue worker started")
     while True:
@@ -248,7 +252,7 @@ async def worker_loop(
 
         result_bytes: bytes | None = None
         try:
-            if turbo_check and turbo_check():
+            if turbo_check and turbo_check(job):
                 # Turbo: skip inference lock — 2 LTX workers handle per-GPU
                 # serialization via SplitModelManager._acquire_worker(). Both
                 # worker_loop instances can dispatch concurrently.
