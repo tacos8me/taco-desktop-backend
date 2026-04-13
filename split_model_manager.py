@@ -326,9 +326,15 @@ def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num
             output_path=tmp_path,
             video_chunks_number=video_chunks_number,
         )
-        return Path(tmp_path).read_bytes()
+        result = Path(tmp_path).read_bytes()
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+    # Release the torch caching allocator's held blocks from decode/encode.
+    # Without this, 10-15 GB of freed 4K activation blocks linger in the
+    # allocator cache and cause OOM on the NEXT generation.
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
 
 
 # ---------------------------------------------------------------------------
