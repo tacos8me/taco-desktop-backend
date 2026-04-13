@@ -452,6 +452,51 @@ class SplitModelManager:
 
         logger.info("All models loaded: %d workers, encoder on %s", len(self._workers), self._encoder_device)
 
+    # --- Encoder hub paging (CPU ↔ GPU) ---
+
+    def _page_encoder_to_cpu(self) -> None:
+        """Move text encoder + audio encoder to CPU after prompt encoding.
+
+        Frees ~25.5 GB on cuda:0 for denoising + VAE decode. The encoder
+        is only needed during the ~2s encode_prompts() call; keeping it
+        resident during the 30-60s denoising + decode wastes 25% of the
+        96 GB budget and causes OOM on 4K (3840x2160) generations.
+        """
+        if self._encoder_ledger is None:
+            return
+        te = self._encoder_ledger._cache.get("text_encoder")
+        ae = self._encoder_ledger._cache.get("audio_encoder")
+        if te is not None:
+            te.to("cpu")
+        if ae is not None:
+            ae.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("Encoder hub paged to CPU (freed ~25 GB on %s)", self._encoder_device)
+
+    def _page_encoder_to_gpu(self) -> None:
+        """Move text encoder + audio encoder back to GPU before encoding.
+
+        Cost: ~2-3s via PCIe 5.0 (25 GB at 13-53 GB/s depending on
+        pinned vs pageable). Acceptable since gen takes 30-60s total.
+        """
+        if self._encoder_ledger is None or self._encoder_device is None:
+            return
+        te = self._encoder_ledger._cache.get("text_encoder")
+        ae = self._encoder_ledger._cache.get("audio_encoder")
+        if te is not None:
+            try:
+                if next(te.parameters()).device.type == "cpu":
+                    te.to(self._encoder_device)
+            except StopIteration:
+                pass
+        if ae is not None:
+            try:
+                if next(ae.parameters()).device.type == "cpu":
+                    ae.to(self._encoder_device)
+            except StopIteration:
+                pass
+
     # --- Worker acquisition ---
 
     async def _acquire_worker(self) -> DenoiserWorker:
@@ -512,7 +557,8 @@ class SplitModelManager:
         # For fast model: start with dev+low LoRA for first pass (Reddit audio fix)
         worker.ensure_transformer("dev_lora_020" if is_fast else "dev", user_lora=user_lora)
 
-        # Text encoding on GPU:0 (shared encoder)
+        # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
+        self._page_encoder_to_gpu()
         if is_fast:
             (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
@@ -523,6 +569,7 @@ class SplitModelManager:
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        self._page_encoder_to_cpu()  # free ~25 GB for denoising + decode
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -653,11 +700,13 @@ class SplitModelManager:
 
         worker.ensure_transformer("dev_lora_025", user_lora=user_lora)
 
-        # Text encoding on GPU:0 (shared encoder)
+        # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
+        self._page_encoder_to_gpu()
         ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        self._page_encoder_to_cpu()  # free ~25 GB for denoising + decode
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -766,7 +815,8 @@ class SplitModelManager:
 
         worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
-        # Text encoding on GPU:0 (shared encoder)
+        # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
+        self._page_encoder_to_gpu()
         if is_fast:
             (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
@@ -777,6 +827,7 @@ class SplitModelManager:
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        self._page_encoder_to_cpu()  # free ~25 GB for denoising + decode
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -884,7 +935,8 @@ class SplitModelManager:
 
         worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
-        # Text encoding on GPU:0 (shared encoder)
+        # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
+        self._page_encoder_to_gpu()
         if is_fast:
             (ctx_p,) = encode_prompts([prompt], self._encoder_ledger, enhance_first_prompt=enhance_prompt)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
@@ -895,6 +947,7 @@ class SplitModelManager:
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        self._page_encoder_to_cpu()  # free ~25 GB for denoising + decode
 
         # Audio encoding on GPU:0, then transfer to worker device
         decoded_audio = decode_audio_from_file(audio_path, self._encoder_device, max_duration=num_frames / fps)
@@ -1012,10 +1065,12 @@ class SplitModelManager:
         # Get video metadata
         fps_vid, num_frames, vid_width, vid_height = get_videostream_metadata(video_path)
 
-        # Text encoding on GPU:0 (shared encoder)
+        # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
+        self._page_encoder_to_gpu()
         params = _DEV_PARAMS
         ctx_p, ctx_n = encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], self._encoder_ledger)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
+        self._page_encoder_to_cpu()  # free ~25 GB for denoising + decode
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
