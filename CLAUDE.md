@@ -2,11 +2,11 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.2 (2026-04-11).
+**Version**: v1.3 (2026-04-13).
 
 ## Structure
 - `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode, dashboard
-- `split_model_manager.py` — Single-GPU LTX pipeline: shared encoder hub + swappable transformer
+- `split_model_manager.py` — Single-GPU LTX pipeline: SingleGPUModelBuilder + CachingModelFactory, CFG++ sampler (default), BatchSplitAdapter for multi-pass batching
 - `flux_manager.py` — Flux 2 image generation: per-request LoRA adapter mode on cuda:0
 - `ace_client.py` — ACE music generation sidecar client (httpx → ace-step on cuda:1:8001)
 - `chat_manager.py` — Proxies /v1/chat/completions to llama-swap (supports per-request model override for vision ranking)
@@ -14,6 +14,8 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - `upload_store.py` — UUID file storage for uploads and job results
 - `history_store.py` — SQLite-backed per-API-key generation history with thumbnails
 - `lora_registry.py` — Flat-dir LoRA storage with registry.json index
+- `flux_lora_registry.py` — Flux LoRA folder-drop discovery (filesystem-only, no registry.json)
+- `ltx_sidecar_client.py` — LTX video sidecar client for DUAL_GPU_LTX mode (httpx → cuda:1:8093)
 - `dashboard.html` — GPU management dashboard SPA (served at /dashboard)
 - `config.py` — Paths, model mapping, device config, resolution tables, TF32 settings
 
@@ -22,11 +24,13 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - Test: `uv run pytest tests/ -v`
 - Health: `curl http://localhost:8090/health`
 
-## GPU topology (v1.2 — dual-GPU layout)
+## GPU topology (v1.3 — dual-GPU layout)
 - **cuda:0** → RTX PRO 6000 Blackwell 96GB — **LTX ↔ Flux** (2-tenant swap, mutually exclusive, auto-swapped on dispatch)
 - **cuda:1** → RTX PRO 6000 Blackwell 96GB — **ACE xl-base+LM** (~18 GB) + **JoyAI** (~50 GB when loaded), coexisting, no swap needed
 
 Verified via `nvidia-smi -L`. No third GPU on this box — any earlier references to `cuda:2`/RTX 4000 are stale.
+
+**DUAL_GPU_LTX mode** (v1.3): `DUAL_GPU_LTX=1` env flag dedicates both GPUs to LTX video generation. cuda:1 runs an LTX sidecar (`ltx_sidecar_client.py` → `127.0.0.1:8093`) for 2 concurrent video workers. Flux, ACE, and JoyAI are disabled. Unlike turbo mode (runtime toggle), DUAL_GPU_LTX is a boot-time flag requiring restart.
 
 **Why mutually exclusive on cuda:0**: LTX active is ~79 GB (60 GB transformer + 19 GB encoder hub + decoder activations) and Flux active is ~81 GB (60 GB transformer + ~14 GB CPU-offload forward-pass peak via `enable_model_cpu_offload`). Combined ~160 GB > 96 GB physical. They cannot coexist on one GPU during forward pass, so the server evicts the other before running.
 
@@ -102,6 +106,7 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - `torch.backends.cuda.matmul.allow_tf32 = False` — full float32 precision for VAE decode
 - `torch.backends.cudnn.allow_tf32 = False` — full float32 for VAE convolutions
 - TF32 was previously enabled but degraded VAE output quality on Blackwell GPUs (VAE uses `force_upcast=True` expecting real float32)
+- `bf16_reduced_precision_reduction`: left at PyTorch default (`True`). LTX-2 was trained with default bf16 accumulation — forcing float32 accumulation creates a training/inference mismatch that compounds across transformer layers × denoising steps. The old `False` setting was based on Flux VAE analysis but incorrectly applied globally.
 
 ## API contract
 - **`docs/API.md` is the canonical, client-facing API spec.** Any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes, auth requirements) MUST update `docs/API.md` in the **same commit**. Do not split "code change" from "doc change" across commits — the doc is the contract the other-side developer reads, and drift breaks them silently.
@@ -117,6 +122,10 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Flux LoRA: adapter mode (NOT fused) — strength is applied at inference time via `pipe.set_adapters([...], [strength])`. Cache key `(model_name, lora_path)` — strength is NOT in the key, so strength changes are free. Only model or LoRA file changes trigger reload.
 - Frame count must be 8k+1; resolution multiples of 64
 - Port 8090, auth via `.api_keys` file (disabled when empty)
+- CFG++ sampler is default for all LTX video generation (togglable via `/v1/system/sampler`)
+- VAE decode uses `TilingConfig.default()` (upstream cosine tiling from ltx-core)
+- All transformer calls wrapped in `BatchSplitAdapter(max_batch_size=1)` for correct multi-pass batching
+- torch.compile available via `TORCH_COMPILE=1` env flag but default OFF (no benefit on Blackwell with cuDNN FA4)
 
 ## Flux LoRA (v1.1 — folder-drop discovery, adapter mode)
 - Storage: `/mnt/nvme-1/servers/taco-backend/flux_loras/` (filesystem is source of truth, no registry.json)
@@ -152,13 +161,14 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - `_ensure_flux_ready()` — no-op if `not ltx_manager.is_ready`, else calls `ltx_manager.evict_all()` (~3 s)
 - Both **must** be called while holding `_inference_lock`. Wired into `_dispatch_job()` (v2 async queue) and all v1 sync handlers. The old `if not manager.is_ready: return 500` early-return guards have been removed from LTX sync handlers — auto-swap handles readiness lazily.
 
-**evict_all leak fix** (`split_model_manager.py::evict_all`): each `DenoiserWorker` holds two strong refs to its source `ModelLedger` — a direct `worker._model_ledger` (set at split_model_manager.py:392) and an indirect `worker.ledger._source_ledger` via `CachingModelLedger(source_ledger=...)`. Prior to v1.1.4 neither was cleared, so the encoder hub (Gemma text encoder + VAE + spatial upsampler, ~22 GB) stayed pinned on the LTX device after `/v1/ltx/unload`. Fix: explicitly null both paths plus `_encoder_ledger._source_ledger` defensively before dropping the workers list. Verified: cuda:0 drops from 66.9 GB → **683 MiB** after unload.
+**evict_all leak fix** (`split_model_manager.py::evict_all`): prior to v1.1.4, `DenoiserWorker` held strong refs to source model builders that kept ~22 GB of encoder hub pinned after eviction. Fix: explicitly null reference paths before dropping workers. Verified: cuda:0 drops from 66.9 GB → **683 MiB** after unload. (v1.3 refactored from `ModelLedger` → `SingleGPUModelBuilder` / `CachingModelFactory` but the eviction pattern is the same.)
 
 **Swap + system endpoints** (Bearer auth required):
 - `POST /v1/ltx/unload`, `POST /v1/ltx/reload`
 - `POST /v1/flux/unload`, `POST /v1/flux/reload`
 - `POST /v1/system/pause`, `POST /v1/system/resume` (acquire `_inference_lock`)
 - `POST /v1/system/turbo` — toggle turbo mode (dual-GPU LTX, see GPU topology section)
+- `GET /v1/system/sampler`, `POST /v1/system/sampler` — get/toggle CFG++ vs Euler sampler (v1.3)
 - `GET /v1/system/gpu` — nvidia-smi telemetry
 - `GET /dashboard` — GPU management dashboard
 
@@ -170,10 +180,11 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - Turbo mode exit: ~15 s (evict dual-GPU LTX, restore single-GPU, restart ACE+JoyAI)
 - LoRA strength changes: still free runtime op, unchanged by the swap refactor
 
-## Batch scheduler (v1.2)
+## Batch scheduler (v1.2, updated v1.3)
 
 - `POST /v2/batch` — submit a batch of generation jobs (1-50 items per batch)
 - `GET /v2/batch/{batch_id}` — poll batch status + partial results
+- `GET /v2/batch/{batch_id}/result/{index}` — download result file for a completed batch item (v1.3)
 - `DELETE /v2/batch/{batch_id}` — cancel remaining items
 - Items are sorted images-first (Klein before Dev) to minimize GPU swaps
 - In turbo mode, `batch_worker` uses `asyncio.gather` to process 2 items concurrently
@@ -223,12 +234,25 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - noodle-i "To Video" button uploads image then POSTs metadata
 - noodle-v polls the GET endpoint to display approved feed
 
+## Sampler configuration (v1.3)
+
+CFG++ Euler sampler ported from ComfyUI's `sample_euler_ancestral_cfg_pp`. Uses `alpha=(1-sigma)` rescaling for improved motion quality.
+
+- Default: **ON** (`_use_cfg_pp = True`)
+- Toggle at runtime: `POST /v1/system/sampler` with `{"use_cfg_pp": true/false}`
+- Query: `GET /v1/system/sampler` returns `{use_cfg_pp, eta_stage1, eta_default, stage2_sigmas_override}`
+- Dashboard has a sampler toggle UI
+- `eta_stage1` (default 1.0): ancestral noise for distilled stage 1
+- `eta_default` (default 0.0): deterministic for guided/stage 2
+- No server restart required — takes effect on the next generation request
+
 ## Critical patterns
 - `cleanup_memory()` calls gc.collect + empty_cache + synchronize — avoid redundant calls after evict_transformer (which already syncs+clears)
 - `detect_params(checkpoint)` opens safetensors metadata — cache the result, don't call per-request
-- `encode_prompts()` with CachingModelLedger keeps text encoder loaded — the internal `del` only drops local ref
+- `encode_prompts()` with CachingModelFactory keeps text encoder loaded — the internal `del` only drops local ref
 - Retake uses `MultiModalGuider(...)` directly, NOT `create_multimodal_guider_factory().build()` — factory has no `.build()` method
 - Audio latent must be trimmed/padded to `AudioLatentShape.from_video_pixel_shape(output_shape).frames`
+- A2V uses `GuidedDenoiser` (static) for stage 1, frozen audio with `noise_scale=0.0`
 
 ## Text encoder variants
 - `GEMMA_VARIANT=default` — Google Gemma 3 12B PT (standard, BF16)
@@ -239,8 +263,10 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 ## Dependencies
 - **PyTorch 2.11.0+cu130** — FlexAttention/FA4 on Blackwell sm_120, SDPA auto-selects cuDNN FlashAttention
 - **diffusers 0.38.0.dev0** (git main) — required for Flux2KleinKVPipeline (not in any stable release)
+- **ltx-core 1.1.1** (editable install from `/mnt/nvme-1/repos/LTX-2/packages/ltx-core`) — upstream sync with vocoder fp32 fix, cosine tiling, layer streaming, BatchSplitAdapter
+- **ltx-pipelines 1.1.1** (editable install from `/mnt/nvme-1/repos/LTX-2/packages/ltx-pipelines`) — new Denoiser classes (SimpleDenoiser, GuidedDenoiser, FactoryGuidedDenoiser), updated sampler signatures
 - LTX-2 repo: `/mnt/nvme-1/repos/LTX-2` (editable install, `torch~=2.7` pin is PEP 440 compatible with 2.11)
-- Checkpoints: `/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/`
+- Checkpoints: `/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/` — v1.1 distilled models (`ltx-2.3-22b-distilled-1.1.safetensors`, `ltx-2.3-22b-distilled-lora-384-1.1.safetensors`, `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`)
 - cuDNN >=9.20 (fixes conv3d memory bug) — currently 9.20.0.48
 - cuBLAS >=13.2 (BF16/FP8 Blackwell speedup) — currently 13.3.0.5
 - nvidia packages revert on `uv sync` — use `--no-sync` for runtime, manual pip for upgrades

@@ -24,6 +24,16 @@ cuda:0 (96 GB)                          cuda:1 (96 GB)
 
 No third GPU exists on this box. Earlier references to `cuda:2` / RTX 4000 are stale.
 
+### DUAL_GPU_LTX Mode (v1.3)
+
+Boot-time alternative to turbo mode. Set `DUAL_GPU_LTX=1` in `.env` and restart.
+
+- cuda:1 runs an LTX sidecar (`ltx_sidecar_client.py` → `127.0.0.1:8093`) as a second video worker
+- Flux, ACE, and JoyAI are disabled at startup (`LOAD_FLUX`, `LOAD_ACE`, `LOAD_JOYAI` forced false)
+- 2 concurrent video jobs without runtime toggling
+- Unlike turbo mode, this is a persistent configuration — no entry/exit latency per batch
+- Sidecar generate timeout: 600 s
+
 ## Auto-Swap Protocol (cuda:0)
 
 Two helpers in `server.py` manage the LTX/Flux swap. Both **must** be called while holding `_inference_lock`:
@@ -52,7 +62,7 @@ Flux Dev uses `enable_model_cpu_offload`, so its idle GPU footprint is near-zero
 
 ### evict_all Leak Fix (v1.1.4)
 
-Each `DenoiserWorker` held two strong refs to its source `ModelLedger` -- a direct `worker._model_ledger` and an indirect `worker.ledger._source_ledger` via `CachingModelLedger`. Prior to v1.1.4, neither was cleared during eviction, so the encoder hub (~22 GB) stayed pinned after `/v1/ltx/unload`. Fix: explicitly null both paths before dropping the workers list. Verified: cuda:0 drops from 66.9 GB to **683 MiB** after unload.
+Prior to v1.1.4, `DenoiserWorker` held strong refs to source model builders that kept ~22 GB of encoder hub pinned after eviction. Fix: explicitly null reference paths before dropping workers. Verified: cuda:0 drops from 66.9 GB to **683 MiB** after unload. (v1.3 refactored from `ModelLedger` → `SingleGPUModelBuilder` / `CachingModelFactory` but the eviction pattern is the same.)
 
 ## Turbo Mode (v1.2)
 
@@ -116,5 +126,6 @@ For operators who want explicit control (all require Bearer auth):
 | `/v1/system/pause` | POST | Free all GPU VRAM, cancel queued jobs |
 | `/v1/system/resume` | POST | Reload all models |
 | `/v1/system/turbo` | POST | Toggle turbo mode |
+| `/v1/system/sampler` | GET/POST | Get/toggle CFG++ vs Euler sampler |
 | `/v1/system/gpu` | GET | nvidia-smi telemetry (2 s cache) |
 | `/dashboard` | GET | GPU management dashboard (no auth) |

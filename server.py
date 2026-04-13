@@ -963,9 +963,11 @@ async def system_gpu() -> dict:
     if _gpu_cache is None or (now - _gpu_cache_time) > 2.0:
         try:
             gpus = await _query_gpu_info()
+            from split_model_manager import _use_cfg_pp
             _gpu_cache = {
                 "gpus": gpus,
                 "turbo": _turbo_active,
+                "sampler": "cfg_pp" if _use_cfg_pp else "euler",
                 "gpu0_tenant": _last_gpu_tenant or "idle",
                 "gpu1_tenant": (
                     "ltx-sidecar" if config.DUAL_GPU_LTX else
@@ -1323,6 +1325,38 @@ async def system_turbo(body: TurboRequest) -> JSONResponse:
     except Exception:
         logger.exception("Turbo toggle failed")
         return JSONResponse(status_code=500, content={"error": "turbo_toggle_failed"})
+
+
+@app.get("/v1/system/sampler")
+async def get_sampler_config() -> JSONResponse:
+    """Get current sampler configuration."""
+    from split_model_manager import _use_cfg_pp, _cfg_pp_eta_stage1, _cfg_pp_eta_default, _stage2_sigmas_override
+    return JSONResponse(content={
+        "sampler": "cfg_pp" if _use_cfg_pp else "euler",
+        "eta_stage1": _cfg_pp_eta_stage1,
+        "eta_default": _cfg_pp_eta_default,
+        "stage2_sigmas": _stage2_sigmas_override,
+    })
+
+
+@app.post("/v1/system/sampler")
+async def set_sampler_config(request: Request) -> JSONResponse:
+    """Toggle sampler between Euler and CFG++."""
+    import split_model_manager
+    body = await request.json()
+    sampler = body.get("sampler", "euler")
+    split_model_manager._use_cfg_pp = (sampler == "cfg_pp")
+    if "eta_stage1" in body:
+        split_model_manager._cfg_pp_eta_stage1 = float(body["eta_stage1"])
+    if "eta_default" in body:
+        split_model_manager._cfg_pp_eta_default = float(body["eta_default"])
+    if sampler == "cfg_pp" and "stage2_sigmas" not in body:
+        split_model_manager._stage2_sigmas_override = [0.85, 0.725, 0.4219, 0.0]
+    elif "stage2_sigmas" in body:
+        split_model_manager._stage2_sigmas_override = body["stage2_sigmas"]
+    else:
+        split_model_manager._stage2_sigmas_override = None
+    return JSONResponse(content={"status": "ok", "sampler": sampler})
 
 
 @app.post("/v1/text-to-video")

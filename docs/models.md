@@ -4,7 +4,7 @@
 
 ## LTX Video Models (cuda:0)
 
-LTX-2.3 powers all video generation -- text-to-video, image-to-video, audio-to-video, and temporal retake. Uses a 22B transformer with shared encoder hub (Gemma 3 12B text encoder + VAE + spatial upsampler).
+LTX-2.3 powers all video generation -- text-to-video, image-to-video, audio-to-video, and temporal retake. Uses a 22B transformer with shared encoder hub (Gemma 3 12B text encoder + VAE + spatial upsampler). Running v1.1 distilled models (`ltx-2.3-22b-distilled-1.1.safetensors`, `ltx-2.3-22b-distilled-lora-384-1.1.safetensors`, `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`).
 
 | Model | ID | Steps | Speed (~5s 1080p) | VRAM | Best For |
 |-------|-----|-------|-------------------|------|----------|
@@ -17,11 +17,15 @@ LTX-2.3 powers all video generation -- text-to-video, image-to-video, audio-to-v
 - **Pro**: Dev transformer with 30 euler steps + CFG + STG, followed by 5 stage-2 refinement steps using `dev_lora`. Best balance of quality and speed.
 - **HQ**: Dev + `distilled_lora@0.25` for 15 res2s steps, then `dev_lora@0.50` for stage 2. Highest fidelity but slowest.
 
+**Sampler:** CFG++ (Euler ancestral CFG++) is the default sampler for all LTX models. Uses alpha=(1-sigma) rescaling for improved motion quality. Togglable at runtime via `GET/POST /v1/system/sampler` or the dashboard.
+
 **Common constraints:**
 - Frame count snapped to `8k+1` (9, 17, 25, 33, 41, 49...)
 - Resolution must be multiples of 64
 - Duration: 0-30 seconds
 - All models support LoRA (fusion mode -- different strengths require full transformer reload)
+- VAE decode uses `TilingConfig.default()` (upstream cosine tiling)
+- All transformer calls wrapped in `BatchSplitAdapter(max_batch_size=1)`
 
 ## Flux Image Models (cuda:0)
 

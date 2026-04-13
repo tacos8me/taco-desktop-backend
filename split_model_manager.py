@@ -18,10 +18,12 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import torch
 from dataclasses import replace as _replace
+from tqdm import tqdm
 
 # --- ltx_core (stable across upstream updates) ---
 from ltx_core.batch_split import BatchSplitAdapter
@@ -77,8 +79,10 @@ from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.constants import (
     DEFAULT_NEGATIVE_PROMPT,
     DISTILLED_SIGMA_VALUES,
+    DISTILLED_SIGMAS,
     LTX_2_3_HQ_PARAMS,
     STAGE_2_DISTILLED_SIGMA_VALUES,
+    STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, GuidedDenoiser, SimpleDenoiser
@@ -87,6 +91,7 @@ from ltx_pipelines.utils.helpers import (
     combined_image_conditionings,
     create_noised_state,
     generate_enhanced_prompt,
+    post_process_latent,
 )
 from ltx_pipelines.utils.media_io import (
     decode_audio_from_file,
@@ -100,7 +105,7 @@ from ltx_pipelines.utils.samplers import (
     gradient_estimating_euler_denoising_loop,
     res2s_audio_video_denoising_loop,
 )
-from ltx_pipelines.utils.types import PipelineComponents
+from ltx_pipelines.utils.types import LatentState, PipelineComponents
 
 _USE_GE_EULER = os.environ.get("USE_GE_EULER", "").lower() in ("1", "true", "yes")
 
@@ -312,10 +317,101 @@ SHORT_VIDEO_THRESHOLD = 257
 # Enable via USE_GE_EULER=1 in .env for A/B testing
 _euler_loop = gradient_estimating_euler_denoising_loop if _USE_GE_EULER else euler_denoising_loop
 
-# Stage 2: 5 steps instead of upstream's 3. More steps resolve fast motion better —
-# 3 steps from 91% noise can't fully reconstruct temporal detail during fast motion.
-# Original: [0.909375, 0.725, 0.421875, 0.0] (3 steps)
-_STAGE_2_SIGMAS = [0.909375, 0.727, 0.546, 0.364, 0.182, 0.0]  # 5 steps
+# ---------------------------------------------------------------------------
+# Sampler configuration (toggled via /v1/system/sampler)
+# ---------------------------------------------------------------------------
+_use_cfg_pp: bool = True
+_cfg_pp_eta_stage1: float = 1.0   # ancestral noise for distilled stage 1
+_cfg_pp_eta_default: float = 0.0  # deterministic for guided/stage 2
+_stage2_sigmas_override: list[float] | None = [0.85, 0.725, 0.4219, 0.0]
+
+
+def _get_ancestral_step(sigma_from: float, sigma_to: float, eta: float = 1.0) -> tuple[float, float]:
+    """Split sigma step into deterministic (sigma_down) + stochastic (sigma_up) parts."""
+    if not eta:
+        return sigma_to, 0.0
+    sigma_up = min(sigma_to, eta * (sigma_to ** 2 * (sigma_from ** 2 - sigma_to ** 2) / sigma_from ** 2) ** 0.5)
+    sigma_down = (sigma_to ** 2 - sigma_up ** 2) ** 0.5
+    return sigma_down, sigma_up
+
+
+def euler_cfg_pp_loop(
+    sigmas: torch.Tensor,
+    video_state: LatentState | None,
+    audio_state: LatentState | None,
+    stepper,  # DiffusionStepProtocol — unused, kept for interface compat
+    transformer,
+    denoiser,
+    eta: float = 0.0,
+    generator: torch.Generator | None = None,
+) -> tuple[LatentState | None, LatentState | None]:
+    """CFG++ Euler sampler ported from ComfyUI's sample_euler_ancestral_cfg_pp.
+
+    For LTX-2 (CONST / flow-matching): alpha(sigma) = 1 - sigma.
+    The key difference from standard Euler is the alpha-rescaled step formula
+    which keeps the trajectory on the data manifold instead of drifting.
+    """
+    for step_idx in tqdm(range(len(sigmas) - 1)):
+        sigma = sigmas[step_idx]
+        sigma_next = sigmas[step_idx + 1]
+
+        # Get denoised prediction from the denoiser (handles CFG internally)
+        denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+
+        # Post-process: blend with clean_latent via denoise_mask
+        if video_state is not None and denoised_video is not None:
+            denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
+        if audio_state is not None and denoised_audio is not None:
+            denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
+
+        if sigma_next == 0:
+            # Final step: jump straight to denoised
+            if video_state is not None and denoised_video is not None:
+                video_state = _replace(video_state, latent=denoised_video)
+            if audio_state is not None and denoised_audio is not None:
+                audio_state = _replace(audio_state, latent=denoised_audio)
+        else:
+            alpha_s = max(1.0 - sigma.item(), 1e-8)
+            alpha_t = max(1.0 - sigma_next.item(), 1e-8)
+
+            if eta > 0:
+                sigma_down, sigma_up = _get_ancestral_step(
+                    sigma.item() / alpha_s, sigma_next.item() / alpha_t, eta=eta,
+                )
+            else:
+                sigma_down = sigma_next.item() / alpha_t
+                sigma_up = 0.0
+
+            video_state = _cfg_pp_step_state(video_state, denoised_video, sigma, alpha_s, alpha_t, sigma_down, sigma_up, eta, generator)
+            audio_state = _cfg_pp_step_state(audio_state, denoised_audio, sigma, alpha_s, alpha_t, sigma_down, sigma_up, eta, generator)
+
+    return (video_state, audio_state)
+
+
+def _cfg_pp_step_state(
+    state: LatentState | None,
+    denoised: torch.Tensor | None,
+    sigma: torch.Tensor,
+    alpha_s: float,
+    alpha_t: float,
+    sigma_down: float,
+    sigma_up: float,
+    eta: float,
+    generator: torch.Generator | None,
+) -> LatentState | None:
+    """Apply one CFG++ Euler step to a single modality."""
+    if state is None or denoised is None:
+        return state
+    x = state.latent.float()
+    d = denoised.float()
+    # Noise direction: (x - alpha_s * denoised) / sigma
+    noise_dir = (x - alpha_s * d) / sigma
+    # Euler step with alpha rescaling
+    x_next = alpha_t * d + alpha_t * sigma_down * noise_dir
+    if eta > 0 and sigma_up > 0:
+        noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+        x_next = x_next + alpha_t * noise * sigma_up
+    return _replace(state, latent=x_next.to(state.latent.dtype))
 
 
 def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
@@ -675,8 +771,7 @@ class SplitModelManager:
         dtype = torch.bfloat16
         is_fast = model == "ltx-2-3-fast"
 
-        # For fast model: start with dev+low LoRA for first pass (Reddit audio fix)
-        worker.ensure_transformer("dev_lora_020" if is_fast else "dev", user_lora=user_lora)
+        worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
@@ -701,7 +796,7 @@ class SplitModelManager:
         video_encoder = worker.ledger.video_encoder()
         stage_1_cond = combined_image_conditionings(images=[], height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
-        transformer = worker.ledger.transformer()
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         # Create initial states for stage 1
         video_state, audio_state, v_tools, a_tools = self._create_av_states(
@@ -709,34 +804,19 @@ class SplitModelManager:
         )
 
         if is_fast:
-            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
-            split_at = 4  # Reddit audio fix: split schedule at step 4
+            sigmas = DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
 
-            # Pass 1: dev + LoRA 0.2, simple denoise (no CFG — saves 2-3x memory)
-            denoiser_1 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+            denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
             if on_progress:
-                denoiser_1 = self._wrap_denoiser(denoiser_1, on_progress, split_at, offset=0.0, scale=0.35)
-            sigmas_1 = sigmas[:split_at + 1]
-            video_state, audio_state = euler_denoising_loop(sigmas=sigmas_1, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_1)
-
-            # Free pass 1 model + activations before loading pass 2
-            del denoiser_1
-            transformer = None
-            worker.evict_transformer()
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Swap to distilled for pass 2
-            worker.ensure_transformer("distilled", user_lora=user_lora)
-            transformer = worker.ledger.transformer()
-
-            # Pass 2: distilled with simple denoise (last 4 steps)
-            denoiser_2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
-            if on_progress:
-                denoiser_2 = self._wrap_denoiser(denoiser_2, on_progress, s1_steps - split_at, offset=0.35, scale=0.35)
-            sigmas_2 = sigmas[split_at:]
-            video_state, audio_state = euler_denoising_loop(sigmas=sigmas_2, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_2)
+                denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+            if _use_cfg_pp:
+                loop_fn = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_stage1, generator=generator)
+            else:
+                loop_fn = euler_denoising_loop
+            video_state, audio_state = loop_fn(
+                sigmas=sigmas, video_state=video_state, audio_state=audio_state,
+                stepper=stepper, transformer=transformer, denoiser=denoiser)
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
@@ -750,7 +830,11 @@ class SplitModelManager:
             )
             if on_progress:
                 denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-            video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+            if _use_cfg_pp:
+                loop_fn = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+            else:
+                loop_fn = euler_denoising_loop
+            video_state, audio_state = loop_fn(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
 
         # Post-process stage 1
         video_state = v_tools.clear_conditioning(video_state)
@@ -773,8 +857,11 @@ class SplitModelManager:
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
-        transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
+        if _use_cfg_pp and _stage2_sigmas_override is not None:
+            distilled_sigmas = torch.tensor(_stage2_sigmas_override, device=device, dtype=torch.float32)
+        else:
+            distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         # Stage 2: create states with upscaled video as initial latent
@@ -789,7 +876,11 @@ class SplitModelManager:
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
             denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
-        video_state, audio_state = euler_denoising_loop(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
+        if _use_cfg_pp:
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        else:
+            loop_fn_s2 = euler_denoising_loop
+        video_state, audio_state = loop_fn_s2(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
 
         # Post-process stage 2
         video_state = v_tools.clear_conditioning(video_state)
@@ -847,7 +938,7 @@ class SplitModelManager:
         video_encoder = worker.ledger.video_encoder()
         stage_1_cond = combined_image_conditionings(images=[], height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
-        transformer = worker.ledger.transformer()
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
         sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=hq_params.num_inference_steps).to(dtype=torch.float32, device=device)
@@ -890,8 +981,8 @@ class SplitModelManager:
         stage_2_cond = combined_image_conditionings(images=[], height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         worker.ensure_transformer("dev_lora_050", user_lora=user_lora)
-        transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
+        distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
         # res2s stage 2: 2 NFE per step + 1 final (3 distilled steps = 2 actual steps)
         s2_nfe = 2 * (len(distilled_sigmas) - 1) + 1
 
@@ -978,7 +1069,7 @@ class SplitModelManager:
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
         video_encoder = worker.ledger.video_encoder()
         stage_1_cond = combined_image_conditionings(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
-        transformer = worker.ledger.transformer()
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
@@ -1004,7 +1095,12 @@ class SplitModelManager:
             )
         if on_progress:
             denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-        video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+        if _use_cfg_pp:
+            # i2v/a2v: always eta=0 — ancestral noise destroys image/audio conditioning
+            loop_fn = partial(euler_cfg_pp_loop, eta=0.0, generator=generator)
+        else:
+            loop_fn = euler_denoising_loop
+        video_state, audio_state = loop_fn(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
 
         # Post-process stage 1
         video_state = v_tools.clear_conditioning(video_state)
@@ -1027,8 +1123,11 @@ class SplitModelManager:
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
-        transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
+        if _use_cfg_pp and _stage2_sigmas_override is not None:
+            distilled_sigmas = torch.tensor(_stage2_sigmas_override, device=device, dtype=torch.float32)
+        else:
+            distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         # Stage 2: create states with upscaled video as initial latent
@@ -1043,7 +1142,11 @@ class SplitModelManager:
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
             denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
-        video_state, audio_state = euler_denoising_loop(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
+        if _use_cfg_pp:
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        else:
+            loop_fn_s2 = euler_denoising_loop
+        video_state, audio_state = loop_fn_s2(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
 
         # Post-process stage 2
         video_state = v_tools.clear_conditioning(video_state)
@@ -1127,7 +1230,7 @@ class SplitModelManager:
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
         video_encoder = worker.ledger.video_encoder()
         stage_1_cond = combined_image_conditionings(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
-        transformer = worker.ledger.transformer()
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
@@ -1158,7 +1261,12 @@ class SplitModelManager:
             )
         if on_progress:
             denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-        video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+        if _use_cfg_pp:
+            # i2v/a2v: always eta=0 — ancestral noise destroys image/audio conditioning
+            loop_fn = partial(euler_cfg_pp_loop, eta=0.0, generator=generator)
+        else:
+            loop_fn = euler_denoising_loop
+        video_state, audio_state = loop_fn(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
 
         # Post-process stage 1
         video_state = v_tools.clear_conditioning(video_state)
@@ -1179,8 +1287,11 @@ class SplitModelManager:
 
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
-        transformer = worker.ledger.transformer()
-        distilled_sigmas = torch.tensor(_STAGE_2_SIGMAS, device=device, dtype=torch.float32)
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
+        if _use_cfg_pp and _stage2_sigmas_override is not None:
+            distilled_sigmas = torch.tensor(_stage2_sigmas_override, device=device, dtype=torch.float32)
+        else:
+            distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
         s2_steps = len(distilled_sigmas) - 1
 
         # Stage 2: create states with upscaled video as initial latent (audio frozen)
@@ -1195,7 +1306,11 @@ class SplitModelManager:
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
             denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
-        video_state, audio_state = euler_denoising_loop(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
+        if _use_cfg_pp:
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        else:
+            loop_fn_s2 = euler_denoising_loop
+        video_state, audio_state = loop_fn_s2(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
 
         # Post-process stage 2
         video_state = v_tools.clear_conditioning(video_state)
@@ -1289,7 +1404,7 @@ class SplitModelManager:
         sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
         total_steps = len(sigmas) - 1
 
-        transformer = worker.ledger.transformer()
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         # Build temporal conditionings: mask=1 inside [start, end) for regen, mask=0 for preserve
         video_conditionings = [
@@ -1326,7 +1441,11 @@ class SplitModelManager:
         )
         if on_progress:
             denoiser = self._wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=0.95)
-        video_state, audio_state = euler_denoising_loop(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
+        if _use_cfg_pp:
+            loop_fn = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        else:
+            loop_fn = euler_denoising_loop
+        video_state, audio_state = loop_fn(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
 
         video_state = v_tools.clear_conditioning(video_state)
         video_state = v_tools.unpatchify(video_state)

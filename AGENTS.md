@@ -28,7 +28,7 @@ Identified via full codebase audit (2026-03-14). Items grouped by tier.
 
 19. ~~**First/mid/last keyframes**~~ — DONE. Symbolic frame_index ("first", "middle", "last") + negative integers (-1 = last, -12 = landing room). Resolved server-side after num_frames computed.
 20. ~~**Bounds checking**~~ — DONE. frame_index >= num_frames → 422.
-24. ~~**Flux 2 LoRA (folder-drop)**~~ — DONE (2026-04-09). `flux_lora_registry.py` scans `flux_loras/` for `.safetensors`; optional sidecar `.json` for metadata; `GET /v1/flux-loras` + `POST /v1/flux-loras/rescan`; `lora: {id, strength}` field on Flux image requests; fuse-before-FP8-cast with `(model, user_lora)` cache key. Works on both flux2-dev and flux2-klein.
+24. ~~**Flux 2 LoRA (folder-drop)**~~ — DONE (2026-04-09). `flux_lora_registry.py` scans `flux_loras/` for `.safetensors`; optional sidecar `.json` for metadata; `GET /v1/flux-loras` + `POST /v1/flux-loras/rescan`; `lora: {id, strength}` field on Flux image requests; adapter mode with `(model, lora_path)` cache key. Works on both flux2-dev and flux2-klein.
 25. ~~**Dithering artifacts on flux2-dev fixed**~~ — DONE (2026-04-06). Root cause: FP8 layerwise casting was quantizing `x_embedder` and `context_embedder` (input projections) into FP8, losing precision on the initial 128→6144 and 15360→6144 projections. Error propagated through all 56 transformer layers. Fix: `skip_modules_pattern=["x_embedder","context_embedder","proj_out"]` on both dev and klein `enable_layerwise_casting()` calls. Klein had already been set correctly; dev was not. Also stopped hard-fusing Turbo LoRA at load time (it's now a regular folder-drop LoRA with ID `flux2-turbo`) — the fused turbo weights + FP8 cast were shifting weights to non-standard FP8 grid points creating structured dithering patterns. See `docs/audit-2026-04-06-comfyui-comparison.md`.
 26. ~~**Char mode vision ranking**~~ — DONE. `POST /v2/char/rank` routes to Gemma 4 31B (`gemma-4-31b-it` on llama-swap) via `chat_manager.generate_chat_completion(..., model=...)`. Returns structured JSON with face_match/eyes/proportions/overall_likeness + add/remove/modify edits. Client-side loop in noodle-i drives iterative refinement.
 27. ~~**Full bf16 Flux 2 Dev (drop FP8 layerwise casting, adapter-mode LoRA)**~~ — DONE (2026-04-09, v1.1.1). Root cause: the v1.1 folder-drop LoRA feature reintroduced the exact `fuse_lora → enable_layerwise_casting(float8_e4m3fn)` sequence that was previously diagnosed as causing structured dithering with the hardcoded Turbo LoRA (entry 25, 2026-04-06). Diffusers PR #10685 documents the root cause: PEFT's input autocast hook forces compute back into FP8, defeating `compute_dtype=bfloat16`, and fused weights sit on non-standard FP8 grid points creating structured artifacts. Fix: (a) drop `enable_layerwise_casting` entirely — run full bf16 transformer (matches ComfyUI default per their issue #10087); (b) add `pipe.enable_model_cpu_offload(device="cuda:0")` on Dev branch (bf16 all-resident is 105.9 GB > 96 GB, so page TE↔GPU around prompt encoding); (c) switch LoRAs from fusion to **adapter mode** via `load_lora_weights(adapter_name="user_lora")` + runtime `set_adapters(["user_lora"], [strength])`. Cache key shrinks from `(model, (path, strength))` to `(model, path)`, so **strength-slider changes are now free** (solves the v1.1 reload-on-every-tick UX bug). Klein fits full bf16 resident without offload. Verified end-to-end: prototype script generates 4 back-to-back images at strengths 1.0/0.4/0.0/disable without a single pipeline reload, no OOM, no screendoor.
@@ -77,9 +77,24 @@ ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temp
 - Spatial tiling disabled (caused grid seams)
 - If re-enabling spatial tiling: use 512/64 with cosine S-curve blending (already in ltx-core)
 
+### v1.3 Features (SHIPPED)
+
+34. ~~**Upstream LTX-2 migration**~~ — DONE (2026-04-13). ModelLedger → SingleGPUModelBuilder, CachingModelLedger → CachingModelFactory. New Denoiser classes: SimpleDenoiser, GuidedDenoiser, FactoryGuidedDenoiser. Updated sampler signatures.
+35. ~~**ltx-core 1.1.1 + ltx-pipelines 1.1.1**~~ — DONE. Upstream sync with vocoder fp32 fix, cosine tiling, layer streaming, BatchSplitAdapter.
+36. ~~**v1.1 distilled models**~~ — DONE. `ltx-2.3-22b-distilled-1.1.safetensors` + `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` + `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`.
+37. ~~**CFG++ sampler**~~ — DONE. Ported from ComfyUI's `euler_ancestral_cfg_pp`. Default ON. Togglable via `GET/POST /v1/system/sampler` and dashboard UI. Uses alpha=(1-sigma) rescaling for better motion quality.
+38. ~~**DUAL_GPU_LTX mode**~~ — DONE. `DUAL_GPU_LTX=1` env flag for 2 concurrent video workers via LTX sidecar on cuda:1:8093. Disables Flux, ACE, JoyAI at boot.
+39. ~~**Batch result download**~~ — DONE. `GET /v2/batch/{id}/result/{index}` endpoint for individual batch item result files.
+40. ~~**BatchSplitAdapter**~~ — DONE. All transformer calls wrapped in `BatchSplitAdapter(max_batch_size=1)` for correct multi-pass batching.
+41. ~~**bf16 precision fix**~~ — DONE. Removed forced float32 accumulation (`bf16_reduced_precision_reduction`). Training/inference mismatch caused character movement artifacts across 56 layers × 20 steps.
+42. ~~**A2V fixes**~~ — DONE. GuidedDenoiser (static) for stage 1, frozen audio noise_scale=0.0, null check, padding.
+43. ~~**TilingConfig.default()**~~ — DONE. Upstream cosine tiling for VAE decode replaces custom tiling config.
+44. ~~**Sidecar timeout**~~ — DONE. 300s → 600s for LTX sidecar and ACE sidecar generate calls.
+45. ~~**torch.compile flag**~~ — DONE. `TORCH_COMPILE=1` env flag available but default OFF (no benefit on Blackwell with cuDNN FA4).
+
 ### Tier 3 — Experimental / Higher Effort
 
-15. **torch.compile on transformer** — 20-40% denoising speedup, needs careful testing with weight swaps
+15. **torch.compile on transformer** — available via `TORCH_COMPILE=1` but default OFF. No measurable benefit on Blackwell with cuDNN FA4. May help on Ampere/Hopper.
 16. **FlashAttention3** — install flash_attn_interface for sm_100 Blackwell, auto-detected by existing code
 17. **Streaming uploads** — request.stream() instead of request.body() for large files
 18. **torch.compile cache** — TORCHINDUCTOR_CACHE_DIR + FX_GRAPH_CACHE for persistent compilation

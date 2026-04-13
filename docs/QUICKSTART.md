@@ -123,7 +123,7 @@ await fetch(`${API}/v2/image-to-video`, {
 |---|---|---|
 | `ltx-2-3-fast` | ~15 s | Previews, fast iteration, audio-to-video |
 | `ltx-2-3-pro` | ~65 s | Production default |
-| `ltx-2-3-hq` | ~90 s | Final render (res2s sampler, best motion) |
+| `ltx-2-3-hq` | ~90 s | Final render (res2s + CFG++ sampler, best motion) |
 
 ### Image — `/v2/text-to-image`, `/v2/image-to-image`, `/v2/image-edit`
 
@@ -251,6 +251,7 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
 }
 ```
 - Returns `202` with `batch_id`. Poll `GET /v2/batch/{batch_id}` for status + partial results. `DELETE /v2/batch/{batch_id}` to cancel.
+- Download individual results: `GET /v2/batch/{batch_id}/result/{index}` (0-based index).
 - Items sorted images-first to minimize GPU swaps. In turbo mode, 2 video items process concurrently.
 
 ## Common pitfalls
@@ -309,4 +310,4 @@ All error responses have the same shape — pick whichever field your parser alr
 
 ## Full spec
 
-For system endpoints, approved-images, compositions, SSE token lifecycle, exact pydantic shapes, and everything else: **[docs/API.md](./API.md)** (58 routes).
+For system endpoints, approved-images, compositions, SSE token lifecycle, exact pydantic shapes, and everything else: **[docs/API.md](./API.md)** (61 routes).

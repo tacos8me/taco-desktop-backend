@@ -40,7 +40,7 @@ class LtxSidecarClient:
         self,
         base_url: str | None = None,
         *,
-        generate_timeout: float = 300.0,
+        generate_timeout: float = 600.0,
         mgmt_timeout: float = 60.0,
     ):
         self._base_url = base_url if base_url is not None else config.LTX_SIDECAR_URL

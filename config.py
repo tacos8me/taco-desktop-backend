@@ -21,9 +21,9 @@ API_KEYS: set[str] = _load_api_keys()
 
 # Checkpoint paths
 CHECKPOINTS_DIR = Path("/mnt/nvme-1/huggingface/ltx-2.3-checkpoints")
-DISTILLED_CHECKPOINT = str(CHECKPOINTS_DIR / "ltx-2.3-22b-distilled.safetensors")
+DISTILLED_CHECKPOINT = str(CHECKPOINTS_DIR / "ltx-2.3-22b-distilled-1.1.safetensors")
 DEV_CHECKPOINT = str(CHECKPOINTS_DIR / "ltx-2.3-22b-dev.safetensors")
-DISTILLED_LORA = str(CHECKPOINTS_DIR / "ltx-2.3-22b-distilled-lora-384.safetensors")
+DISTILLED_LORA = str(CHECKPOINTS_DIR / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors")
 SPATIAL_UPSAMPLER = str(CHECKPOINTS_DIR / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
 
 # Text encoder — point to the HF snapshot directory containing model*.safetensors
@@ -134,10 +134,9 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = False  # Full float32 precision for VAE decode
 torch.backends.cudnn.allow_tf32 = False         # Full float32 precision for VAE convolutions
 torch.backends.cudnn.deterministic = True  # Stable algorithm selection
-# Force float32 accumulation for bf16 matmul. Default in torch 2.11 is True
-# (reduced precision = bf16 accumulation, fast but loses mantissa through large K).
-# With 56 transformer layers × 20 denoising steps on Flux 2 Dev, bf16-accumulated
-# matmul error compounds into visible quality degradation. No speed benefit for
-# diffusion inference in practice (Draw Things engineering analysis, PyTorch
-# issue #100966). ComfyUI does not enable this flag either.
-torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+# bf16 reduced precision accumulation: leave at PyTorch default (True).
+# LTX-2 was trained with default bf16 accumulation — forcing float32 accumulation
+# creates a training/inference precision mismatch that compounds across 56 transformer
+# layers × 20 denoising steps, causing character movement artifacts. ComfyUI also
+# uses the default. The old False setting was based on Flux VAE analysis but
+# incorrectly applied globally to the LTX transformer.

@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.2 (2026-04-11)
+**Server version:** v1.3 (2026-04-13)
 **Base URL:** `http://<host>:8090`
 **Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
 **Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
@@ -214,6 +214,31 @@ Toggle turbo mode — claims both GPUs for LTX, enabling 2 concurrent denoiser w
 - `409 {"error": "already_enabled"}` if already in turbo mode.
 - `409 {"error": "already_disabled"}` if already in normal mode.
 - `503` if the system is paused.
+
+### `GET /v1/system/sampler` (v1.3)
+
+Get current sampler configuration.
+
+```json
+{
+  "use_cfg_pp": true,
+  "eta_stage1": 1.0,
+  "eta_default": 0.0,
+  "stage2_sigmas_override": null
+}
+```
+
+### `POST /v1/system/sampler` (v1.3)
+
+Toggle sampler between Euler and CFG++.
+
+**Body:**
+
+```json
+{"use_cfg_pp": false}
+```
+
+**Response:** Same shape as GET. Takes effect immediately on the next generation request — no restart needed.
 
 ### `GET /v1/system/gpu` (v1.2)
 
@@ -754,6 +779,15 @@ Cancel remaining items in a batch. The currently-running item (if any) will fini
 - `409 {"error": "batch_already_finished"}` if already completed/failed/cancelled.
 - `404` if not found.
 
+### `GET /v2/batch/{batch_id}/result/{index}` (v1.3)
+
+Download the result file for a completed batch item.
+
+- `index` is 0-based, matching the item order in the batch status response.
+- Returns the raw media file (video/mp4 or image/webp) with appropriate Content-Type.
+- `404` if batch or index not found.
+- `409` if the item is not yet completed.
+
 ---
 
 ## Uploads
@@ -1121,6 +1155,8 @@ Codes the backend actively returns:
 | POST | `/v1/system/pause` | yes | Evict all models + cancel queued jobs |
 | POST | `/v1/system/resume` | yes | Reload all models |
 | POST | `/v1/system/turbo` | yes | Toggle turbo mode (v1.2) |
+| GET | `/v1/system/sampler` | yes | Get sampler configuration (v1.3) |
+| POST | `/v1/system/sampler` | yes | Toggle CFG++ vs Euler sampler (v1.3) |
 | GET | `/v1/system/gpu` | yes | nvidia-smi GPU telemetry (v1.2) |
 | POST | `/v1/flux/unload` | yes | Unload Flux only |
 | POST | `/v1/flux/reload` | yes | Reload Flux only |
@@ -1152,6 +1188,7 @@ Codes the backend actively returns:
 | POST | `/v2/music` | yes | Async music generation (ACE, v1.2) |
 | POST | `/v2/batch` | yes | Submit batch of generation jobs (v1.2) |
 | GET | `/v2/batch/{batch_id}` | yes | Poll batch status + partial results (v1.2) |
+| GET | `/v2/batch/{batch_id}/result/{index}` | yes | Download individual batch item result (v1.3) |
 | DELETE | `/v2/batch/{batch_id}` | yes | Cancel remaining batch items (v1.2) |
 | GET | `/v2/jobs/{job_id}` | yes | Poll job status |
 | GET | `/v2/jobs/{job_id}/preview` | yes | Preview JPEG (204 when empty) |
@@ -1175,7 +1212,7 @@ Codes the backend actively returns:
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue composition export job |
 
-Total: 58 routes.
+Total: 61 routes.
 
 ---
 
@@ -1224,6 +1261,20 @@ curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
 
 ## Changelog
 
+- **v1.3** (2026-04-13)
+  - **Upstream LTX-2 migration**: ModelLedger → SingleGPUModelBuilder, CachingModelLedger → CachingModelFactory, new Denoiser classes (SimpleDenoiser/GuidedDenoiser/FactoryGuidedDenoiser).
+  - **ltx-core 1.1.1 + ltx-pipelines 1.1.1**: vocoder fp32 fix, cosine tiling, layer streaming, BatchSplitAdapter.
+  - **v1.1 distilled models**: `ltx-2.3-22b-distilled-1.1.safetensors` + `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` + `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`.
+  - **CFG++ sampler**: `GET/POST /v1/system/sampler` — toggle between CFG++ (default) and Euler. Dashboard toggle. No restart needed.
+  - **DUAL_GPU_LTX mode**: `DUAL_GPU_LTX=1` env flag for 2 concurrent video workers via LTX sidecar on cuda:1:8093. Disables Flux/ACE/JoyAI.
+  - **Batch result download**: `GET /v2/batch/{id}/result/{index}` — download individual completed batch item results.
+  - **BatchSplitAdapter**: all transformer calls wrapped for correct multi-pass batching.
+  - **bf16 precision fix**: removed forced float32 accumulation (training/inference mismatch).
+  - **A2V fixes**: GuidedDenoiser (static) for stage 1, frozen audio noise_scale=0.0, null check, padding.
+  - **TilingConfig.default()**: upstream cosine tiling for VAE decode.
+  - **Sidecar timeouts**: 300s → 600s for generate calls.
+  - **torch.compile**: `TORCH_COMPILE=1` flag available, default OFF.
+  - New env vars: `DUAL_GPU_LTX`, `LTX_SIDECAR_URL`, `TORCH_COMPILE`.
 - **v1.2** (2026-04-11)
   - **Dual-GPU layout**: cuda:0 = LTX ↔ Flux (2-tenant swap), cuda:1 = ACE + JoyAI (coexisting). JoyAI migrated from cuda:0 to cuda:1.
   - **Music generation**: `POST /v1/music` (sync) + `POST /v2/music` (async) — ACE Step xl-base+LM on cuda:1:8001. `MusicGenerationRequest` with 30+ fields, 6 task types (text2music/cover/repaint/extract/lego/complete), 6 audio formats. Gated by `LOAD_ACE=1`.
