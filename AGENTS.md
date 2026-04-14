@@ -91,6 +91,7 @@ ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temp
 43. ~~**TilingConfig.default()**~~ — DONE. Upstream cosine tiling for VAE decode replaces custom tiling config.
 44. ~~**Sidecar timeout**~~ — DONE. 300s → 600s for LTX sidecar and ACE sidecar generate calls.
 45. ~~**torch.compile flag**~~ — DONE. `TORCH_COMPILE=1` env flag available but default OFF (no benefit on Blackwell with cuDNN FA4).
+46. ~~**Dashboard advanced controls + config API**~~ — DONE. 14 tunable generation parameters exposed in `/dashboard` (sampler, step counts, scheduler shifts, CFG/STG/rescale/modality scales, stage 2 sigmas, eta controls). Preset dropdowns and reset button. `GET/POST /v1/system/config` + `POST /v1/system/config/reset` endpoints. Persisted to `.gen_config.json`, survives restarts.
 
 ### Tier 3 — Experimental / Higher Effort
 

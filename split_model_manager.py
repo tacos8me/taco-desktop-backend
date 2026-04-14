@@ -318,12 +318,54 @@ SHORT_VIDEO_THRESHOLD = 257
 _euler_loop = gradient_estimating_euler_denoising_loop if _USE_GE_EULER else euler_denoising_loop
 
 # ---------------------------------------------------------------------------
-# Sampler configuration (toggled via /v1/system/sampler)
+# Generation configuration — persisted to .gen_config.json
 # ---------------------------------------------------------------------------
-_use_cfg_pp: bool = True
-_cfg_pp_eta_stage1: float = 1.0   # ancestral noise for distilled stage 1
-_cfg_pp_eta_default: float = 0.0  # deterministic for guided/stage 2
-_stage2_sigmas_override: list[float] | None = [0.85, 0.725, 0.4219, 0.0]
+import copy
+import json as _json
+
+_CONFIG_PATH = Path(__file__).parent / ".gen_config.json"
+
+_DEFAULT_GEN_CONFIG = {
+    "sampler": "cfg_pp",
+    "eta_stage1": 1.0,
+    "eta_default": 0.0,
+    "fast_stage1_steps": 8,
+    "pro_stage1_steps": 30,
+    "scheduler_max_shift": 2.05,
+    "scheduler_base_shift": 0.95,
+    "cfg_scale": 3.0,
+    "stg_scale": 1.0,
+    "stg_blocks": [28],
+    "rescale_scale": 0.7,
+    "modality_scale": 3.0,
+    "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0],
+}
+
+
+def _load_gen_config() -> dict:
+    """Load saved config from disk, merging with defaults for new keys."""
+    if _CONFIG_PATH.exists():
+        try:
+            saved = _json.loads(_CONFIG_PATH.read_text())
+            merged = copy.deepcopy(_DEFAULT_GEN_CONFIG)
+            for key in merged:
+                if key in saved:
+                    merged[key] = saved[key]
+            return merged
+        except Exception:
+            pass
+    return copy.deepcopy(_DEFAULT_GEN_CONFIG)
+
+
+def _save_gen_config() -> None:
+    """Persist current config to disk."""
+    try:
+        _CONFIG_PATH.write_text(_json.dumps(_gen_config, indent=2))
+    except Exception:
+        logger.warning("Failed to save gen_config", exc_info=True)
+
+
+_gen_config = _load_gen_config()
 
 
 def _get_ancestral_step(sigma_from: float, sigma_to: float, eta: float = 1.0) -> tuple[float, float]:
@@ -804,14 +846,14 @@ class SplitModelManager:
         )
 
         if is_fast:
-            sigmas = DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
+            sigmas = LTX2Scheduler().execute(steps=_gen_config["fast_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
 
             denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
             if on_progress:
                 denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-            if _use_cfg_pp:
-                loop_fn = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_stage1, generator=generator)
+            if _gen_config["sampler"] == "cfg_pp":
+                loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_stage1"], generator=generator)
             else:
                 loop_fn = euler_denoising_loop
             video_state, audio_state = loop_fn(
@@ -820,18 +862,26 @@ class SplitModelManager:
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
+            video_guider_params = MultiModalGuiderParams(
+                cfg_scale=_gen_config["cfg_scale"],
+                stg_scale=_gen_config["stg_scale"],
+                rescale_scale=_gen_config["rescale_scale"],
+                modality_scale=_gen_config["modality_scale"],
+                skip_step=0,
+                stg_blocks=_gen_config["stg_blocks"],
+            )
             denoiser = FactoryGuidedDenoiser(
                 v_context=v_context_p, a_context=a_context_p,
-                video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                video_guider_factory=create_multimodal_guider_factory(params=video_guider_params, negative_context=v_context_n),
                 audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
             )
             if on_progress:
                 denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-            if _use_cfg_pp:
-                loop_fn = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+            if _gen_config["sampler"] == "cfg_pp":
+                loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
             else:
                 loop_fn = euler_denoising_loop
             video_state, audio_state = loop_fn(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)
@@ -858,10 +908,10 @@ class SplitModelManager:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
-        if _use_cfg_pp and _stage2_sigmas_override is not None:
-            distilled_sigmas = torch.tensor(_stage2_sigmas_override, device=device, dtype=torch.float32)
-        else:
-            distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(
+            _gen_config["stage2_sigmas"] or list(STAGE_2_DISTILLED_SIGMA_VALUES),
+            device=device, dtype=torch.float32,
+        )
         s2_steps = len(distilled_sigmas) - 1
 
         # Stage 2: create states with upscaled video as initial latent
@@ -876,8 +926,8 @@ class SplitModelManager:
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
             denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
-        if _use_cfg_pp:
-            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        if _gen_config["sampler"] == "cfg_pp":
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
             loop_fn_s2 = euler_denoising_loop
         video_state, audio_state = loop_fn_s2(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
@@ -941,7 +991,7 @@ class SplitModelManager:
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=hq_params.num_inference_steps).to(dtype=torch.float32, device=device)
+        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=hq_params.num_inference_steps, max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
         # res2s: 2 NFE per step + 1 final
         s1_nfe = 2 * hq_params.num_inference_steps + 1
 
@@ -1072,12 +1122,12 @@ class SplitModelManager:
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
-            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+            sigmas = LTX2Scheduler().execute(steps=_gen_config["fast_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
         # Create initial states for stage 1
@@ -1088,14 +1138,22 @@ class SplitModelManager:
         if is_fast:
             denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         else:
+            video_guider_params = MultiModalGuiderParams(
+                cfg_scale=_gen_config["cfg_scale"],
+                stg_scale=_gen_config["stg_scale"],
+                rescale_scale=_gen_config["rescale_scale"],
+                modality_scale=_gen_config["modality_scale"],
+                skip_step=0,
+                stg_blocks=_gen_config["stg_blocks"],
+            )
             denoiser = FactoryGuidedDenoiser(
                 v_context=v_context_p, a_context=a_context_p,
-                video_guider_factory=create_multimodal_guider_factory(params=params.video_guider_params, negative_context=v_context_n),
+                video_guider_factory=create_multimodal_guider_factory(params=video_guider_params, negative_context=v_context_n),
                 audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
             )
         if on_progress:
             denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-        if _use_cfg_pp:
+        if _gen_config["sampler"] == "cfg_pp":
             # i2v/a2v: always eta=0 — ancestral noise destroys image/audio conditioning
             loop_fn = partial(euler_cfg_pp_loop, eta=0.0, generator=generator)
         else:
@@ -1124,10 +1182,10 @@ class SplitModelManager:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
 
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
-        if _use_cfg_pp and _stage2_sigmas_override is not None:
-            distilled_sigmas = torch.tensor(_stage2_sigmas_override, device=device, dtype=torch.float32)
-        else:
-            distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(
+            _gen_config["stage2_sigmas"] or list(STAGE_2_DISTILLED_SIGMA_VALUES),
+            device=device, dtype=torch.float32,
+        )
         s2_steps = len(distilled_sigmas) - 1
 
         # Stage 2: create states with upscaled video as initial latent
@@ -1142,8 +1200,8 @@ class SplitModelManager:
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
             denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
-        if _use_cfg_pp:
-            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        if _gen_config["sampler"] == "cfg_pp":
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
             loop_fn_s2 = euler_denoising_loop
         video_state, audio_state = loop_fn_s2(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
@@ -1233,12 +1291,12 @@ class SplitModelManager:
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
-            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+            sigmas = LTX2Scheduler().execute(steps=_gen_config["fast_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(device=device, dtype=torch.float32)
             s1_steps = len(sigmas) - 1
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
             s1_steps = len(sigmas) - 1
 
         # Create initial states for stage 1 (audio frozen)
@@ -1254,14 +1312,22 @@ class SplitModelManager:
             # Factory guiders resolve per-step from sigma which weakens audio coupling
             # at low sigma values. Static guiders maintain consistent audio-video
             # guidance strength across all denoising steps.
+            video_guider_params = MultiModalGuiderParams(
+                cfg_scale=_gen_config["cfg_scale"],
+                stg_scale=_gen_config["stg_scale"],
+                rescale_scale=_gen_config["rescale_scale"],
+                modality_scale=_gen_config["modality_scale"],
+                skip_step=0,
+                stg_blocks=_gen_config["stg_blocks"],
+            )
             denoiser = GuidedDenoiser(
                 v_context=v_context_p, a_context=a_context_p,
-                video_guider=MultiModalGuider(params=params.video_guider_params, negative_context=v_context_n),
+                video_guider=MultiModalGuider(params=video_guider_params, negative_context=v_context_n),
                 audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
             )
         if on_progress:
             denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
-        if _use_cfg_pp:
+        if _gen_config["sampler"] == "cfg_pp":
             # i2v/a2v: always eta=0 — ancestral noise destroys image/audio conditioning
             loop_fn = partial(euler_cfg_pp_loop, eta=0.0, generator=generator)
         else:
@@ -1288,10 +1354,10 @@ class SplitModelManager:
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
-        if _use_cfg_pp and _stage2_sigmas_override is not None:
-            distilled_sigmas = torch.tensor(_stage2_sigmas_override, device=device, dtype=torch.float32)
-        else:
-            distilled_sigmas = STAGE_2_DISTILLED_SIGMAS.to(device=device, dtype=torch.float32)
+        distilled_sigmas = torch.tensor(
+            _gen_config["stage2_sigmas"] or list(STAGE_2_DISTILLED_SIGMA_VALUES),
+            device=device, dtype=torch.float32,
+        )
         s2_steps = len(distilled_sigmas) - 1
 
         # Stage 2: create states with upscaled video as initial latent (audio frozen)
@@ -1306,8 +1372,8 @@ class SplitModelManager:
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
             denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
-        if _use_cfg_pp:
-            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        if _gen_config["sampler"] == "cfg_pp":
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
             loop_fn_s2 = euler_denoising_loop
         video_state, audio_state = loop_fn_s2(sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser_s2)
@@ -1401,7 +1467,7 @@ class SplitModelManager:
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(output_shape).to_torch_shape())
-        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=params.num_inference_steps).to(dtype=torch.float32, device=device)
+        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
         total_steps = len(sigmas) - 1
 
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
@@ -1434,15 +1500,23 @@ class SplitModelManager:
         audio_state = create_noised_state(a_tools, audio_conditionings, noiser, dtype, device, initial_latent=initial_audio_latent)
 
         # Build denoiser with guiders (retake is single-stage, maps 0-0.95)
+        video_guider_params = MultiModalGuiderParams(
+            cfg_scale=_gen_config["cfg_scale"],
+            stg_scale=_gen_config["stg_scale"],
+            rescale_scale=_gen_config["rescale_scale"],
+            modality_scale=_gen_config["modality_scale"],
+            skip_step=0,
+            stg_blocks=_gen_config["stg_blocks"],
+        )
         denoiser = GuidedDenoiser(
             v_context=v_context_p, a_context=a_context_p,
-            video_guider=MultiModalGuider(params=params.video_guider_params, negative_context=v_context_n),
+            video_guider=MultiModalGuider(params=video_guider_params, negative_context=v_context_n),
             audio_guider=MultiModalGuider(params=params.audio_guider_params, negative_context=a_context_n),
         )
         if on_progress:
             denoiser = self._wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=0.95)
-        if _use_cfg_pp:
-            loop_fn = partial(euler_cfg_pp_loop, eta=_cfg_pp_eta_default, generator=generator)
+        if _gen_config["sampler"] == "cfg_pp":
+            loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
             loop_fn = euler_denoising_loop
         video_state, audio_state = loop_fn(sigmas=sigmas, video_state=video_state, audio_state=audio_state, stepper=stepper, transformer=transformer, denoiser=denoiser)

@@ -240,6 +240,46 @@ Toggle sampler between Euler and CFG++.
 
 **Response:** Same shape as GET. Takes effect immediately on the next generation request — no restart needed.
 
+### `GET /v1/system/config` (v1.3)
+
+Get all generation configuration parameters. Persisted to `.gen_config.json`.
+
+```json
+{
+  "sampler": "cfg_pp",
+  "fast_stage1_steps": 8,
+  "pro_stage1_steps": 30,
+  "scheduler_max_shift": 2.05,
+  "scheduler_base_shift": 0.95,
+  "cfg_scale": 3.0,
+  "stg_scale": 1.0,
+  "stg_blocks": [28],
+  "rescale_scale": 0.7,
+  "modality_scale": 3.0,
+  "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0],
+  "eta_stage1": 1.0,
+  "eta_default": 0.0
+}
+```
+
+### `POST /v1/system/config` (v1.3)
+
+Merge-update generation config. Send only the keys you want to change — unknown keys are ignored.
+
+**Body (partial example):**
+
+```json
+{"fast_stage1_steps": 12, "cfg_scale": 4.0}
+```
+
+**Response:** `{"status": "ok", ...}` with full config after merge. Persisted to `.gen_config.json`. Takes effect on the next generation request — no restart needed.
+
+### `POST /v1/system/config/reset` (v1.3)
+
+Reset all generation parameters to defaults. No body required.
+
+**Response:** `{"status": "reset", ...}` with full default config.
+
 ### `GET /v1/system/gpu` (v1.2)
 
 nvidia-smi GPU telemetry (2 s cache). Used by the dashboard.
@@ -265,7 +305,7 @@ nvidia-smi GPU telemetry (2 s cache). Used by the dashboard.
 
 ### `GET /dashboard` (v1.2, no auth)
 
-Serves the GPU management dashboard as a static HTML SPA. Provides real-time GPU telemetry, turbo toggle controls, and system status.
+Serves the GPU management dashboard as a static HTML SPA. Provides real-time GPU telemetry, turbo toggle controls, advanced generation controls (14 tunable parameters with presets and reset), and system status.
 
 ---
 
@@ -1157,6 +1197,9 @@ Codes the backend actively returns:
 | POST | `/v1/system/turbo` | yes | Toggle turbo mode (v1.2) |
 | GET | `/v1/system/sampler` | yes | Get sampler configuration (v1.3) |
 | POST | `/v1/system/sampler` | yes | Toggle CFG++ vs Euler sampler (v1.3) |
+| GET | `/v1/system/config` | yes | Get all generation parameters (v1.3) |
+| POST | `/v1/system/config` | yes | Update generation parameters (v1.3) |
+| POST | `/v1/system/config/reset` | yes | Reset generation config to defaults (v1.3) |
 | GET | `/v1/system/gpu` | yes | nvidia-smi GPU telemetry (v1.2) |
 | POST | `/v1/flux/unload` | yes | Unload Flux only |
 | POST | `/v1/flux/reload` | yes | Reload Flux only |
@@ -1212,7 +1255,7 @@ Codes the backend actively returns:
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue composition export job |
 
-Total: 61 routes.
+Total: 63 routes.
 
 ---
 
@@ -1266,6 +1309,7 @@ curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
   - **ltx-core 1.1.1 + ltx-pipelines 1.1.1**: vocoder fp32 fix, cosine tiling, layer streaming, BatchSplitAdapter.
   - **v1.1 distilled models**: `ltx-2.3-22b-distilled-1.1.safetensors` + `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` + `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`.
   - **CFG++ sampler**: `GET/POST /v1/system/sampler` — toggle between CFG++ (default) and Euler. Dashboard toggle. No restart needed.
+  - **Generation config API**: `GET/POST /v1/system/config` + `POST /v1/system/config/reset` — 14 tunable generation parameters (sampler, step counts, scheduler shifts, CFG/STG/rescale scales, stage 2 sigmas, eta controls). Persisted to `.gen_config.json`, survives restarts. Dashboard exposes all params with preset dropdowns and reset button.
   - **DUAL_GPU_LTX mode**: `DUAL_GPU_LTX=1` env flag for 2 concurrent video workers via LTX sidecar on cuda:1:8093. Disables Flux/ACE/JoyAI.
   - **Batch result download**: `GET /v2/batch/{id}/result/{index}` — download individual completed batch item results.
   - **BatchSplitAdapter**: all transformer calls wrapped for correct multi-pass batching.

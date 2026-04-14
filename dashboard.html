@@ -478,6 +478,122 @@ section h2 {
   margin-top: 4px;
 }
 
+/* --- Range slider (Advanced controls) --- */
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  background: var(--bg-input);
+  border-radius: 2px;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: var(--bg-input);
+  border-radius: 2px;
+}
+.adv-control { position: relative; }
+.default-tick {
+  position: absolute;
+  bottom: 0;
+  width: 2px;
+  height: 8px;
+  background: var(--text-dim);
+  border-radius: 1px;
+  pointer-events: none;
+  opacity: 0.6;
+}
+.default-tick::after {
+  content: 'default';
+  position: absolute;
+  top: 9px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.55rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Collapsible section */
+.collapsible-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.collapsible-header h2 { margin-bottom: 0; }
+.collapse-arrow {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  transition: transform 0.2s;
+}
+.collapse-arrow.open { transform: rotate(90deg); }
+.collapsible-body {
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.3s ease;
+}
+.collapsible-body.open {
+  max-height: 600px;
+}
+
+.adv-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.adv-control {
+  flex: 1;
+  min-width: 160px;
+}
+.adv-control label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.adv-control .adv-val {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.adv-control select,
+.adv-control input[type="number"] {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+.adv-control select:focus,
+.adv-control input[type="number"]:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
 .range-value {
   font-family: var(--mono);
   font-size: 0.78rem;
@@ -667,6 +783,123 @@ section h2 {
   <div class="btn-grid">
     <button class="btn" id="btnEuler" onclick="setSampler('euler')" title="Standard Euler (upstream default)">Euler</button>
     <button class="btn btn-success" id="btnCfgPP" onclick="setSampler('cfg_pp')" title="CFG++ with alpha rescaling (ComfyUI-style, better motion quality)">CFG++</button>
+  </div>
+</section>
+
+<!-- Section 4b: Advanced Controls -->
+<section>
+  <div class="collapsible-header" onclick="toggleAdvanced()">
+    <span class="collapse-arrow" id="advArrow">&#9654;</span>
+    <h2>Advanced</h2>
+  </div>
+  <div class="collapsible-body" id="advBody">
+    <div style="padding-top:12px">
+      <div class="btn-row-label">Fast Model <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(distilled, no guidance)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Stage 1 Steps <span class="adv-val" id="advFastStepsVal">8</span></label>
+          <input type="range" id="advFastSteps" min="4" max="20" step="1" value="8" list="tickFast"
+                 oninput="document.getElementById('advFastStepsVal').textContent=this.value"
+                 onchange="setConfig({fast_stage1_steps: parseInt(this.value)})">
+        </div>
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">Pro Model <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(dev, CFG+STG guidance)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Stage 1 Steps <span class="adv-val" id="advProStepsVal">30</span></label>
+          <input type="range" id="advProSteps" min="10" max="50" step="1" value="30" list="tickPro"
+                 oninput="document.getElementById('advProStepsVal').textContent=this.value"
+                 onchange="setConfig({pro_stage1_steps: parseInt(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>CFG Scale <span class="adv-val" id="advCfgVal">3.0</span></label>
+          <input type="range" id="advCfg" min="1.0" max="7.0" step="0.5" value="3.0" list="tickCfg"
+                 oninput="document.getElementById('advCfgVal').textContent=parseFloat(this.value).toFixed(1)"
+                 onchange="setConfig({cfg_scale: parseFloat(this.value)})">
+        </div>
+      </div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>STG Scale <span class="adv-val" id="advStgVal">1.0</span></label>
+          <input type="range" id="advStg" min="0.0" max="2.0" step="0.1" value="1.0" list="tickStg"
+                 oninput="document.getElementById('advStgVal').textContent=parseFloat(this.value).toFixed(1)"
+                 onchange="setConfig({stg_scale: parseFloat(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Rescale <span class="adv-val" id="advRescaleVal">0.7</span></label>
+          <input type="range" id="advRescale" min="0.0" max="1.0" step="0.05" value="0.7" list="tickRescale"
+                 oninput="document.getElementById('advRescaleVal').textContent=parseFloat(this.value).toFixed(2)"
+                 onchange="setConfig({rescale_scale: parseFloat(this.value)})">
+        </div>
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">Scheduler <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(both models)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Max Shift <span class="adv-val" id="advMaxShiftVal">2.05</span></label>
+          <input type="range" id="advMaxShift" min="0.5" max="3.0" step="0.05" value="2.05" list="tickMaxShift"
+                 oninput="document.getElementById('advMaxShiftVal').textContent=parseFloat(this.value).toFixed(2)"
+                 onchange="setConfig({scheduler_max_shift: parseFloat(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Base Shift <span class="adv-val" id="advBaseShiftVal">0.95</span></label>
+          <input type="range" id="advBaseShift" min="0.5" max="1.5" step="0.05" value="0.95" list="tickBaseShift"
+                 oninput="document.getElementById('advBaseShiftVal').textContent=parseFloat(this.value).toFixed(2)"
+                 onchange="setConfig({scheduler_base_shift: parseFloat(this.value)})">
+        </div>
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">Stage 2 <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(both models)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Steps <span class="adv-val" id="advS2StepsVal">3</span></label>
+          <input type="range" id="advS2Steps" min="2" max="10" step="1" value="3"
+                 oninput="document.getElementById('advS2StepsVal').textContent=this.value"
+                 onchange="setS2Steps(parseInt(this.value))">
+        </div>
+        <div class="adv-control">
+          <label>Preset</label>
+          <select id="advStage2Preset" onchange="setStage2Preset(this.value)">
+            <option value="comfyui">ComfyUI [0.85, 0.725, 0.4219, 0.0]</option>
+            <option value="upstream">Upstream [0.909, 0.727, 0.455, 0.0]</option>
+          </select>
+        </div>
+      </div>
+      <div class="adv-row" id="s2SigmaSliders" style="flex-wrap:wrap;gap:8px">
+        <!-- dynamically populated by renderS2Sigmas() -->
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">Sampler <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(both models)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Eta Stage 1 <span class="adv-val" id="advEtaS1Val">1.0</span></label>
+          <input type="range" id="advEtaS1" min="0.0" max="1.0" step="0.1" value="1.0" list="tickEta1"
+                 oninput="document.getElementById('advEtaS1Val').textContent=parseFloat(this.value).toFixed(1)"
+                 onchange="setConfig({eta_stage1: parseFloat(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Eta Default <span class="adv-val" id="advEtaDefVal">0.0</span></label>
+          <input type="range" id="advEtaDef" min="0.0" max="1.0" step="0.1" value="0.0" list="tickEta0"
+                 oninput="document.getElementById('advEtaDefVal').textContent=parseFloat(this.value).toFixed(1)"
+                 onchange="setConfig({eta_default: parseFloat(this.value)})">
+        </div>
+      </div>
+
+      <div class="btn-grid" style="margin-top:4px">
+        <button class="btn btn-danger" onclick="resetConfig()">Reset to Default</button>
+      </div>
+    </div>
+    <!-- Default notches for all sliders -->
+    <datalist id="tickFast"><option value="8" label="default"></datalist>
+    <datalist id="tickPro"><option value="30" label="default"></datalist>
+    <datalist id="tickCfg"><option value="3.0" label="default"></datalist>
+    <datalist id="tickStg"><option value="1.0" label="default"></datalist>
+    <datalist id="tickRescale"><option value="0.7" label="default"></datalist>
+    <datalist id="tickMaxShift"><option value="2.05" label="default"></datalist>
+    <datalist id="tickBaseShift"><option value="0.95" label="default"></datalist>
+    <datalist id="tickEta1"><option value="1.0" label="default"></datalist>
+    <datalist id="tickEta0"><option value="0.0" label="default"></datalist>
   </div>
 </section>
 
@@ -916,6 +1149,11 @@ async function pollGpu() {
     updateTurboState(data);
     // Update sampler state
     updateSamplerState(data);
+    // Update advanced controls ONLY on first load
+    if (!window._advControlsInitialized && data.gen_config) {
+      updateAdvancedControls(data.gen_config);
+      window._advControlsInitialized = true;
+    }
   } catch {
     // Endpoint not yet available
   }
@@ -959,14 +1197,9 @@ function updateSamplerState(data) {
 }
 
 async function setSampler(sampler) {
-  const body = {sampler};
-  if (sampler === 'cfg_pp') {
-    body.eta_stage1 = 1.0;
-    body.eta_default = 0.0;
-    body.stage2_sigmas = [0.85, 0.725, 0.4219, 0.0];
-  }
-  await callEndpoint('POST', '/v1/system/sampler', body);
-  pollGpu();
+  const data = await callEndpoint('POST', '/v1/system/config', {sampler});
+  if (data) updateAdvancedControls(data);
+  pollGpu(); // refresh sampler badge
 }
 
 async function toggleTurbo(enable) {
@@ -1180,6 +1413,167 @@ async function pollJob(jobId, respBox) {
     }
   };
   setTimeout(poll, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Advanced controls
+// ---------------------------------------------------------------------------
+
+function toggleAdvanced() {
+  const body = document.getElementById('advBody');
+  const arrow = document.getElementById('advArrow');
+  body.classList.toggle('open');
+  arrow.classList.toggle('open');
+}
+
+async function setConfig(fields) {
+  const data = await callEndpoint('POST', '/v1/system/config', fields);
+  if (data && data.status === 'ok') {
+    // Update controls from the POST response (authoritative, no cache)
+    updateAdvancedControls(data);
+  }
+}
+
+function setStage2Preset(preset) {
+  const sigmas = preset === 'upstream'
+    ? [0.909, 0.727, 0.455, 0.0]
+    : [0.85, 0.725, 0.4219, 0.0];
+  setConfig({stage2_sigmas: sigmas}).then(() => renderS2Sigmas(sigmas));
+}
+
+function setS2Steps(n) {
+  // Generate evenly-spaced sigmas from current start down to 0.0
+  const container = document.getElementById('s2SigmaSliders');
+  const current = _currentS2Sigmas || [0.85, 0.725, 0.4219, 0.0];
+  const start = current[0] || 0.85;
+  const sigmas = [];
+  for (let i = 0; i <= n; i++) {
+    sigmas.push(parseFloat((start * (1 - i / n)).toFixed(4)));
+  }
+  setConfig({stage2_sigmas: sigmas}).then(() => renderS2Sigmas(sigmas));
+}
+
+let _currentS2Sigmas = [0.85, 0.725, 0.4219, 0.0];
+
+const _defaultS2Sigmas = [0.85, 0.725, 0.4219];
+
+function renderS2Sigmas(sigmas) {
+  _currentS2Sigmas = sigmas;
+  const container = document.getElementById('s2SigmaSliders');
+  if (!container) return;
+  container.innerHTML = '';
+  for (let i = 0; i < sigmas.length - 1; i++) {
+    const val = sigmas[i];
+    const dlId = 's2tick' + i;
+    const defVal = _defaultS2Sigmas[i];
+    const dlHtml = defVal !== undefined ? `<datalist id="${dlId}"><option value="${defVal}"></datalist>` : '';
+    const listAttr = defVal !== undefined ? ` list="${dlId}"` : '';
+    const div = document.createElement('div');
+    div.className = 'adv-control';
+    div.style.minWidth = '120px';
+    div.innerHTML = `
+      <label>σ${i+1} <span class="adv-val" id="s2sig${i}Val">${val.toFixed(3)}</span></label>
+      <input type="range" min="0.01" max="1.0" step="0.005" value="${val}"${listAttr}
+             oninput="document.getElementById('s2sig${i}Val').textContent=parseFloat(this.value).toFixed(3)"
+             onchange="updateS2Sigma(${i}, parseFloat(this.value))">
+      ${dlHtml}
+    `;
+    container.appendChild(div);
+  }
+  // Show terminal as static label
+  const termDiv = document.createElement('div');
+  termDiv.className = 'adv-control';
+  termDiv.style.minWidth = '80px';
+  termDiv.innerHTML = '<label>σ<sub>end</sub> <span class="adv-val">0.000</span></label><div style="height:20px;display:flex;align-items:center;color:var(--text-dim);font-size:0.75rem">fixed</div>';
+  container.appendChild(termDiv);
+  // Update steps slider to match
+  setSlider('advS2Steps', 'advS2StepsVal', sigmas.length - 1, 0);
+}
+
+function updateS2Sigma(index, value) {
+  const sigmas = [..._currentS2Sigmas];
+  sigmas[index] = value;
+  _currentS2Sigmas = sigmas;
+  setConfig({stage2_sigmas: sigmas});
+}
+
+async function resetConfig() {
+  const data = await callEndpoint('POST', '/v1/system/config/reset');
+  if (data) {
+    updateAdvancedControls(data);
+  }
+}
+
+function addDefaultTick(sliderId, defaultVal) {
+  const slider = document.getElementById(sliderId);
+  if (!slider || slider.dataset.tickAdded) return;
+  const min = parseFloat(slider.min);
+  const max = parseFloat(slider.max);
+  const pct = ((defaultVal - min) / (max - min)) * 100;
+  const tick = document.createElement('div');
+  tick.className = 'default-tick';
+  tick.style.left = `calc(${pct}% - 1px)`;
+  slider.parentElement.appendChild(tick);
+  slider.dataset.tickAdded = '1';
+}
+
+function updateAdvancedControls(gc) {
+  if (!gc) return;
+  const focused = document.activeElement;
+
+  // Add default notches (once)
+  addDefaultTick('advFastSteps', 8);
+  addDefaultTick('advProSteps', 30);
+  addDefaultTick('advCfg', 3.0);
+  addDefaultTick('advStg', 1.0);
+  addDefaultTick('advRescale', 0.7);
+  addDefaultTick('advMaxShift', 2.05);
+  addDefaultTick('advBaseShift', 0.95);
+  addDefaultTick('advEtaS1', 1.0);
+  addDefaultTick('advEtaDef', 0.0);
+  addDefaultTick('advS2Steps', 3);
+
+  // Fast steps
+  if (gc.fast_stage1_steps !== undefined && focused?.id !== 'advFastSteps') {
+    setSlider('advFastSteps', 'advFastStepsVal', gc.fast_stage1_steps, 0);
+  }
+
+  // Pro steps
+  if (focused?.id !== 'advProSteps') {
+    setSlider('advProSteps', 'advProStepsVal', gc.pro_stage1_steps, 0);
+  }
+
+  // Stage 2 preset
+  const s2sel = document.getElementById('advStage2Preset');
+  if (s2sel && gc.stage2_sigmas && focused?.id !== 'advStage2Preset') {
+    s2sel.value = gc.stage2_sigmas[0] > 0.9 ? 'upstream' : 'comfyui';
+  }
+
+  // Guidance sliders (skip if user is dragging)
+  if (focused?.id !== 'advCfg') setSlider('advCfg', 'advCfgVal', gc.cfg_scale, 1);
+  if (focused?.id !== 'advStg') setSlider('advStg', 'advStgVal', gc.stg_scale, 1);
+  if (focused?.id !== 'advRescale') setSlider('advRescale', 'advRescaleVal', gc.rescale_scale, 2);
+
+  // Stage 2 sigmas — render dynamic sliders
+  if (gc.stage2_sigmas && !focused?.id?.startsWith('s2sig') && focused?.id !== 'advS2Steps') {
+    renderS2Sigmas(gc.stage2_sigmas);
+  }
+
+  // Scheduler shift sliders
+  if (focused?.id !== 'advMaxShift') setSlider('advMaxShift', 'advMaxShiftVal', gc.scheduler_max_shift, 2);
+  if (focused?.id !== 'advBaseShift') setSlider('advBaseShift', 'advBaseShiftVal', gc.scheduler_base_shift, 2);
+
+  // Eta sliders
+  if (focused?.id !== 'advEtaS1') setSlider('advEtaS1', 'advEtaS1Val', gc.eta_stage1, 1);
+  if (focused?.id !== 'advEtaDef') setSlider('advEtaDef', 'advEtaDefVal', gc.eta_default, 1);
+}
+
+function setSlider(sliderId, labelId, value, decimals) {
+  if (value === undefined) return;
+  const slider = document.getElementById(sliderId);
+  const label = document.getElementById(labelId);
+  if (slider) slider.value = value;
+  if (label) label.textContent = parseFloat(value).toFixed(decimals);
 }
 
 // ---------------------------------------------------------------------------

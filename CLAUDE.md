@@ -63,10 +63,11 @@ Previously a third tenant on cuda:0 (v1.1.8). Now runs on cuda:1 at `127.0.0.1:8
 - Service: `systemctl --user {start,stop,restart,status} joyai-sidecar`.
 - Fallback: `503 joyai_disabled` / `503 sidecar_unreachable` — client should retry with `flux2-klein`.
 
-### Dashboard and GPU telemetry (v1.2)
+### Dashboard and GPU telemetry (v1.2, advanced controls v1.3)
 
 - `GET /dashboard` — static HTML SPA for GPU management (served from `dashboard.html`)
 - `GET /v1/system/gpu` — nvidia-smi telemetry (2 s cache): per-GPU memory/temp/utilization, turbo state, tenant info
+- **Advanced controls** (v1.3): 14 tunable generation parameters exposed in the dashboard — sampler (Euler/CFG++), fast stage 1 steps (4-20), pro stage 1 steps (10-50), scheduler max_shift/base_shift, CFG/STG/rescale/modality scales, stage 2 steps + individual sigma sliders, eta controls, preset dropdowns, reset to default button. All persisted to `.gen_config.json` via `GET/POST /v1/system/config`.
 
 ## Flux pipeline details
 
@@ -122,7 +123,8 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 - Flux LoRA: adapter mode (NOT fused) — strength is applied at inference time via `pipe.set_adapters([...], [strength])`. Cache key `(model_name, lora_path)` — strength is NOT in the key, so strength changes are free. Only model or LoRA file changes trigger reload.
 - Frame count must be 8k+1; resolution multiples of 64
 - Port 8090, auth via `.api_keys` file (disabled when empty)
-- CFG++ sampler is default for all LTX video generation (togglable via `/v1/system/sampler`)
+- CFG++ sampler is default for all LTX video generation (togglable via `/v1/system/config` or `/v1/system/sampler`)
+- Generation config persisted to `.gen_config.json` — survives restarts, editable via dashboard or API
 - VAE decode uses `TilingConfig.default()` (upstream cosine tiling from ltx-core)
 - All transformer calls wrapped in `BatchSplitAdapter(max_batch_size=1)` for correct multi-pass batching
 - torch.compile available via `TORCH_COMPILE=1` env flag but default OFF (no benefit on Blackwell with cuDNN FA4)
@@ -168,9 +170,11 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - `POST /v1/flux/unload`, `POST /v1/flux/reload`
 - `POST /v1/system/pause`, `POST /v1/system/resume` (acquire `_inference_lock`)
 - `POST /v1/system/turbo` — toggle turbo mode (dual-GPU LTX, see GPU topology section)
-- `GET /v1/system/sampler`, `POST /v1/system/sampler` — get/toggle CFG++ vs Euler sampler (v1.3)
+- `GET /v1/system/sampler`, `POST /v1/system/sampler` — get/toggle CFG++ vs Euler sampler (v1.3, alias for gen_config subset)
+- `GET /v1/system/config`, `POST /v1/system/config` — get/update all generation parameters (v1.3)
+- `POST /v1/system/config/reset` — reset generation config to defaults (v1.3)
 - `GET /v1/system/gpu` — nvidia-smi telemetry
-- `GET /dashboard` — GPU management dashboard
+- `GET /dashboard` — GPU management dashboard with advanced generation controls
 
 **Latency**:
 - Within-type (video→video, image→image with same LoRA): unchanged, fast
@@ -234,17 +238,27 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - noodle-i "To Video" button uploads image then POSTs metadata
 - noodle-v polls the GET endpoint to display approved feed
 
-## Sampler configuration (v1.3)
+## Generation config (v1.3)
 
-CFG++ Euler sampler ported from ComfyUI's `sample_euler_ancestral_cfg_pp`. Uses `alpha=(1-sigma)` rescaling for improved motion quality.
+All LTX generation parameters are stored in `.gen_config.json` (project root) and survive restarts. Managed via `GET/POST /v1/system/config` and the dashboard advanced controls.
 
-- Default: **ON** (`_use_cfg_pp = True`)
-- Toggle at runtime: `POST /v1/system/sampler` with `{"use_cfg_pp": true/false}`
-- Query: `GET /v1/system/sampler` returns `{use_cfg_pp, eta_stage1, eta_default, stage2_sigmas_override}`
-- Dashboard has a sampler toggle UI
-- `eta_stage1` (default 1.0): ancestral noise for distilled stage 1
-- `eta_default` (default 0.0): deterministic for guided/stage 2
-- No server restart required — takes effect on the next generation request
+### Parameters (14 tunable via dashboard)
+- `sampler`: `"cfg_pp"` (default) or `"euler"` — CFG++ uses alpha=(1-sigma) rescaling for improved motion quality
+- `fast_stage1_steps`: 8 (default), range 4-20
+- `pro_stage1_steps`: 30 (default), range 10-50
+- `scheduler_max_shift`: 2.05, `scheduler_base_shift`: 0.95
+- `cfg_scale`: 3.0, `stg_scale`: 1.0, `rescale_scale`: 0.7, `modality_scale`: 3.0
+- `stg_blocks`: [28]
+- `stage2_sigmas`: [0.85, 0.725, 0.4219, 0.0] — individual sigma sliders in dashboard
+- `eta_stage1`: 1.0 (ancestral noise for distilled stage 1), `eta_default`: 0.0 (deterministic for guided/stage 2)
+
+### Endpoints
+- `GET /v1/system/config` — returns full config dict
+- `POST /v1/system/config` — merge-update (partial body OK, unknown keys ignored)
+- `POST /v1/system/config/reset` — restore all defaults
+- `GET/POST /v1/system/sampler` — alias for the sampler/eta/stage2_sigmas subset
+
+No server restart required — changes take effect on the next generation request. Dashboard preset dropdowns and reset button use these endpoints.
 
 ## Critical patterns
 - `cleanup_memory()` calls gc.collect + empty_cache + synchronize — avoid redundant calls after evict_transformer (which already syncs+clears)

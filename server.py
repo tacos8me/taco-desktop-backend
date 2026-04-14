@@ -963,11 +963,12 @@ async def system_gpu() -> dict:
     if _gpu_cache is None or (now - _gpu_cache_time) > 2.0:
         try:
             gpus = await _query_gpu_info()
-            from split_model_manager import _use_cfg_pp
+            from split_model_manager import _gen_config
             _gpu_cache = {
                 "gpus": gpus,
                 "turbo": _turbo_active,
-                "sampler": "cfg_pp" if _use_cfg_pp else "euler",
+                "sampler": _gen_config["sampler"],
+                "gen_config": dict(_gen_config),
                 "gpu0_tenant": _last_gpu_tenant or "idle",
                 "gpu1_tenant": (
                     "ltx-sidecar" if config.DUAL_GPU_LTX else
@@ -1327,35 +1328,65 @@ async def system_turbo(body: TurboRequest) -> JSONResponse:
         return JSONResponse(status_code=500, content={"error": "turbo_toggle_failed"})
 
 
+@app.get("/v1/system/config")
+async def get_gen_config() -> JSONResponse:
+    """Get current generation configuration."""
+    from split_model_manager import _gen_config
+    return JSONResponse(content=dict(_gen_config))
+
+
+@app.post("/v1/system/config")
+async def set_gen_config(request: Request) -> JSONResponse:
+    """Update generation configuration. Merges body into current config."""
+    global _gpu_cache
+    import split_model_manager
+    body = await request.json()
+    for key, value in body.items():
+        if key in split_model_manager._gen_config:
+            split_model_manager._gen_config[key] = value
+    _gpu_cache = None  # invalidate so next poll returns fresh config
+    split_model_manager._save_gen_config()
+    return JSONResponse(content={"status": "ok", **dict(split_model_manager._gen_config)})
+
+
+@app.post("/v1/system/config/reset")
+async def reset_gen_config() -> JSONResponse:
+    """Reset generation config to defaults."""
+    global _gpu_cache
+    import split_model_manager, copy
+    split_model_manager._gen_config.update(copy.deepcopy(split_model_manager._DEFAULT_GEN_CONFIG))
+    _gpu_cache = None  # invalidate so next poll returns fresh config
+    split_model_manager._save_gen_config()
+    return JSONResponse(content={"status": "reset", **dict(split_model_manager._gen_config)})
+
+
 @app.get("/v1/system/sampler")
 async def get_sampler_config() -> JSONResponse:
-    """Get current sampler configuration."""
-    from split_model_manager import _use_cfg_pp, _cfg_pp_eta_stage1, _cfg_pp_eta_default, _stage2_sigmas_override
+    """Get current sampler configuration (alias for config endpoint)."""
+    from split_model_manager import _gen_config
     return JSONResponse(content={
-        "sampler": "cfg_pp" if _use_cfg_pp else "euler",
-        "eta_stage1": _cfg_pp_eta_stage1,
-        "eta_default": _cfg_pp_eta_default,
-        "stage2_sigmas": _stage2_sigmas_override,
+        "sampler": _gen_config["sampler"],
+        "eta_stage1": _gen_config["eta_stage1"],
+        "eta_default": _gen_config["eta_default"],
+        "stage2_sigmas": _gen_config["stage2_sigmas"],
     })
 
 
 @app.post("/v1/system/sampler")
 async def set_sampler_config(request: Request) -> JSONResponse:
-    """Toggle sampler between Euler and CFG++."""
+    """Toggle sampler between Euler and CFG++ (alias — writes to gen_config)."""
     import split_model_manager
     body = await request.json()
     sampler = body.get("sampler", "euler")
-    split_model_manager._use_cfg_pp = (sampler == "cfg_pp")
+    split_model_manager._gen_config["sampler"] = sampler
     if "eta_stage1" in body:
-        split_model_manager._cfg_pp_eta_stage1 = float(body["eta_stage1"])
+        split_model_manager._gen_config["eta_stage1"] = float(body["eta_stage1"])
     if "eta_default" in body:
-        split_model_manager._cfg_pp_eta_default = float(body["eta_default"])
-    if sampler == "cfg_pp" and "stage2_sigmas" not in body:
-        split_model_manager._stage2_sigmas_override = [0.85, 0.725, 0.4219, 0.0]
-    elif "stage2_sigmas" in body:
-        split_model_manager._stage2_sigmas_override = body["stage2_sigmas"]
-    else:
-        split_model_manager._stage2_sigmas_override = None
+        split_model_manager._gen_config["eta_default"] = float(body["eta_default"])
+    if "stage2_sigmas" in body:
+        split_model_manager._gen_config["stage2_sigmas"] = body["stage2_sigmas"]
+    elif sampler == "cfg_pp":
+        split_model_manager._gen_config["stage2_sigmas"] = [0.85, 0.725, 0.4219, 0.0]
     return JSONResponse(content={"status": "ok", "sampler": sampler})
 
 

@@ -55,6 +55,28 @@ MAX_BATCH_ITEMS=50
 # TORCH_COMPILE=1   # Uncomment to enable torch.compile (adds 60-120s warmup)
 ```
 
+## Generation Config (`.gen_config.json`)
+
+Runtime generation parameters are persisted to `.gen_config.json` in the project root. This file is auto-managed by the server -- edit via `GET/POST /v1/system/config` or the dashboard advanced controls panel.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sampler` | `"cfg_pp"` | `"cfg_pp"` or `"euler"` |
+| `fast_stage1_steps` | `8` | Distilled model denoising steps (4-20) |
+| `pro_stage1_steps` | `30` | Pro/dev model denoising steps (10-50) |
+| `scheduler_max_shift` | `2.05` | LTX2Scheduler max shift |
+| `scheduler_base_shift` | `0.95` | LTX2Scheduler base shift |
+| `cfg_scale` | `3.0` | Classifier-free guidance scale |
+| `stg_scale` | `1.0` | Spatiotemporal guidance scale |
+| `rescale_scale` | `0.7` | CFG rescale factor |
+| `modality_scale` | `3.0` | Modality guidance scale |
+| `stg_blocks` | `[28]` | STG block indices |
+| `stage2_sigmas` | `[0.85, 0.725, 0.4219, 0.0]` | Stage 2 sigma schedule |
+| `eta_stage1` | `1.0` | Ancestral noise for distilled stage 1 |
+| `eta_default` | `0.0` | Ancestral noise for guided/stage 2 |
+
+Changes take effect on the next generation request -- no restart needed. Use `POST /v1/system/config/reset` or the dashboard reset button to restore defaults.
+
 ## Authentication
 
 API keys are stored in `/mnt/nvme-1/servers/taco-backend/.api_keys`, one key per line. When the file is empty or missing, authentication is disabled.

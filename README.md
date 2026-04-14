@@ -15,7 +15,7 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 - **DUAL_GPU_LTX mode** -- boot-time flag for 2 concurrent video workers (LTX sidecar on cuda:1), disables Flux/ACE/JoyAI
 - **Batch scheduler** -- submit up to 50 generation jobs in a single request, auto-sorted to minimize GPU swaps, per-item result download
 - **Turbo mode** -- runtime toggle, claims both GPUs for LTX, 2 concurrent denoiser workers, 2x video throughput
-- **Dashboard** -- real-time GPU telemetry, sampler toggle, and management at `/dashboard`
+- **Dashboard** -- real-time GPU telemetry, sampler toggle, advanced generation controls (14 tunable params), and management at `/dashboard`
 
 ## Quick start
 
@@ -57,7 +57,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 
 ## Endpoints overview
 
-61 endpoints total. Key routes:
+63 endpoints total. Key routes:
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -76,6 +76,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | GET | `/v2/jobs/{id}/result` | Download result (MP4/WEBP/audio) |
 | POST | `/v1/system/turbo` | Toggle dual-GPU turbo mode |
 | GET/POST | `/v1/system/sampler` | Get/toggle CFG++ vs Euler sampler |
+| GET/POST | `/v1/system/config` | Get/update all generation parameters |
 | POST | `/v1/system/pause` | Evict all models, free VRAM |
 | GET | `/v2/batch/{id}/result/{index}` | Download individual batch item result |
 | GET | `/v1/chat/completions` | Chat/vision proxy (OpenAI-compatible) |
@@ -86,7 +87,7 @@ All endpoints except `/health` and `/v1/approved-images/events` require `Authori
 
 | Document | Contents |
 |----------|----------|
-| [API Reference](docs/API.md) | Full 61-endpoint spec with request/response schemas |
+| [API Reference](docs/API.md) | Full 63-endpoint spec with request/response schemas |
 | [Quick Start Guide](docs/QUICKSTART.md) | 5-minute integration guide for frontend devs |
 | [GPU Architecture](docs/gpu-architecture.md) | Dual-GPU layout, swap mechanics, turbo mode, latency tables |
 | [Models & Latency](docs/models.md) | All model specs, step counts, VRAM, speed benchmarks |

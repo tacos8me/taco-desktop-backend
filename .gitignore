@@ -13,3 +13,4 @@ uv.lock
 .api_keys
 .gstack/
 resume.md
+.gen_config.json
