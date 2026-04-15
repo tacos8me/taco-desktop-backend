@@ -270,6 +270,7 @@ async def _dispatch_job(job: Job) -> bytes:
             model = p.get("model", "flux2-klein")
             if model == "ernie-image":
                 await _ensure_ernie_ready()
+                on_progress(0.90, phase="encoding")
                 result = await ernie.generate(
                     prompt=p["prompt"],
                     width=p.get("width", 1024),
