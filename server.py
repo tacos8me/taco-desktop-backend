@@ -21,6 +21,7 @@ import config
 from split_model_manager import SplitModelManager
 from flux_manager import FluxManager, FluxLoraError
 from joyai_client import joyai, JoyAIError
+from ernie_client import ernie, ErnieError
 from ace_client import ace, AceError
 from ltx_sidecar_client import ltx_sidecar, LtxSidecarError
 from chat_manager import ChatManager
@@ -150,6 +151,18 @@ async def _ensure_flux_ready() -> None:
         flux.load()
 
 
+async def _ensure_ernie_ready() -> None:
+    """Load ERNIE-Image on cuda:1, evicting JoyAI if needed."""
+    if not config.LOAD_ERNIE:
+        raise ErnieError("ernie_disabled: set LOAD_ERNIE=1 to enable", 503)
+    await _auto_exit_turbo_if_active("ernie-image")
+    try:
+        await joyai.unload()
+    except Exception:
+        pass
+    await ernie.load()
+
+
 async def _run_music_job(job: Job) -> None:
     """Standalone async task for music on cuda:1. No _inference_lock needed."""
     job.status = JobStatus.PROCESSING
@@ -157,10 +170,14 @@ async def _run_music_job(job: Job) -> None:
     job.phase = "generating"
     result_bytes: bytes | None = None
     try:
-        # Free JoyAI's 50 GB on cuda:1 if loaded — gives ACE more headroom.
-        # joyai.load() before the next edit request will reload it on demand.
+        # Free JoyAI/ERNIE from cuda:1 if loaded — gives ACE more headroom.
+        # joyai.load()/ernie.load() before the next request will reload on demand.
         try:
             await joyai.unload()
+        except Exception:
+            pass
+        try:
+            await ernie.unload()
         except Exception:
             pass
 
@@ -250,6 +267,19 @@ async def _dispatch_job(job: Job) -> bytes:
             await _ensure_ltx_resident()
             return await manager.retake(**p, on_progress=on_progress)
         case JobType.TEXT_TO_IMAGE:
+            model = p.get("model", "flux2-klein")
+            if model == "ernie-image":
+                await _ensure_ernie_ready()
+                result = await ernie.generate(
+                    prompt=p["prompt"],
+                    width=p.get("width", 1024),
+                    height=p.get("height", 1024),
+                    num_inference_steps=p.get("num_inference_steps", 50),
+                    guidance_scale=p.get("guidance_scale", 4.0),
+                    seed=p.get("seed"),
+                )
+                _touch_cuda1_activity()
+                return result
             await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
@@ -266,6 +296,9 @@ async def _dispatch_job(job: Job) -> bytes:
                 await _auto_exit_turbo_if_active("joyai-edit")
                 if not config.LOAD_JOYAI:
                     raise JoyAIError("joyai_disabled: set LOAD_JOYAI=1 to enable", 503)
+                if ernie.is_loaded:
+                    logger.info("Evicting ERNIE-Image from cuda:1 for JoyAI")
+                    await ernie.unload()
                 await joyai.load()  # idempotent — ensures sidecar pipeline is loaded on cuda:1
                 # joyai-edit: exactly one image_path, ignores lora, chat-template
                 # prompt wrap is server-side in the sidecar.
@@ -473,7 +506,7 @@ class LoRAInput(BaseModel):
     strength: float = Field(default=1.0, ge=0.0, le=2.0)
 Resolution = Literal["1920x1080", "1080x1920", "2560x1440", "1440x2560", "3840x2160", "2160x3840"]
 RetakeMode = Literal["replace_audio_and_video", "replace_video", "replace_video_only", "replace_audio"]
-ImageModelName = Literal["flux2-dev", "flux2-klein", "joyai-edit"]
+ImageModelName = Literal["flux2-dev", "flux2-klein", "joyai-edit", "ernie-image"]
 
 
 class TextToVideoRequest(BaseModel):
@@ -991,6 +1024,7 @@ async def health() -> dict:
             "ltx": "paused",
             "flux": "paused",
             "ace": "paused" if config.LOAD_ACE else "disabled",
+            "ernie": "paused" if config.LOAD_ERNIE else "disabled",
             "chat": "ready" if chat.is_ready else "not_loaded",
             "queue": job_store.stats(),
         }
@@ -999,6 +1033,7 @@ async def health() -> dict:
         "ltx": "ready" if manager.is_ready else "not_loaded",
         "flux": "ready" if flux.is_ready else "not_loaded",
         "ace": "enabled" if config.LOAD_ACE else "disabled",
+        "ernie": "ready" if ernie.is_loaded else ("enabled" if config.LOAD_ERNIE else "disabled"),
         "chat": "ready" if chat.is_ready else "not_loaded",
         "queue": job_store.stats(),
     }
@@ -1042,6 +1077,11 @@ async def system_pause() -> dict:
                     await joyai.unload()
                 except Exception:
                     logger.warning("JoyAI unload during pause failed", exc_info=True)
+            if config.LOAD_ERNIE:
+                try:
+                    await ernie.unload()
+                except Exception:
+                    logger.warning("ERNIE unload during pause failed", exc_info=True)
             _last_gpu_tenant = None
         logger.info("System paused — all GPU memory freed")
         return {"status": "paused"}
@@ -1223,6 +1263,14 @@ async def _enter_turbo_mode() -> None:
             logger.info("Turbo: JoyAI unloaded from cuda:1")
         except JoyAIError:
             logger.warning("Turbo: JoyAI unload failed — continuing (non-critical)")
+
+    # Step 2b: Evict ERNIE from cuda:1
+    if ernie.is_loaded:
+        try:
+            await ernie.unload()
+            logger.info("Turbo: ERNIE unloaded from cuda:1")
+        except ErnieError:
+            logger.warning("Turbo: ERNIE unload failed — continuing (non-critical)")
 
     # Step 3: Evict Flux from cuda:0 (LTX needs full GPU)
     flux.unload()
@@ -1552,6 +1600,26 @@ async def retake(body: RetakeRequest) -> Response:
 async def text_to_image(body: TextToImageRequest) -> Response:
     if _paused:
         return _error(503, "System is paused for maintenance")
+    if body.model == "ernie-image":
+        try:
+            await _ensure_ernie_ready()
+            width = (body.width // 16) * 16
+            height = (body.height // 16) * 16
+            seed = body.seed if body.seed is not None else random.randint(0, 2**32 - 1)
+            image_bytes = await ernie.generate(
+                prompt=body.prompt,
+                width=width,
+                height=height,
+                num_inference_steps=body.num_inference_steps,
+                guidance_scale=body.guidance_scale,
+                seed=seed,
+            )
+            return Response(content=image_bytes, media_type="image/webp")
+        except ErnieError as exc:
+            return _error(exc.status_code, str(exc))
+        except Exception as exc:
+            logger.exception("text-to-image (ernie) failed")
+            return _error(500, str(exc))
     if not config.LOAD_FLUX:
         return _error(500, "Flux not enabled")
     flux_lora_result = _resolve_flux_lora(body)
@@ -1641,6 +1709,9 @@ async def image_edit(body: ImageEditRequest) -> Response:
         if not config.LOAD_JOYAI:
             return _error(503, "JoyAI not enabled (LOAD_JOYAI=0)")
         try:
+            if ernie.is_loaded:
+                logger.info("Evicting ERNIE-Image from cuda:1 for JoyAI")
+                await ernie.unload()
             await joyai.load()  # idempotent — ensures sidecar pipeline is loaded on cuda:1
             image_path = str(uploads.resolve(body.image_uris[0]))
             width = (body.width // 16) * 16

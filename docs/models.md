@@ -50,6 +50,32 @@ Flux 2 handles all image generation -- text-to-image, image-to-image, and multi-
 
 **Why no FP8:** FP8 layerwise casting was removed in v1.1.1 after diagnosing screendoor/grid artifacts. The PEFT input-autocast hook forces compute back into FP8 when fused LoRA weights are present, creating structured dithering on non-standard grid points. ComfyUI also defaults to bf16 on high-VRAM hardware for the same reason.
 
+## ERNIE-Image (cuda:1 sidecar)
+
+baidu/ERNIE-Image 8B DiT text-to-image model (Apache 2.0) via an out-of-process sidecar. Mutually exclusive with JoyAI on cuda:1.
+
+| Property | Value |
+|----------|-------|
+| Model ID | `ernie-image` |
+| Architecture | 8B DiT |
+| Steps (turbo) | 8 |
+| Steps (full) | 50 |
+| Latency (turbo) | ~11 s (1024x1024) |
+| Disk size | ~39 GB |
+| VRAM (50 steps) | ~33 GB on cuda:1 |
+| VRAM (8 turbo steps) | ~18 GB on cuda:1 |
+| Port | `127.0.0.1:8094` |
+| systemd unit | `ernie-image-sidecar.service` |
+| Activation | `LOAD_ERNIE=1` in `.env` |
+
+**Supported resolutions:** 1024x1024, 848x1264, 1264x848, and other standard aspect ratios.
+
+**Key constraints:**
+- Text-to-image only -- accessed via `/v1/text-to-image` or `/v2/text-to-image` with `model="ernie-image"`
+- Runs on cuda:1, mutually exclusive with JoyAI (combined ~83 GB with ACE exceeds 96 GB)
+- Falls back to `503 ernie_disabled` / `503 sidecar_unreachable` if unavailable
+- Env: `ERNIE_SIDECAR_URL` (default `http://127.0.0.1:8094`)
+
 ## JoyAI Image Edit (cuda:1 sidecar)
 
 Instruction-based single-image editing via an out-of-process sidecar.
@@ -121,6 +147,7 @@ Turbo mode is intended for batch video processing. Entry takes ~20 s, exit ~15 s
 | High-quality image generation | `flux2-dev` (50 steps, ~50-90 s) |
 | Fast image generation | `flux2-dev` + `turbo:true` (8 steps, ~25-35 s) |
 | Instruction-based image edit | `joyai-edit` (30 steps, ~78 s) |
+| Fast text-to-image (alt) | `ernie-image` (8 turbo steps, ~11 s) |
 | Video preview / iteration | `ltx-2-3-fast` (8 steps, ~15 s) |
 | Production video | `ltx-2-3-pro` (35 steps, ~65 s) |
 | Final render video | `ltx-2-3-hq` (20 steps, ~90 s) |

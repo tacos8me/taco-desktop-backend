@@ -86,7 +86,7 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs. They reso
 
 ### GPU layout (v1.2 — dual-GPU, 2-tenant swap on cuda:0)
 
-LTX and Flux target `cuda:0` and are **mutually exclusive**. cuda:1 runs ACE (music, :8001) and JoyAI (image edit, :8092) concurrently. The server auto-swaps on cuda:0:
+LTX and Flux target `cuda:0` and are **mutually exclusive**. cuda:1 runs ACE (music, :8001) alongside either JoyAI (image edit, :8092) or ERNIE-Image (t2i, :8094) — JoyAI and ERNIE swap (mutually exclusive). The server auto-swaps on cuda:0:
 
 - Video request → evicts Flux if needed, ensures LTX resident (cold load ≈ 25–30 s).
 - Image request (Flux) → evicts LTX if resident (≈ 3 s), Flux's own offload hooks page weights in (≈ 15–60 s first call).
@@ -131,7 +131,7 @@ Up to 8 keyframes per request.
 | `duration` | `0 < x ≤ 30` seconds |
 | `fps` | `0 < x ≤ 60` |
 | `model` (video) | `"ltx-2-3-fast"` \| `"ltx-2-3-pro"` \| `"ltx-2-3-hq"` |
-| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` \| `"joyai-edit"` (edit only) |
+| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` \| `"joyai-edit"` (edit only) \| `"ernie-image"` (t2i only) |
 | `resolution` | `"1920x1080"` \| `"1080x1920"` \| `"2560x1440"` \| `"1440x2560"` \| `"3840x2160"` \| `"2160x3840"` |
 | `width` / `height` (Flux / JoyAI) | `64 ≤ x ≤ 4096`, snapped to multiples of 16 server-side |
 | `num_inference_steps` (Flux / JoyAI) | `1 ≤ x ≤ 100`. Defaults: 50 (dev), 4 (klein), 30 (joyai-edit). Turbo mode overrides to 8. |
@@ -434,8 +434,9 @@ Regenerates a span of an existing video.
 ```
 
 - `seed: null` → server picks a random 32-bit seed.
-- `turbo: true` → server forces 8 steps + turbo sigma schedule + guidance 2.5.
+- `turbo: true` → server forces 8 steps + turbo sigma schedule + guidance 2.5 (Flux only).
 - Width/height snapped to multiples of 16.
+- `model: "ernie-image"` routes to the ERNIE-Image sidecar on cuda:1 (v1.3). Supported resolutions: 1024x1024, 848x1264, 1264x848, etc. Returns `503 ernie_disabled` if `LOAD_ERNIE` is off or sidecar unreachable.
 
 **Response:** `200 image/webp` (lossless VP8L).
 

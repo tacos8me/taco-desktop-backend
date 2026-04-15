@@ -13,7 +13,8 @@ All environment variables are read from the `.env` file in the project root (`/m
 | `LOAD_FLUX` | `false` | `1`, `true`, `yes` | Enable Flux image generation on cuda:0 |
 | `LOAD_ACE` | `false` | `1`, `true`, `yes` | Enable ACE music generation sidecar on cuda:1 |
 | `LOAD_JOYAI` | `false` | `1`, `true`, `yes` | Enable JoyAI image-edit sidecar on cuda:1 |
-| `DUAL_GPU_LTX` | `false` | `1`, `true`, `yes` | Dedicate both GPUs to LTX video generation. 2 concurrent workers via sidecar on cuda:1. Disables Flux, ACE, JoyAI |
+| `LOAD_ERNIE` | `false` | `1`, `true`, `yes` | Enable ERNIE-Image text-to-image sidecar on cuda:1. Mutually exclusive with JoyAI |
+| `DUAL_GPU_LTX` | `false` | `1`, `true`, `yes` | Dedicate both GPUs to LTX video generation. 2 concurrent workers via sidecar on cuda:1. Disables Flux, ACE, JoyAI, ERNIE |
 | `TORCH_COMPILE` | `false` | `1`, `true`, `yes` | Compile transformer blocks for Inductor-optimized inference. First request after load takes ~60-120s warmup. Default OFF (no benefit on Blackwell with cuDNN FA4) |
 | `GEMMA_VARIANT` | `default` | `default`, `sikaworld` | Text encoder variant. `default` = Google Gemma 3 12B PT (BF16). `sikaworld` = abliterated FP4 (uncensored, NVFP4 quantized) |
 
@@ -31,6 +32,7 @@ All environment variables are read from the `.env` file in the project root (`/m
 |----------|---------|-------------|
 | `ACE_SIDECAR_URL` | `http://127.0.0.1:8001` | URL of the ACE Step music generation sidecar |
 | `JOYAI_SIDECAR_URL` | `http://127.0.0.1:8092` | URL of the JoyAI image-edit sidecar |
+| `ERNIE_SIDECAR_URL` | `http://127.0.0.1:8094` | URL of the ERNIE-Image text-to-image sidecar |
 | `LTX_SIDECAR_URL` | `http://127.0.0.1:8093` | URL of the LTX video sidecar (used in DUAL_GPU_LTX mode) |
 
 ### Queue Limits
@@ -47,6 +49,7 @@ All environment variables are read from the `.env` file in the project root (`/m
 LOAD_FLUX=1
 LOAD_ACE=1
 LOAD_JOYAI=1
+# LOAD_ERNIE=1           # Uncomment for ERNIE-Image (mutually exclusive with JoyAI on cuda:1)
 GEMMA_VARIANT=default
 MAX_MUSIC_PENDING=5
 MAX_BATCH_QUEUE_DEPTH=5
@@ -97,6 +100,7 @@ taco-backend uses three systemd user services:
 | taco-backend | `taco-backend.service` | 8090 | Main FastAPI server (LTX + Flux + job queue + batch scheduler) |
 | JoyAI sidecar | `joyai-sidecar.service` | 8092 | JoyAI image-edit model on cuda:1 |
 | ACE Step | `ace-step.service` | 8001 | ACE music generation on cuda:1 |
+| ERNIE-Image | `ernie-image-sidecar.service` | 8094 | ERNIE-Image text-to-image on cuda:1 (mutually exclusive with JoyAI) |
 | LTX sidecar | `ltx-sidecar.service` | 8093 | LTX video worker on cuda:1 (DUAL_GPU_LTX mode only) |
 
 ### Service Management
@@ -132,6 +136,7 @@ All three services are independent. The sidecars can be started/stopped without 
 | 8092 | JoyAI image-edit sidecar | `127.0.0.1:8092` |
 | 8001 | ACE Step music sidecar | `127.0.0.1:8001` |
 | 8093 | LTX video sidecar | `127.0.0.1:8093` |
+| 8094 | ERNIE-Image sidecar | `127.0.0.1:8094` |
 
 Sidecars bind to localhost only -- they are not directly accessible from the network. All external traffic goes through taco-backend on port 8090.
 

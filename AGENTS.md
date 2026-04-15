@@ -92,6 +92,7 @@ ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temp
 44. ~~**Sidecar timeout**~~ — DONE. 300s → 600s for LTX sidecar and ACE sidecar generate calls.
 45. ~~**torch.compile flag**~~ — DONE. `TORCH_COMPILE=1` env flag available but default OFF (no benefit on Blackwell with cuDNN FA4).
 46. ~~**Dashboard advanced controls + config API**~~ — DONE. 14 tunable generation parameters exposed in `/dashboard` (sampler, step counts, scheduler shifts, CFG/STG/rescale/modality scales, stage 2 sigmas, eta controls). Preset dropdowns and reset button. `GET/POST /v1/system/config` + `POST /v1/system/config/reset` endpoints. Persisted to `.gen_config.json`, survives restarts.
+47. ~~**ERNIE-Image sidecar**~~ — DONE (2026-04-13, v1.3). baidu/ERNIE-Image 8B DiT text-to-image (Apache 2.0) on cuda:1 at `127.0.0.1:8094`. `ernie_client.py` httpx proxy. `model="ernie-image"` on `/v1/text-to-image` and `/v2/text-to-image`. Swaps with JoyAI on cuda:1 (mutually exclusive, both coexist with ACE). ~39 GB on disk, ~33 GB VRAM (50 steps), ~18 GB turbo (8 steps). Tested: clean 1024x1024 in 11 s at 8 turbo steps. `LOAD_ERNIE=1` env var, `ERNIE_SIDECAR_URL` config, `ernie-image-sidecar.service` systemd unit.
 
 ### Tier 3 — Experimental / Higher Effort
 

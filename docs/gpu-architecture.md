@@ -10,17 +10,18 @@ taco-backend runs on two RTX PRO 6000 Blackwell GPUs (96 GB each). Each GPU has 
 cuda:0 (96 GB)                          cuda:1 (96 GB)
 +---------------------------------+     +---------------------------------+
 |  LTX  <-->  Flux                |     |  ACE xl-base+LM    (~18 GB)    |
-|  (2-tenant swap, auto-managed)  |     |  JoyAI Image Edit  (~50 GB)    |
-|                                 |     |  --------------------------------|
-|  LTX active:  ~79 GB           |     |  Combined:          ~68 GB     |
-|  Flux active: ~81 GB (Dev)     |     |  Headroom:          ~28 GB     |
-|               ~32 GB (Klein)   |     |  No swap needed                |
+|  (2-tenant swap, auto-managed)  |     |  + JoyAI (~50 GB)              |
+|                                 |     |    OR ERNIE-Image (~33 GB)     |
+|  LTX active:  ~79 GB           |     |  --------------------------------|
+|  Flux active: ~81 GB (Dev)     |     |  ACE+JoyAI:  ~68 GB            |
+|               ~32 GB (Klein)   |     |  ACE+ERNIE:  ~51 GB            |
+|                                 |     |  JoyAI <-> ERNIE swap          |
 +---------------------------------+     +---------------------------------+
 ```
 
 **cuda:0** hosts LTX (video) and Flux (image) as mutually exclusive tenants. Their combined active memory (~160 GB) exceeds the 96 GB physical limit, so the server auto-swaps between them on every inference request.
 
-**cuda:1** hosts ACE (music, ~18 GB) and JoyAI (image edit, ~50 GB) concurrently. Combined footprint of ~68 GB fits comfortably within 96 GB with no swapping required.
+**cuda:1** hosts ACE (music, ~18 GB) alongside either JoyAI (image edit, ~50 GB) or ERNIE-Image (text-to-image, ~33 GB). JoyAI and ERNIE are mutually exclusive (combined ~83 GB with ACE exceeds 96 GB). ACE coexists with either tenant.
 
 No third GPU exists on this box. Earlier references to `cuda:2` / RTX 4000 are stale.
 
@@ -86,18 +87,23 @@ Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 3. Restores single-GPU LTX on cuda:0
 4. Restarts ACE + JoyAI on cuda:1
 
-## cuda:1 Coexistence
+## cuda:1 Tenants
 
-ACE and JoyAI share cuda:1 without any swap mechanism:
+ACE is always resident on cuda:1. JoyAI and ERNIE-Image are mutually exclusive — only one can be loaded at a time (combined ~83 GB with ACE would exceed 96 GB).
 
-| Service | VRAM | Port | systemd unit |
-|---------|------|------|--------------|
-| ACE Step xl-base+LM | ~18 GB | `127.0.0.1:8001` | `ace-step.service` |
-| JoyAI Image Edit | ~50 GB | `127.0.0.1:8092` | `joyai-sidecar.service` |
-| **Total** | **~68 GB** | | |
-| **Available** | **~28 GB headroom** | | |
+| Service | VRAM | Port | systemd unit | Env var |
+|---------|------|------|--------------|---------|
+| ACE Step xl-base+LM | ~18 GB | `127.0.0.1:8001` | `ace-step.service` | `LOAD_ACE=1` |
+| JoyAI Image Edit | ~50 GB | `127.0.0.1:8092` | `joyai-sidecar.service` | `LOAD_JOYAI=1` |
+| ERNIE-Image (8B DiT) | ~33 GB | `127.0.0.1:8094` | `ernie-image-sidecar.service` | `LOAD_ERNIE=1` |
 
-Both are gated by env vars (`LOAD_ACE=1`, `LOAD_JOYAI=1`) and run as separate systemd services. taco-backend proxies to them via httpx.
+| Configuration | VRAM | Headroom |
+|---------------|------|----------|
+| ACE + JoyAI | ~68 GB | ~28 GB |
+| ACE + ERNIE | ~51 GB | ~45 GB |
+| ACE only | ~18 GB | ~78 GB |
+
+All are gated by env vars and run as separate systemd services. taco-backend proxies to them via httpx.
 
 ## Swap Latency Table
 
@@ -110,7 +116,8 @@ Both are gated by env vars (`LOAD_ACE=1`, `LOAD_JOYAI=1`) and run as separate sy
 | **LTX to Flux** (video then image) | **+3 s** | LTX eviction, then normal Flux forward pass |
 | LoRA strength change | ~0 ms | Runtime `set_adapters` call, no reload |
 | LoRA file change | ~30-60 s | Full pipeline unload + reload (Dev) |
-| **Turbo entry** | **~20 s** | Evict ACE + JoyAI + Flux, load dual-GPU LTX |
+| ERNIE-Image t2i (turbo) | ~11 s | 8 steps, 1024x1024, sidecar on cuda:1 |
+| **Turbo entry** | **~20 s** | Evict ACE + JoyAI/ERNIE + Flux, load dual-GPU LTX |
 | **Turbo exit** | **~15 s** | Evict dual-GPU LTX, restore single-GPU + sidecars |
 
 ## Manual Control Endpoints

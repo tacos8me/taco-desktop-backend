@@ -51,6 +51,11 @@ LOAD_FLUX = os.environ.get("LOAD_FLUX", "").lower() in ("1", "true", "yes")
 JOYAI_SIDECAR_URL = os.environ.get("JOYAI_SIDECAR_URL", "http://127.0.0.1:8092")
 LOAD_JOYAI = os.environ.get("LOAD_JOYAI", "").lower() in ("1", "true", "yes")
 
+# ERNIE-Image text-to-image sidecar on cuda:1 (v1.0).
+# 8B DiT, Apache 2.0. Swaps with JoyAI on cuda:1.
+ERNIE_SIDECAR_URL = os.environ.get("ERNIE_SIDECAR_URL", "http://127.0.0.1:8094")
+LOAD_ERNIE = os.environ.get("LOAD_ERNIE", "").lower() in ("1", "true", "yes")
+
 # LTX video sidecar — independent LTX pipeline on cuda:1 for turbo mode (v1.2).
 # Managed via systemctl; taco-backend calls /load and /unload to control GPU memory.
 LTX_SIDECAR_URL = os.environ.get("LTX_SIDECAR_URL", "http://127.0.0.1:8093")

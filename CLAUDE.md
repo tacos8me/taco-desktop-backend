@@ -15,6 +15,7 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - `history_store.py` — SQLite-backed per-API-key generation history with thumbnails
 - `lora_registry.py` — Flat-dir LoRA storage with registry.json index
 - `flux_lora_registry.py` — Flux LoRA folder-drop discovery (filesystem-only, no registry.json)
+- `ernie_client.py` — ERNIE-Image sidecar client (httpx → cuda:1:8094), swaps with JoyAI on cuda:1
 - `ltx_sidecar_client.py` — LTX video sidecar client for DUAL_GPU_LTX mode (httpx → cuda:1:8093)
 - `dashboard.html` — GPU management dashboard SPA (served at /dashboard)
 - `config.py` — Paths, model mapping, device config, resolution tables, TF32 settings
@@ -26,7 +27,7 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
 ## GPU topology (v1.3 — dual-GPU layout)
 - **cuda:0** → RTX PRO 6000 Blackwell 96GB — **LTX ↔ Flux** (2-tenant swap, mutually exclusive, auto-swapped on dispatch)
-- **cuda:1** → RTX PRO 6000 Blackwell 96GB — **ACE xl-base+LM** (~18 GB) + **JoyAI** (~50 GB when loaded), coexisting, no swap needed
+- **cuda:1** → RTX PRO 6000 Blackwell 96GB — **ACE xl-base+LM** (~18 GB) + **JoyAI** (~50 GB) OR **ERNIE-Image** (~33 GB), JoyAI and ERNIE swap (mutually exclusive), both coexist with ACE
 
 Verified via `nvidia-smi -L`. No third GPU on this box — any earlier references to `cuda:2`/RTX 4000 are stale.
 
@@ -56,12 +57,25 @@ ACE Step (xl-base + LM) runs on cuda:1 at `127.0.0.1:8001` via a separate system
 
 ### JoyAI image-edit sidecar (v1.2, migrated from cuda:0)
 
-Previously a third tenant on cuda:0 (v1.1.8). Now runs on cuda:1 at `127.0.0.1:8092`, coexisting with ACE. No swap needed — combined footprint (~68 GB) fits within 96 GB.
+Previously a third tenant on cuda:0 (v1.1.8). Now runs on cuda:1 at `127.0.0.1:8092`, coexisting with ACE. Mutually exclusive with ERNIE-Image (combined ~83 GB > 96 GB budget with ACE).
 
 - Activation: `LOAD_JOYAI=1` env var in `.env`.
 - Dispatch: `/v1/image-edit` and `/v2/image-edit` with `model="joyai-edit"` route to `joyai_client.edit()`.
 - Service: `systemctl --user {start,stop,restart,status} joyai-sidecar`.
 - Fallback: `503 joyai_disabled` / `503 sidecar_unreachable` — client should retry with `flux2-klein`.
+
+### ERNIE-Image sidecar (v1.3)
+
+baidu/ERNIE-Image (8B DiT text-to-image, Apache 2.0) runs on cuda:1 at `127.0.0.1:8094`. Swaps with JoyAI (mutually exclusive — combined ~83 GB exceeds 96 GB budget), both coexist with ACE (~18 GB).
+
+- Activation: `LOAD_ERNIE=1` env var in `.env`.
+- Dispatch: `/v1/text-to-image` and `/v2/text-to-image` with `model="ernie-image"` route to `ernie_client.generate()`.
+- Service: `systemctl --user {start,stop,restart,status} ernie-image-sidecar`.
+- VRAM: ~39 GB on disk, ~33 GB active (50 steps), ~18 GB turbo (8 steps).
+- Resolutions: 1024x1024, 848x1264, 1264x848, etc.
+- Latency: ~11 s at 8 turbo steps (1024x1024).
+- Fallback: `503 ernie_disabled` / `503 sidecar_unreachable`.
+- Env: `ERNIE_SIDECAR_URL` (default `http://127.0.0.1:8094`).
 
 ### Dashboard and GPU telemetry (v1.2, advanced controls v1.3)
 

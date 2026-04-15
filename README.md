@@ -10,8 +10,9 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 - **CFG++ sampler** -- ported from ComfyUI's `euler_ancestral_cfg_pp`, default ON, togglable via `/v1/system/sampler` and dashboard
 - **Image generation** -- Flux 2 Dev and Klein KV for text-to-image, image-to-image, and multi-reference editing
 - **Image editing** -- JoyAI instruction-based single-image editing via sidecar on cuda:1
+- **ERNIE-Image** -- baidu/ERNIE-Image 8B DiT text-to-image via sidecar on cuda:1, ~11 s at turbo steps
 - **Music generation** -- ACE Step xl-base+LM for text-to-music, covers, repainting, and stem extraction
-- **Dual-GPU architecture** -- 2-tenant auto-swap on cuda:0 (LTX and Flux), concurrent ACE + JoyAI on cuda:1
+- **Dual-GPU architecture** -- 2-tenant auto-swap on cuda:0 (LTX and Flux), ACE + JoyAI/ERNIE swap on cuda:1
 - **DUAL_GPU_LTX mode** -- boot-time flag for 2 concurrent video workers (LTX sidecar on cuda:1), disables Flux/ACE/JoyAI
 - **Batch scheduler** -- submit up to 50 generation jobs in a single request, auto-sorted to minimize GPU swaps, per-item result download
 - **Turbo mode** -- runtime toggle, claims both GPUs for LTX, 2 concurrent denoiser workers, 2x video throughput
@@ -43,17 +44,17 @@ uv run --no-sync pytest tests/ -q -p no:cacheprovider
 cuda:0 (RTX PRO 6000, 96 GB)          cuda:1 (RTX PRO 6000, 96 GB)
 ┌──────────────────────────┐           ┌──────────────────────────┐
 │  LTX  ↔  Flux            │           │  ACE (~18 GB)            │
-│  (2-tenant swap,         │           │  + JoyAI (~50 GB)        │
-│   auto-swapped on        │           │  (coexisting, no swap)   │
-│   dispatch)              │           │                          │
+│  (2-tenant swap,         │           │  + JoyAI (~50 GB) OR     │
+│   auto-swapped on        │           │    ERNIE (~33 GB)        │
+│   dispatch)              │           │  (JoyAI/ERNIE swap)      │
 └──────────────────────────┘           └──────────────────────────┘
- ~79 GB active (LTX)                    Combined ~68 GB
- ~81 GB active (Flux Dev)               Fits within 96 GB budget
- Mutually exclusive — cannot
- coexist during forward pass
+ ~79 GB active (LTX)                    ACE + JoyAI ~68 GB
+ ~81 GB active (Flux Dev)               ACE + ERNIE ~51 GB
+ Mutually exclusive — cannot             JoyAI ↔ ERNIE mutually
+ coexist during forward pass             exclusive on cuda:1
 ```
 
-LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB physical). The dispatcher auto-swaps inside the inference lock -- clients never orchestrate it. Turbo mode (runtime) or DUAL_GPU_LTX (boot-time) claims both GPUs for LTX with 2 concurrent workers. See [GPU Architecture](docs/gpu-architecture.md) for swap latency and details.
+LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB physical). The dispatcher auto-swaps inside the inference lock -- clients never orchestrate it. cuda:1 hosts ACE (always resident) plus JoyAI or ERNIE-Image (mutually exclusive swap). Turbo mode (runtime) or DUAL_GPU_LTX (boot-time) claims both GPUs for LTX with 2 concurrent workers. See [GPU Architecture](docs/gpu-architecture.md) for swap latency and details.
 
 ## Endpoints overview
 
