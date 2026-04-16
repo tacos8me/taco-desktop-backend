@@ -1089,7 +1089,7 @@ Per-api-key history of completed v2 jobs, with thumbnails, keyed by SHA-256 of t
 - A specific job type string (e.g., `"text-to-video"`)
 - Unset — all types
 
-Response is a JSON array; `limit` is clamped to `200`.
+Response is a JSON array; `limit` is clamped to `200`. **The list response shape is unchanged from v1.2** — the new full-fidelity fields (`seed`, `enhanced_prompt`, `params`, `gen_config`) are only returned by `GET /v2/history/{id}` below.
 
 ```json
 [
@@ -1108,6 +1108,203 @@ Response is a JSON array; `limit` is clamped to `200`.
   }
 ]
 ```
+
+### `GET /v2/history/{generation_id}` — full record (v1.3)
+
+Returns the complete history row for a single generation, including the raw request body (`params`) and the generation-config snapshot captured at dispatch time (`gen_config`). Use this to reproduce a run, populate a "reuse settings" button, or show full provenance.
+
+- Bearer auth required.
+- Path param: `generation_id` (the job id returned by `POST /v2/*`).
+- `404` if the entry doesn't exist **or** belongs to a different API key — the ID space can't be probed.
+
+Response (200):
+
+```json
+{
+  "id": "job_...",
+  "job_type": "text-to-video",
+  "prompt": "a neon jellyfish drifting through a rainstorm",
+  "enhanced_prompt": "A bioluminescent jellyfish ...",
+  "model": "ltx-2-3-pro",
+  "width": 1920,
+  "height": 1080,
+  "seed": 845210937,
+  "turbo": false,
+  "status": "completed",
+  "created_at": 1712345678.9,
+  "completed_at": 1712345745.2,
+  "error": null,
+  "result_url": "/v2/history/job_.../image",
+  "thumbnail_url": "/v2/history/job_.../thumbnail",
+  "params": { "...": "raw request body — see Captured params below" },
+  "gen_config": { "...": "LTX snapshot or Flux turbo snapshot — see gen_config snapshot below" }
+}
+```
+
+Field notes:
+
+- `seed` — always an integer for completed generations. If the client omitted it, the server auto-generated one; the stored value is what was actually used.
+- `enhanced_prompt` — the LTX-rewritten prompt text when `enhance_prompt=true` was set on the request. `null` for Flux / ERNIE / JoyAI / retake (no prompt-enhancement pipeline on those paths) and for any LTX request that left `enhance_prompt=false`.
+- `params` — the raw Pydantic request body (`body.model_dump(mode="json")`). Preserves `storage://` URIs, resolution enum strings, LoRA `{id, strength}` shape, and keyframe symbolic indices. Music jobs run the body through a sanitizer that rewrites staged `/tmp/*` paths back to `storage://` URIs.
+- `gen_config` — LTX `_gen_config` snapshot at dispatch time, or a Flux `{turbo_steps, turbo_guidance}` snapshot when `turbo=true`. `null` for non-turbo Flux, ERNIE-Image, and JoyAI.
+- `result_url` / `thumbnail_url` — `null` on failed rows.
+
+#### Captured params by job type
+
+Shape of the `params` object for each `job_type`. Fields reflect the corresponding Pydantic request body; unset optional fields are omitted by `model_dump`.
+
+**`text-to-video`** (`TextToVideoRequest`):
+
+```json
+{
+  "prompt": "a cat riding a horse",
+  "model": "ltx-2-3-pro",
+  "resolution": "1920x1080",
+  "duration": 5.0,
+  "fps": 24,
+  "generate_audio": false,
+  "camera_motion": "slow pan left",
+  "lora": {"id": "cinematic", "strength": 0.8},
+  "enhance_prompt": true
+}
+```
+
+**`image-to-video`** — adds `image_uri` OR `keyframes`:
+
+```json
+{
+  "prompt": "the subject walks forward",
+  "image_uri": "storage://abc-123",
+  "image_strength": 0.85,
+  "keyframes": [
+    {"image_uri": "storage://a", "frame_index": "first", "strength": 1.0},
+    {"image_uri": "storage://b", "frame_index": "last",  "strength": 1.0}
+  ],
+  "model": "ltx-2-3-fast",
+  "resolution": "1280x720",
+  "duration": 4.0, "fps": 24,
+  "lora": null, "enhance_prompt": false
+}
+```
+
+**`audio-to-video`** — adds `audio_uri`, optional `image_uri`:
+
+```json
+{
+  "prompt": "a dancer moves to the beat",
+  "audio_uri": "storage://track-uuid",
+  "image_uri": "storage://ref-uuid",
+  "model": "ltx-2-3-fast",
+  "resolution": "1280x720",
+  "duration": 6.0, "fps": 24,
+  "lora": null, "enhance_prompt": false
+}
+```
+
+**`retake`** — adds `video_uri`, `start_time`, `mode`:
+
+```json
+{
+  "video_uri": "storage://clip-uuid",
+  "start_time": 2.5,
+  "duration": 4.0,
+  "mode": "motion_retake",
+  "prompt": "stronger hand gesture",
+  "lora": null
+}
+```
+
+**`text-to-image`** (`TextToImageRequest`):
+
+```json
+{
+  "prompt": "cinematic portrait, studio lighting",
+  "model": "flux2-dev",
+  "width": 1024, "height": 1024,
+  "num_inference_steps": 50,
+  "guidance_scale": 4.0,
+  "seed": 845210937,
+  "turbo": false,
+  "lora": {"id": "film-grain", "strength": 0.6}
+}
+```
+
+**`image-to-image`** — same shape as `text-to-image`, adds `image_uri`:
+
+```json
+{
+  "prompt": "repaint in oil-painting style",
+  "image_uri": "storage://src-uuid",
+  "model": "flux2-dev",
+  "width": 1024, "height": 1024,
+  "num_inference_steps": 50,
+  "guidance_scale": 4.0,
+  "seed": 1234567,
+  "turbo": false,
+  "lora": null
+}
+```
+
+**`image-edit`** — same shape as `text-to-image`, adds `image_uris` (1–10):
+
+```json
+{
+  "prompt": "make the subject wear a red jacket",
+  "image_uris": ["storage://a", "storage://b"],
+  "model": "flux2-klein",
+  "width": 1024, "height": 1024,
+  "num_inference_steps": 4,
+  "guidance_scale": 4.0,
+  "seed": null,
+  "lora": null
+}
+```
+
+**`music`** (`MusicGenerationRequest`):
+
+```json
+{
+  "prompt": "uplifting cinematic synthwave",
+  "lyrics": "[Instrumental]",
+  "duration": 60.0,
+  "task_type": "text2music",
+  "num_inference_steps": 50,
+  "guidance_scale": 7.0,
+  "bpm": 120,
+  "key_scale": "C minor",
+  "source_audio_uri": "storage://stem-uuid"
+}
+```
+
+#### `gen_config` snapshot
+
+**LTX jobs** (`text-to-video`, `image-to-video`, `audio-to-video`, `retake`) capture a snapshot of `split_model_manager._gen_config` at dispatch time:
+
+```json
+{
+  "sampler": "cfg_pp",
+  "eta_stage1": 1.0,
+  "eta_default": 0.0,
+  "fast_stage1_steps": 8,
+  "pro_stage1_steps": 30,
+  "scheduler_max_shift": 2.05,
+  "scheduler_base_shift": 0.95,
+  "cfg_scale": 3.0,
+  "stg_scale": 1.0,
+  "stg_blocks": [28],
+  "rescale_scale": 0.7,
+  "modality_scale": 3.0,
+  "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0]
+}
+```
+
+**Flux turbo jobs** (`text-to-image`, `image-to-image`, `image-edit` with `turbo=true`) capture only the turbo sigma schedule inputs:
+
+```json
+{"turbo_steps": 8, "turbo_guidance": 2.5}
+```
+
+**Non-turbo Flux, ERNIE-Image, and JoyAI**: `gen_config` is `null`. All tunable parameters for those paths already live in `params` (steps, guidance, seed, etc.).
 
 ### `GET /v2/history/{generation_id}/image`
 
@@ -1245,7 +1442,8 @@ Codes the backend actively returns:
 | GET | `/v1/approved-images/events` | no (token or bearer) | SSE feed |
 | GET | `/v1/approved-images/{id}/file` | yes | Fetch approved image file |
 | POST | `/v2/char/rank` | yes | Vision character consistency rank |
-| GET | `/v2/history` | yes | Per-key generation history |
+| GET | `/v2/history` | yes | Per-key generation history (list — unchanged shape) |
+| GET | `/v2/history/{id}` | yes | Full record with parsed params + gen_config (v1.3) |
 | GET | `/v2/history/{id}/image` | yes | Full-size history media |
 | GET | `/v2/history/{id}/thumbnail` | yes | History thumbnail |
 | DELETE | `/v2/history/{id}` | yes | Delete history entry |

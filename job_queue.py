@@ -156,6 +156,9 @@ class Job:
     error: str | None = None
     error_code: str | None = None
     preview_bytes: bytes | None = None
+    enhanced_prompt: str | None = None
+    gen_config_snapshot: dict | None = None
+    raw_request: dict | None = None
 
 
 class JobStore:
@@ -278,11 +281,22 @@ async def worker_loop(
             logger.info("Job %s completed in %.1fs", job.id, elapsed)
 
         except Exception as exc:
-            job.status = JobStatus.FAILED
-            job.phase = None
-            job.error = str(exc)[:500]
-            job.error_code = "cuda_oom" if "out of memory" in str(exc).lower() else "generation_failed"
-            logger.exception("Job %s failed", job.id)
+            # If the user DELETEd mid-gen, the denoiser raised
+            # GenerationCancelledError from inside the sigma loop.
+            # Respect that rather than rewriting the status to FAILED.
+            exc_name = type(exc).__name__
+            if exc_name == "GenerationCancelledError" or job.status == JobStatus.CANCELLED:
+                job.status = JobStatus.CANCELLED
+                job.phase = None
+                job.error = None
+                job.error_code = None
+                logger.info("Job %s cancelled mid-denoise", job.id)
+            else:
+                job.status = JobStatus.FAILED
+                job.phase = None
+                job.error = str(exc)[:500]
+                job.error_code = "cuda_oom" if "out of memory" in str(exc).lower() else "generation_failed"
+                logger.exception("Job %s failed", job.id)
 
         finally:
             job.completed_at = time.monotonic()
@@ -308,6 +322,10 @@ async def worker_loop(
                     created_at=time.time(),
                     completed_at=time.time(),
                     error=job.error,
+                    seed=_params.get("seed"),
+                    enhanced_prompt=job.enhanced_prompt,
+                    raw_request=job.raw_request,
+                    gen_config_snapshot=job.gen_config_snapshot,
                 )
                 _job_id_for_log = job.id
                 _result_uri = job.result_uri

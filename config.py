@@ -101,6 +101,11 @@ FLUX_TURBO_SIGMAS = [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.0003
 # Upload storage
 UPLOAD_DIR = Path("/mnt/nvme-1/servers/taco-backend/uploads")
 
+# Temp dir for intermediate MP4 encode buffer. PyAV needs a path (can't use BytesIO
+# without a format= hint), and /tmp on this host is ext-backed — each encode pays
+# NVMe write + read roundtrip. /dev/shm is tmpfs (pure RAM), falling back to /tmp.
+MP4_TMPDIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path("/tmp")
+
 # Approved images (curated feed from noodle-i for noodle-v)
 APPROVED_IMAGES_DIR = Path("/mnt/nvme-1/servers/taco-backend/approved-images")
 

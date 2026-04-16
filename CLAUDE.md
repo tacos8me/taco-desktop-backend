@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.3 (2026-04-13).
+**Version**: v1.4 (2026-04-16).
 
 ## Structure
 - `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode, dashboard
@@ -231,10 +231,14 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - Saves every completed v2 job with prompt, model, dimensions, result_uri, thumbnail
 - API key hashed with SHA-256 (raw keys never stored)
 - Thumbnails: 256px-wide JPEG at `/mnt/nvme-1/servers/taco-backend/thumbnails/`. Video thumbnails extract the first frame via PyAV (v1.1.5).
-- Endpoints: `GET /v2/history`, `GET /v2/history/{id}/image`, `GET /v2/history/{id}/thumbnail`
+- Endpoints: `GET /v2/history`, `GET /v2/history/{id}`, `GET /v2/history/{id}/image`, `GET /v2/history/{id}/thumbnail`
 - Cleanup: job_queue keeps completed result files (history manages lifecycle), 30-day retention
 - Both noodle-i and noodle-v consume the same history API
 - **`history.save()` runs in an `asyncio.to_thread` task** (v1.1.6) fire-and-forgotten from `worker_loop`, so the queue worker dequeues the next job immediately instead of stalling ~300 ms per job on PyAV + SQLite
+- **Schema v2 (2026-04-16)**: four new columns — `params_json`, `gen_config_json`, `seed`, `enhanced_prompt` — for full reproducibility. Online migration via `PRAGMA user_version`, idempotent, no backfill.
+- **`params_json`**: raw request body (Pydantic `body.model_dump(mode="json")`) — preserves `storage://` URIs, resolution enum, LoRA `id+strength`, keyframes symbolic indices. Music sanitizes paths back to URIs via `_sanitize_params_for_history`.
+- **`gen_config_json`**: LTX `_gen_config` snapshot at dispatch time OR `{turbo_steps, turbo_guidance}` for Flux-turbo requests. NULL for non-turbo Flux, ERNIE, JoyAI.
+- **`enhanced_prompt`**: LTX-rewritten prompt text when `enhance_prompt=true` (captured via `on_prompt_enhanced` callback). Always NULL for Flux/ERNIE/JoyAI/retake.
 
 ## v2 job observability (v1.1.6 / v1.1.7)
 
@@ -242,6 +246,7 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - **`/v2/jobs/{id}` status response** exposes `phase` when processing.
 - **`/v2/jobs/{id}/stream` SSE endpoint** (v1.1.7) — EventSource-compatible live status stream. Emits on `(status, progress, phase, error_code)` change, closes on terminal state, keepalive comment every 15 s. Accepts bearer header OR `?token=` query param (browsers). Replaces the 240-GET polling loop per video job with one long-lived connection.
 - **`/v2/jobs/{id}/preview`** (v1.1.6) serves the on-disk thumbnail written by `history.save()` via zero-copy `FileResponse`. Fallback lazy extraction still exists for jobs without api_key but is offloaded via `asyncio.to_thread`.
+- **`GET /v2/history/{id}`** — full record with parsed params + gen_config (v1.3).
 - **Timing logs** at every post-denoise phase boundary in `split_model_manager` (`vae_decode`, `video_decode+encode`) and `flux_manager` (`flux_webp_encode`), plus `history.save` in `job_queue`. Grep production logs for real wall-clock per phase: `journalctl -u taco-backend | grep -E "vae_decode|encode|history.save"`.
 
 ## Approved images (noodle-i → noodle-v pipeline)

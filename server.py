@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy as _copy
+import json as _json_mod
 import time
 import torch
 import logging
@@ -18,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 import config
+import split_model_manager
 from split_model_manager import SplitModelManager
 from flux_manager import FluxManager, FluxLoraError
 from joyai_client import joyai, JoyAIError
@@ -50,6 +53,45 @@ lora_registry = LoRARegistry(config.LORAS_DIR)
 flux_lora_registry = FluxLoRARegistry(config.FLUX_LORAS_DIR)
 chat = ChatManager()
 history = HistoryStore()
+
+# ---------------------------------------------------------------------------
+# Flux generation config (persisted to .flux_config.json)
+# ---------------------------------------------------------------------------
+
+_FLUX_CONFIG_PATH = Path(__file__).parent / ".flux_config.json"
+_DEFAULT_FLUX_CONFIG = {
+    "default_model": "flux2-dev",
+    "t2i_steps": 50,
+    "edit_steps": 4,
+    "guidance_scale": 4.0,
+    "turbo": False,
+    "turbo_steps": 8,
+    "turbo_guidance": 2.5,
+}
+
+
+def _load_flux_config() -> dict:
+    if _FLUX_CONFIG_PATH.exists():
+        try:
+            saved = _json_mod.loads(_FLUX_CONFIG_PATH.read_text())
+            merged = _copy.deepcopy(_DEFAULT_FLUX_CONFIG)
+            for k in merged:
+                if k in saved:
+                    merged[k] = saved[k]
+            return merged
+        except Exception:
+            pass
+    return _copy.deepcopy(_DEFAULT_FLUX_CONFIG)
+
+
+def _save_flux_config() -> None:
+    try:
+        _FLUX_CONFIG_PATH.write_text(_json_mod.dumps(_flux_config, indent=2))
+    except Exception:
+        pass
+
+
+_flux_config = _load_flux_config()
 
 # Shared inference lock: FP8 layerwise casting in diffusers causes CUBLAS_STATUS_INTERNAL_ERROR
 # when Flux and LTX run CUDA inference concurrently in the same process.
@@ -137,6 +179,12 @@ async def _ensure_ltx_resident() -> None:
         logger.info("Auto-swap: destroying Flux pipeline to free CUDA context for LTX peak")
         flux.unload()
     if not manager.is_ready:
+        # If the previous load_all() raised midway, GPU has partial state and
+        # a blind retry will OOM again. reset() nulls workers + encoder_ledger
+        # + flushes allocator so we start clean.
+        if getattr(manager, "_last_load_failed", False):
+            logger.warning("Auto-swap: prior LTX load failed — resetting before retry")
+            manager.reset()
         logger.info("Auto-swap: loading LTX on %s", config.LTX_DEVICE)
         manager.load_all()
 
@@ -169,6 +217,7 @@ async def _run_music_job(job: Job) -> None:
     job.started_at = time.monotonic()
     job.phase = "generating"
     result_bytes: bytes | None = None
+    staged_tmp: list[str] = []
     try:
         # Free JoyAI/ERNIE from cuda:1 if loaded — gives ACE more headroom.
         # joyai.load()/ernie.load() before the next request will reload on demand.
@@ -182,6 +231,21 @@ async def _run_music_job(job: Job) -> None:
             pass
 
         p = job.params
+        # ACE's validate_audio_path rejects absolute paths outside the system
+        # tempdir. Our uploads dir lives on the data volume, not /tmp, so copy
+        # any source/reference audio to a tempfile for the duration of the job.
+        import shutil, tempfile, os
+        for key in ("source_audio_path", "reference_audio_path"):
+            src = p.get(key)
+            if not src:
+                continue
+            suffix = os.path.splitext(src)[1] or ".bin"
+            fd, staged = tempfile.mkstemp(prefix=f"ace-{key}-{job.id}-", suffix=suffix)
+            os.close(fd)
+            shutil.copyfile(src, staged)
+            p[key] = staged
+            staged_tmp.append(staged)
+
         ace_params = _build_ace_params(p)
         est = _estimate_music_time(p)
 
@@ -216,6 +280,13 @@ async def _run_music_job(job: Job) -> None:
         job.error_code = "generation_failed"
         logger.exception("Music job %s failed", job.id)
     finally:
+        # Remove staged /tmp copies of source/reference audio.
+        for _p in staged_tmp:
+            try:
+                import os as _os
+                _os.remove(_p)
+            except OSError:
+                pass
         job.completed_at = time.monotonic()
         if history and job.api_key and result_bytes is not None:
             _params = job.params or {}
@@ -226,6 +297,11 @@ async def _run_music_job(job: Job) -> None:
                 status=job.status, result_uri=job.result_uri,
                 result_bytes=result_bytes, created_at=time.time(),
                 completed_at=time.time(), error=job.error,
+                seed=_params.get("seed"),
+                enhanced_prompt=None,
+                raw_request=None,
+                gen_config_snapshot=None,
+                dispatch_params=_params,
             )
 
             async def _save():
@@ -253,22 +329,48 @@ async def _dispatch_job(job: Job) -> bytes:
         if phase is not None:
             job.phase = phase
 
+    def _capture_enhanced(text: str) -> None:
+        job.enhanced_prompt = text
+
+    def _is_cancelled() -> bool:
+        # Polled from inside the denoiser loop between steps. Returning True
+        # raises GenerationCancelledError and unwinds the sigma loop so we
+        # stop burning GPU on a job the user DELETEd.
+        return job.status == JobStatus.CANCELLED
+
     match job.type:
         case JobType.TEXT_TO_VIDEO:
             await _ensure_ltx_resident()
-            return await manager.generate_text_to_video(**p, on_progress=on_progress)
+            job.gen_config_snapshot = dict(split_model_manager._gen_config)
+            return await manager.generate_text_to_video(
+                **p, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
+                on_cancel_check=_is_cancelled,
+            )
         case JobType.IMAGE_TO_VIDEO:
             await _ensure_ltx_resident()
-            return await manager.generate_image_to_video(**p, on_progress=on_progress)
+            job.gen_config_snapshot = dict(split_model_manager._gen_config)
+            return await manager.generate_image_to_video(
+                **p, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
+                on_cancel_check=_is_cancelled,
+            )
         case JobType.AUDIO_TO_VIDEO:
             await _ensure_ltx_resident()
-            return await manager.generate_audio_to_video(**p, on_progress=on_progress)
+            job.gen_config_snapshot = dict(split_model_manager._gen_config)
+            return await manager.generate_audio_to_video(
+                **p, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
+                on_cancel_check=_is_cancelled,
+            )
         case JobType.RETAKE:
             await _ensure_ltx_resident()
-            return await manager.retake(**p, on_progress=on_progress)
+            job.gen_config_snapshot = dict(split_model_manager._gen_config)
+            return await manager.retake(
+                **p, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
+                on_cancel_check=_is_cancelled,
+            )
         case JobType.TEXT_TO_IMAGE:
             model = p.get("model", "flux2-klein")
             if model == "ernie-image":
+                # ERNIE-Image: no enhanced-prompt pipeline, no gen_config snapshot.
                 await _ensure_ernie_ready()
                 on_progress(0.90, phase="encoding")
                 result = await ernie.generate(
@@ -283,13 +385,23 @@ async def _dispatch_job(job: Job) -> bytes:
                 return result
             await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
+            if p.get("turbo"):
+                job.gen_config_snapshot = {
+                    "turbo_steps": _flux_config["turbo_steps"],
+                    "turbo_guidance": _flux_config["turbo_guidance"],
+                }
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
-            return await flux.generate_text_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress)
+            return await flux.generate_text_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress, turbo_steps=_flux_config["turbo_steps"], turbo_guidance=_flux_config["turbo_guidance"])
         case JobType.IMAGE_TO_IMAGE:
             await _ensure_flux_ready()
             torch.cuda.set_device(config.FLUX_DEVICE)
+            if p.get("turbo"):
+                job.gen_config_snapshot = {
+                    "turbo_steps": _flux_config["turbo_steps"],
+                    "turbo_guidance": _flux_config["turbo_guidance"],
+                }
             cb = make_flux_callback(job, p.get("num_inference_steps", 50))
-            return await flux.generate_image_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress)
+            return await flux.generate_image_to_image(**p, callback_on_step_end=cb, phase_sink=on_progress, turbo_steps=_flux_config["turbo_steps"], turbo_guidance=_flux_config["turbo_guidance"])
         case JobType.IMAGE_EDIT:
             model = p.get("model", "flux2-klein")
             if model == "joyai-edit":
@@ -326,6 +438,11 @@ async def _dispatch_job(job: Job) -> bytes:
             else:
                 await _ensure_flux_ready()
                 torch.cuda.set_device(config.FLUX_DEVICE)
+                if p.get("turbo"):
+                    job.gen_config_snapshot = {
+                        "turbo_steps": _flux_config["turbo_steps"],
+                        "turbo_guidance": _flux_config["turbo_guidance"],
+                    }
                 cb = make_flux_callback(job, p.get("num_inference_steps", 4))
                 return await flux.generate_image_edit(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.EXPORT_COMPOSITION:
@@ -1003,6 +1120,7 @@ async def system_gpu() -> dict:
                 "turbo": _turbo_active,
                 "sampler": _gen_config["sampler"],
                 "gen_config": dict(_gen_config),
+                "flux_config": dict(_flux_config),
                 "gpu0_tenant": _last_gpu_tenant or "idle",
                 "gpu1_tenant": (
                     "ltx-sidecar" if config.DUAL_GPU_LTX else
@@ -1210,27 +1328,59 @@ async def _ace_systemctl(action: str) -> None:
     )
 
 
+async def _auto_exit_turbo_on_sidecar_failure() -> None:
+    """Exit turbo mode after a sidecar transport failure. Runs in a background
+    task so we don't block the dispatching worker while holding the inference
+    lock. Best-effort; logs but doesn't raise.
+    """
+    try:
+        async with _inference_lock:
+            await _exit_turbo_mode()
+        logger.warning("Auto-exited turbo mode after sidecar transport failure")
+    except Exception:
+        logger.exception("Auto-exit turbo after sidecar failure: failed")
+
+
 async def _dispatch_job_turbo(job: Job) -> bytes:
-    """Route a video job to the LTX sidecar on cuda:1."""
+    """Route a video job to the LTX sidecar on cuda:1.
+
+    If the sidecar is unreachable / times out / returns a transport-level
+    error (not a job-level failure), we schedule an automatic turbo exit so
+    the next queued job doesn't immediately fail the same way.
+    """
     if job.type not in _VIDEO_JOB_TYPES:
         raise ValueError(f"Turbo worker cannot handle {job.type} — only video jobs supported")
     p = job.params
-    return await ltx_sidecar.generate(
-        job_type=job.type,
-        prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
-        width=p["width"], height=p["height"],
-        num_frames=p["num_frames"], fps=p.get("fps", 24),
-        seed=p["seed"], generate_audio=p.get("generate_audio", False),
-        lora_path=p.get("lora_path"), lora_strength=p.get("lora_strength", 1.0),
-        enhance_prompt=p.get("enhance_prompt", False),
-        keyframes=p.get("keyframes"),
-        audio_path=p.get("audio_path"),
-        image_path=p.get("image_path"),
-        video_path=p.get("video_path"),
-        start_time=p.get("start_time"),
-        duration=p.get("duration"),
-        mode=p.get("mode"),
-    )
+    try:
+        return await ltx_sidecar.generate(
+            job_type=job.type,
+            prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
+            width=p["width"], height=p["height"],
+            num_frames=p["num_frames"], fps=p.get("fps", 24),
+            seed=p["seed"], generate_audio=p.get("generate_audio", False),
+            lora_path=p.get("lora_path"), lora_strength=p.get("lora_strength", 1.0),
+            enhance_prompt=p.get("enhance_prompt", False),
+            keyframes=p.get("keyframes"),
+            audio_path=p.get("audio_path"),
+            image_path=p.get("image_path"),
+            video_path=p.get("video_path"),
+            start_time=p.get("start_time"),
+            duration=p.get("duration"),
+            mode=p.get("mode"),
+        )
+    except LtxSidecarError as exc:
+        # Transport-level failures (status 502/503/504) mean the sidecar is
+        # dead or unreachable. Schedule a turbo exit so the next job doesn't
+        # just fail the same way — systemd will restart the sidecar and the
+        # main worker resumes on cuda:0. Job-level errors (4xx, validation)
+        # don't trigger exit.
+        status = getattr(exc, "status", None) or getattr(exc, "args", [None, None])[1]
+        if status in (502, 503, 504) or any(
+            tag in str(exc).lower() for tag in ("unreachable", "timeout", "http_error")
+        ):
+            logger.error("Turbo dispatch: sidecar transport failure (%s) — scheduling auto-exit", exc)
+            asyncio.create_task(_auto_exit_turbo_on_sidecar_failure())
+        raise
 
 
 async def _enter_turbo_mode() -> None:
@@ -1276,7 +1426,14 @@ async def _enter_turbo_mode() -> None:
     # Step 3: Evict Flux from cuda:0 (LTX needs full GPU)
     flux.unload()
 
-    # Step 4: Tell the LTX sidecar to load its pipeline on cuda:1.
+    # Step 4: Start the LTX sidecar service if not running, then load pipeline.
+    try:
+        health = await ltx_sidecar.health()
+    except Exception:
+        logger.info("Turbo: LTX sidecar not running — starting via systemctl")
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: subprocess.run(["systemctl", "--user", "start", "ltx-sidecar"], check=True, timeout=10))
+        await asyncio.sleep(5)  # wait for sidecar to bind port
     await ltx_sidecar.load()
     _last_gpu_tenant = "ltx"
 
@@ -1407,6 +1564,35 @@ async def reset_gen_config() -> JSONResponse:
     _gpu_cache = None  # invalidate so next poll returns fresh config
     split_model_manager._save_gen_config()
     return JSONResponse(content={"status": "reset", **dict(split_model_manager._gen_config)})
+
+
+@app.get("/v1/system/flux-config")
+async def get_flux_config() -> JSONResponse:
+    """Get current Flux generation configuration."""
+    return JSONResponse(content=dict(_flux_config))
+
+
+@app.post("/v1/system/flux-config")
+async def set_flux_config(request: Request) -> JSONResponse:
+    """Update Flux generation configuration. Merges body into current config."""
+    global _gpu_cache
+    body = await request.json()
+    for key, value in body.items():
+        if key in _flux_config:
+            _flux_config[key] = value
+    _gpu_cache = None
+    _save_flux_config()
+    return JSONResponse(content={"status": "ok", **dict(_flux_config)})
+
+
+@app.post("/v1/system/flux-config/reset")
+async def reset_flux_config() -> JSONResponse:
+    """Reset Flux generation config to defaults."""
+    global _gpu_cache
+    _flux_config.update(_copy.deepcopy(_DEFAULT_FLUX_CONFIG))
+    _gpu_cache = None
+    _save_flux_config()
+    return JSONResponse(content={"status": "reset", **dict(_flux_config)})
 
 
 @app.get("/v1/system/sampler")
@@ -1646,6 +1832,8 @@ async def text_to_image(body: TextToImageRequest) -> Response:
                 turbo=body.turbo,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
+                turbo_steps=_flux_config["turbo_steps"],
+                turbo_guidance=_flux_config["turbo_guidance"],
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FluxLoraError as exc:
@@ -1686,6 +1874,8 @@ async def image_to_image(body: ImageToImageRequest) -> Response:
                 turbo=body.turbo,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
+                turbo_steps=_flux_config["turbo_steps"],
+                turbo_guidance=_flux_config["turbo_guidance"],
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FluxLoraError as exc:
@@ -1969,8 +2159,14 @@ async def rescan_flux_loras() -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONResponse:
-    """Create a job, enqueue it, return 202."""
+def _submit_job(job_type: JobType, params: dict, request: Request, raw: dict | None = None) -> JSONResponse:
+    """Create a job, enqueue it, return 202.
+
+    ``raw`` captures the client-facing request body (via Pydantic
+    ``model_dump(mode="json")``) so history_store can persist the exact user
+    intent — storage:// URIs, keyframe sub-models, etc. — rather than the
+    lowered dispatch params.
+    """
     if _paused:
         return JSONResponse(
             status_code=503,
@@ -1988,6 +2184,7 @@ def _submit_job(job_type: JobType, params: dict, request: Request) -> JSONRespon
     api_key = auth[7:] if auth.startswith("Bearer ") else ""
 
     job = Job(id=make_job_id(), type=job_type, params=params, api_key=api_key)
+    job.raw_request = raw
     job_store.add(job)
     _job_queue.put_nowait(job.id)
 
@@ -2016,7 +2213,7 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
                   num_frames=num_frames, fps=body.fps, seed=seed, generate_audio=body.generate_audio,
                   lora_path=lora_path, lora_strength=lora_strength,
                   enhance_prompt=body.enhance_prompt)
-    return _submit_job(JobType.TEXT_TO_VIDEO, params, request)
+    return _submit_job(JobType.TEXT_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/image-to-video")
@@ -2036,7 +2233,7 @@ async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSON
                   seed=seed, generate_audio=body.generate_audio,
                   lora_path=lora_path, lora_strength=lora_strength,
                   enhance_prompt=body.enhance_prompt)
-    return _submit_job(JobType.IMAGE_TO_VIDEO, params, request)
+    return _submit_job(JobType.IMAGE_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/audio-to-video")
@@ -2057,7 +2254,7 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
                   fps=body.fps, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength,
                   enhance_prompt=body.enhance_prompt)
-    return _submit_job(JobType.AUDIO_TO_VIDEO, params, request)
+    return _submit_job(JobType.AUDIO_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/retake")
@@ -2072,7 +2269,7 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
     params = dict(video_path=video_path, start_time=body.start_time,
                   duration=body.duration, mode=body.mode, prompt=prompt, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength)
-    return _submit_job(JobType.RETAKE, params, request)
+    return _submit_job(JobType.RETAKE, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/text-to-image")
@@ -2089,7 +2286,7 @@ async def v2_text_to_image(body: TextToImageRequest, request: Request) -> JSONRe
                   guidance_scale=body.guidance_scale, seed=seed,
                   model=body.model, turbo=body.turbo,
                   lora_path=lora_path, lora_strength=lora_strength)
-    return _submit_job(JobType.TEXT_TO_IMAGE, params, request)
+    return _submit_job(JobType.TEXT_TO_IMAGE, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/image-to-image")
@@ -2107,7 +2304,7 @@ async def v2_image_to_image(body: ImageToImageRequest, request: Request) -> JSON
                   guidance_scale=body.guidance_scale, seed=seed,
                   model=body.model, turbo=body.turbo,
                   lora_path=lora_path, lora_strength=lora_strength)
-    return _submit_job(JobType.IMAGE_TO_IMAGE, params, request)
+    return _submit_job(JobType.IMAGE_TO_IMAGE, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/image-edit")
@@ -2125,7 +2322,7 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
                   guidance_scale=body.guidance_scale, seed=seed,
                   model=body.model,
                   lora_path=lora_path, lora_strength=lora_strength)
-    return _submit_job(JobType.IMAGE_EDIT, params, request)
+    return _submit_job(JobType.IMAGE_EDIT, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/music")
@@ -2727,6 +2924,59 @@ async def v2_history_delete(generation_id: str, request: Request) -> JSONRespons
     if not history.delete(generation_id, api_key):
         return _error(404, "Not found")
     return JSONResponse(content={"ok": True})
+
+
+@app.get("/v2/history/{generation_id}")
+async def v2_history_get(generation_id: str, request: Request) -> JSONResponse:
+    """Return the full history record for a single generation, including the
+    raw request body (``params``) and generation-config snapshot
+    (``gen_config``). Scoped to the caller's API key — returns 404 both when
+    the entry doesn't exist and when it belongs to another key."""
+    api_key = _extract_api_key(request)
+    if not api_key:
+        return _error(401, "Missing API key")
+    item = history.get(generation_id, api_key)
+    if not item:
+        return _error(404, "Not found")
+
+    params_json = item.get("params_json")
+    try:
+        params = _json_mod.loads(params_json) if params_json else {}
+    except (ValueError, TypeError):
+        params = {}
+
+    gen_config_json = item.get("gen_config_json")
+    try:
+        gen_config = _json_mod.loads(gen_config_json) if gen_config_json else None
+    except (ValueError, TypeError):
+        gen_config = None
+
+    response: dict = {
+        "id": item["id"],
+        "job_type": item.get("job_type"),
+        "prompt": item.get("prompt"),
+        "enhanced_prompt": item.get("enhanced_prompt"),
+        "model": item.get("model"),
+        "width": item.get("width"),
+        "height": item.get("height"),
+        "seed": item.get("seed"),
+        "turbo": bool(item.get("turbo")),
+        "status": item.get("status"),
+        "created_at": item.get("created_at"),
+        "completed_at": item.get("completed_at"),
+        "error": item.get("error"),
+        "params": params,
+        "gen_config": gen_config,
+    }
+    if item.get("result_uri"):
+        response["result_url"] = f"/v2/history/{item['id']}/image"
+    else:
+        response["result_url"] = None
+    if item.get("thumbnail_uri"):
+        response["thumbnail_url"] = f"/v2/history/{item['id']}/thumbnail"
+    else:
+        response["thumbnail_url"] = None
+    return JSONResponse(content=response)
 
 
 def _extract_api_key(request: Request) -> str | None:

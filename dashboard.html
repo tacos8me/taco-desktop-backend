@@ -903,6 +903,83 @@ input[type="range"]::-moz-range-track {
   </div>
 </section>
 
+<!-- Section 4c: Flux Controls -->
+<section>
+  <div class="collapsible-header" onclick="toggleSection('flux')">
+    <span class="collapse-arrow" id="fluxArrow">&#9654;</span>
+    <h2>Flux</h2>
+  </div>
+  <div class="collapsible-body" id="fluxBody">
+    <div style="padding-top:12px">
+
+      <div class="btn-row-label">Generation</div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Default Model</label>
+          <select id="fluxModel" onchange="setFluxConfig({default_model: this.value})">
+            <option value="flux2-dev">Flux 2 Dev (50 steps, CFG)</option>
+            <option value="flux2-klein">Flux 2 Klein (4 steps, distilled)</option>
+          </select>
+        </div>
+        <div class="adv-control">
+          <label>T2I/I2I Steps <span class="adv-val" id="fluxT2iStepsVal">50</span></label>
+          <input type="range" id="fluxT2iSteps" min="1" max="100" step="1" value="50" list="tickFluxT2i"
+                 oninput="document.getElementById('fluxT2iStepsVal').textContent=this.value"
+                 onchange="setFluxConfig({t2i_steps: parseInt(this.value)})">
+        </div>
+      </div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Edit Steps <span class="adv-val" id="fluxEditStepsVal">4</span></label>
+          <input type="range" id="fluxEditSteps" min="1" max="20" step="1" value="4" list="tickFluxEdit"
+                 oninput="document.getElementById('fluxEditStepsVal').textContent=this.value"
+                 onchange="setFluxConfig({edit_steps: parseInt(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Guidance Scale <span class="adv-val" id="fluxGuidanceVal">4.0</span></label>
+          <input type="range" id="fluxGuidance" min="0" max="20" step="0.5" value="4.0" list="tickFluxGuidance"
+                 oninput="document.getElementById('fluxGuidanceVal').textContent=parseFloat(this.value).toFixed(1)"
+                 onchange="setFluxConfig({guidance_scale: parseFloat(this.value)})">
+        </div>
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">Turbo <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(Dev only, 8-step sigma schedule)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Turbo Mode</label>
+          <select id="fluxTurbo" onchange="setFluxConfig({turbo: this.value === 'on'})">
+            <option value="off">Off</option>
+            <option value="on">On</option>
+          </select>
+        </div>
+        <div class="adv-control">
+          <label>Turbo Steps <span class="adv-val" id="fluxTurboStepsVal">8</span></label>
+          <input type="range" id="fluxTurboSteps" min="4" max="12" step="1" value="8" list="tickFluxTurboSteps"
+                 oninput="document.getElementById('fluxTurboStepsVal').textContent=this.value"
+                 onchange="setFluxConfig({turbo_steps: parseInt(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Turbo Guidance <span class="adv-val" id="fluxTurboGuidanceVal">2.5</span></label>
+          <input type="range" id="fluxTurboGuidance" min="1.0" max="4.0" step="0.1" value="2.5" list="tickFluxTurboGuidance"
+                 oninput="document.getElementById('fluxTurboGuidanceVal').textContent=parseFloat(this.value).toFixed(1)"
+                 onchange="setFluxConfig({turbo_guidance: parseFloat(this.value)})">
+        </div>
+      </div>
+
+      <div class="btn-grid" style="margin-top:16px">
+        <button class="btn btn-danger" onclick="resetFluxConfig()">Reset to Default</button>
+      </div>
+
+    </div>
+    <!-- Default tick marks -->
+    <datalist id="tickFluxT2i"><option value="50"></datalist>
+    <datalist id="tickFluxEdit"><option value="4"></datalist>
+    <datalist id="tickFluxGuidance"><option value="4.0"></datalist>
+    <datalist id="tickFluxTurboSteps"><option value="8"></datalist>
+    <datalist id="tickFluxTurboGuidance"><option value="2.5"></datalist>
+  </div>
+</section>
+
 <!-- Section 5: Quick Generate -->
 <section>
   <h2>Quick Generate</h2>
@@ -1153,6 +1230,11 @@ async function pollGpu() {
     if (!window._advControlsInitialized && data.gen_config) {
       updateAdvancedControls(data.gen_config);
       window._advControlsInitialized = true;
+    }
+    // Update flux controls ONLY on first load
+    if (!window._fluxControlsInitialized && data.flux_config) {
+      updateFluxControls(data.flux_config);
+      window._fluxControlsInitialized = true;
     }
   } catch {
     // Endpoint not yet available
@@ -1502,6 +1584,63 @@ async function resetConfig() {
   if (data) {
     updateAdvancedControls(data);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Collapsible section toggle (generic)
+// ---------------------------------------------------------------------------
+
+function toggleSection(name) {
+  const body = document.getElementById(name + 'Body');
+  const arrow = document.getElementById(name + 'Arrow');
+  if (body.classList.contains('open')) {
+    body.classList.remove('open');
+    body.style.maxHeight = '0';
+    arrow.textContent = '\u25B6';
+  } else {
+    body.classList.add('open');
+    body.style.maxHeight = body.scrollHeight + 'px';
+    arrow.textContent = '\u25BC';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Flux controls
+// ---------------------------------------------------------------------------
+
+async function setFluxConfig(fields) {
+  const data = await callEndpoint('POST', '/v1/system/flux-config', fields);
+  if (data && data.status === 'ok') updateFluxControls(data);
+}
+
+async function resetFluxConfig() {
+  const data = await callEndpoint('POST', '/v1/system/flux-config/reset');
+  if (data) updateFluxControls(data);
+}
+
+function updateFluxControls(fc) {
+  if (!fc) return;
+  const focused = document.activeElement;
+
+  const model = document.getElementById('fluxModel');
+  if (model && focused?.id !== 'fluxModel') model.value = fc.default_model || 'flux2-dev';
+
+  if (focused?.id !== 'fluxT2iSteps') setSlider('fluxT2iSteps', 'fluxT2iStepsVal', fc.t2i_steps, 0);
+  if (focused?.id !== 'fluxEditSteps') setSlider('fluxEditSteps', 'fluxEditStepsVal', fc.edit_steps, 0);
+  if (focused?.id !== 'fluxGuidance') setSlider('fluxGuidance', 'fluxGuidanceVal', fc.guidance_scale, 1);
+
+  const turbo = document.getElementById('fluxTurbo');
+  if (turbo && focused?.id !== 'fluxTurbo') turbo.value = fc.turbo ? 'on' : 'off';
+
+  if (focused?.id !== 'fluxTurboSteps') setSlider('fluxTurboSteps', 'fluxTurboStepsVal', fc.turbo_steps, 0);
+  if (focused?.id !== 'fluxTurboGuidance') setSlider('fluxTurboGuidance', 'fluxTurboGuidanceVal', fc.turbo_guidance, 1);
+
+  // Add default tick marks
+  addDefaultTick('fluxT2iSteps', 50);
+  addDefaultTick('fluxEditSteps', 4);
+  addDefaultTick('fluxGuidance', 4.0);
+  addDefaultTick('fluxTurboSteps', 8);
+  addDefaultTick('fluxTurboGuidance', 2.5);
 }
 
 function addDefaultTick(sliderId, defaultVal) {

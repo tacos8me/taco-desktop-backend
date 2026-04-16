@@ -14,3 +14,6 @@ uv.lock
 .gstack/
 resume.md
 .gen_config.json
+.flux_config.json
+*.bak-pr*
+cufile.log

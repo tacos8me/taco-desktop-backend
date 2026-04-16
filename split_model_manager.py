@@ -15,10 +15,10 @@ import logging
 import os
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 
 import torch
@@ -113,6 +113,53 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
+class GenerationCancelledError(Exception):
+    """Raised from inside the LTX denoiser when the owning job is cancelled.
+
+    Unwinds the sigma loop so we stop burning GPU; caller in server.py
+    catches and marks the job CANCELLED (not FAILED).
+    """
+
+
+@contextmanager
+def _oom_recovery(worker: "DenoiserWorker"):
+    """Catch CUDA OOM inside an `_run_*` body, evict transformer + flush
+    allocator so the NEXT request starts from a clean state, then re-raise.
+
+    Mirrors flux_manager.py:354 pattern. Without this, a mid-VAE-decode OOM
+    leaks ~22 GB of transformer + ~15 GB of decode activations into the
+    allocator cache, OOMing every subsequent request until a restart.
+    """
+    try:
+        yield
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        msg = str(exc).lower()
+        if isinstance(exc, RuntimeError) and "out of memory" not in msg and "cuda" not in msg:
+            raise
+        logger.exception("LTX OOM — evicting transformer + flushing allocator")
+        try:
+            worker.evict_transformer()
+        except Exception:
+            logger.exception("evict_transformer during OOM recovery failed")
+        try:
+            cleanup_memory()
+        except Exception:
+            logger.exception("cleanup_memory during OOM recovery failed")
+        raise
+
+
+def _with_oom_recovery(fn):
+    """Decorator that wraps a `_run_*(self, worker, ...)` method in
+    :func:`_oom_recovery`. Stack it OUTSIDE any `@torch.inference_mode()`
+    so OOM is caught after the inference-mode context exits.
+    """
+    @wraps(fn)
+    def wrapper(self, worker, *args, **kwargs):
+        with _oom_recovery(worker):
+            return fn(self, worker, *args, **kwargs)
+    return wrapper
+
 # Pre-compute dev checkpoint params once at import time (avoids repeated disk I/O)
 _DEV_PARAMS = detect_params(config.DEV_CHECKPOINT)
 
@@ -201,6 +248,11 @@ class DenoiserWorker:
             self.ledger._cache["transformer"] = None
             self.transformer_state = ""
             self._user_lora = None
+            # Load-bearing: ~22 GB transformer must be fully freed and its
+            # allocator blocks released BEFORE the next request's allocation
+            # lands, or we OOM on the handoff. Device-specific sync (not
+            # cleanup_memory()) — on DUAL_GPU_LTX, cuda:1's worker needs its
+            # own sync and cleanup_memory() only targets the current device.
             import gc; gc.collect()
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
@@ -263,6 +315,7 @@ class DenoiserWorker:
         self.cache["transformer"] = None
         self.ledger._cache["transformer"] = None
         del old
+        # Load-bearing (device-specific sync, see evict_transformer for rationale).
         import gc; gc.collect()
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -393,7 +446,7 @@ def euler_cfg_pp_loop(
     The key difference from standard Euler is the alpha-rescaled step formula
     which keeps the trajectory on the data manifold instead of drifting.
     """
-    for step_idx in tqdm(range(len(sigmas) - 1)):
+    for step_idx in tqdm(range(len(sigmas) - 1), disable=None):
         sigma = sigmas[step_idx]
         sigma_next = sigmas[step_idx + 1]
 
@@ -496,8 +549,10 @@ def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iter
 def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
     # Can't use BytesIO here: encode_video calls av.open(path, mode="w") without
     # format= kwarg, so PyAV can't infer the container format from a file-like object.
+    # dir=config.MP4_TMPDIR puts the intermediate on tmpfs (RAM) instead of /tmp (NVMe),
+    # skipping the encode-write + read-back roundtrip through the filesystem.
     video_chunks_number = get_video_chunks_number(num_frames, _get_decode_tiling(num_frames))
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=str(config.MP4_TMPDIR)) as tmp:
         tmp_path = tmp.name
     try:
         encode_video(
@@ -533,6 +588,14 @@ class SplitModelManager:
         self._workers: list[DenoiserWorker] = []
         self._encoder_device: torch.device | None = None
         self._encoder_ledger: CachingModelFactory | None = None
+        # Cached encoding of DEFAULT_NEGATIVE_PROMPT. Lives on encoder device
+        # (cuda:0); survives encoder CPU↔GPU paging because the cached tensor
+        # is independent of the encoder's parameter tensors. Nulled in evict_all.
+        self._neg_prompt_cache: EmbeddingsProcessorOutput | None = None
+        # Tracks whether the last load_all() raised midway. When True, the next
+        # _ensure_ltx_resident() call in server.py forces reset() before retrying
+        # so we don't OOM again on partially-populated GPU state.
+        self._last_load_failed: bool = False
         # No explicit encode lock needed — CUDA serializes ops on the default
         # stream per-device. Text encoding (0.4s) may wait at most 1 denoising
         # step (~1.5s) when GPU:0 is concurrently denoising. Acceptable tradeoff.
@@ -555,14 +618,54 @@ class SplitModelManager:
                 self._encoder_ledger._cache[key] = None
             self._encoder_ledger._builders.clear()
             self._encoder_ledger = None
+        # Drop cached neg-prompt embedding — its tensors live on a device we
+        # just evicted, and the encoder_ledger it came from is now None.
+        self._neg_prompt_cache = None
+        # Fresh slate — subsequent load_all() starts clean.
+        self._last_load_failed = False
+        # Load-bearing: explicit per-device loop so BOTH cuda:0 and cuda:1
+        # quiesce + release allocator blocks. cleanup_memory() is current-
+        # device-only, which would leave the other GPU in a stale state.
         gc.collect()
         for device_name in config.GPU_DEVICES:
             torch.cuda.synchronize(torch.device(device_name))
             torch.cuda.empty_cache()
         logger.info("All LTX models evicted from GPU")
 
+    def reset(self) -> None:
+        """Nuke any partial state (half-loaded workers, orphan encoder cache,
+        cuda allocator blocks) and leave the manager in a definitely-clean
+        state. Called by server.py's _ensure_ltx_resident when a prior
+        load_all() raised midway — otherwise we'd OOM again on the next
+        retry against partially-populated GPU memory.
+        """
+        try:
+            self.evict_all()
+        except Exception:
+            # evict_all iterates workers; if any is mid-construction, tolerate.
+            logger.exception("reset: evict_all partial; forcing raw cleanup")
+            self._workers.clear()
+            self._encoder_ledger = None
+            self._neg_prompt_cache = None
+            for device_name in config.GPU_DEVICES:
+                try:
+                    torch.cuda.synchronize(torch.device(device_name))
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        self._last_load_failed = False
+        logger.info("SplitModelManager reset to clean state")
+
     def load_all(self) -> None:
         self._workers.clear()
+        self._last_load_failed = False
+        try:
+            self._load_all_impl()
+        except Exception:
+            self._last_load_failed = True
+            raise
+
+    def _load_all_impl(self) -> None:
         devices = [torch.device(d) for d in config.GPU_DEVICES]
         checkpoint = config.DEV_CHECKPOINT
 
@@ -680,6 +783,9 @@ class SplitModelManager:
             te.to("cpu")
         if ae is not None:
             ae.to("cpu")
+        # Load-bearing: release the ~25 GB of encoder params we just paged out
+        # back to the allocator free list — without empty_cache the allocator
+        # holds the blocks as "cached" and OOMs on denoise activations.
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("Encoder hub paged to CPU (freed ~25 GB on %s)", self._encoder_device)
@@ -735,16 +841,37 @@ class SplitModelManager:
 
     # --- Prompt encoding (replaces upstream encode_prompts) ---
 
-    def _encode_prompts(self, prompts: list[str], *, enhance_first_prompt: bool = False, enhance_prompt_image: str | None = None, enhance_prompt_seed: int = 42) -> list[EmbeddingsProcessorOutput]:
-        """Encode prompts through cached Gemma text encoder + embeddings processor."""
-        text_encoder = self._encoder_ledger.text_encoder()
-        if enhance_first_prompt:
-            prompts = list(prompts)
-            prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], image_path=enhance_prompt_image, seed=enhance_prompt_seed)
-        raw_outputs = [text_encoder.encode(p) for p in prompts]
-        torch.cuda.synchronize()
-        embeddings_processor = self._encoder_ledger.gemma_embeddings_processor()
-        return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+    def _encode_prompts(self, prompts: list[str], *, enhance_first_prompt: bool = False, enhance_prompt_image: str | None = None, enhance_prompt_seed: int = 42, on_enhanced: Callable[[str], None] | None = None) -> list[EmbeddingsProcessorOutput]:
+        """Encode prompts through cached Gemma text encoder + embeddings processor.
+
+        DEFAULT_NEGATIVE_PROMPT is a lib-level constant that appears in every
+        CFG-enabled path — we encode it once per encoder lifecycle and reuse
+        the EmbeddingsProcessorOutput across requests. Cache is nulled by
+        evict_all() when the encoder_ledger is cleared.
+
+        Dropped the post-encode torch.cuda.synchronize() — same default stream
+        serializes subsequent ops; the eventual `.to(target)` in _contexts_to_device
+        syncs implicitly when the tensor is consumed by the denoiser.
+        """
+        with _timed("encode_prompts"):
+            text_encoder = self._encoder_ledger.text_encoder()
+            if enhance_first_prompt:
+                prompts = list(prompts)
+                prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], image_path=enhance_prompt_image, seed=enhance_prompt_seed)
+                if on_enhanced is not None:
+                    on_enhanced(prompts[0])
+            embeddings_processor = self._encoder_ledger.gemma_embeddings_processor()
+            results: list[EmbeddingsProcessorOutput] = []
+            for p in prompts:
+                if p == DEFAULT_NEGATIVE_PROMPT and self._neg_prompt_cache is not None:
+                    results.append(self._neg_prompt_cache)
+                    continue
+                hs, mask = text_encoder.encode(p)
+                output = embeddings_processor.process_hidden_states(hs, mask)
+                if p == DEFAULT_NEGATIVE_PROMPT:
+                    self._neg_prompt_cache = output
+                results.append(output)
+            return results
 
     # --- State creation helper (replaces denoise_audio_video / denoise_video_only) ---
 
@@ -785,16 +912,24 @@ class SplitModelManager:
     # --- Generation flows ---
 
     @staticmethod
-    def _wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=1.0):
+    def _wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=1.0, on_cancel_check=None):
         """Wrap a Denoiser to report progress on each step.
 
         Cap is 0.90: the top 10% of the progress bar is reserved for
         post-denoise phases (decoding, encoding, saving).
+
+        If ``on_cancel_check`` is provided, it's polled BEFORE each step;
+        returning True raises :class:`GenerationCancelledError` to unwind the
+        sigma loop so we stop burning GPU on a job the user cancelled.
         """
         step_count = [0]
 
         class ProgressDenoiser:
             def __call__(self, transformer, video_state, audio_state, sigmas, step_index):
+                if on_cancel_check is not None and on_cancel_check():
+                    raise GenerationCancelledError(
+                        f"Cancelled at step {step_count[0]}/{total_steps}"
+                    )
                 result = denoiser(transformer, video_state, audio_state, sigmas, step_index)
                 step_count[0] += 1
                 p = offset + min(step_count[0] / max(total_steps, 1), 1.0) * scale
@@ -803,11 +938,14 @@ class SplitModelManager:
 
         return ProgressDenoiser()
 
+    @_with_oom_recovery
     @torch.inference_mode()
     def _run_t2v(
         self, worker: DenoiserWorker, prompt: str, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -818,12 +956,12 @@ class SplitModelManager:
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
         if is_fast:
-            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt)
+            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, on_enhanced=on_prompt_enhanced)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt)
+            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, on_enhanced=on_prompt_enhanced)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -851,7 +989,7 @@ class SplitModelManager:
 
             denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
             if on_progress:
-                denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+                denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7, on_cancel_check=on_cancel_check)
             if _gen_config["sampler"] == "cfg_pp":
                 loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_stage1"], generator=generator)
             else:
@@ -879,7 +1017,7 @@ class SplitModelManager:
                 audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
             )
             if on_progress:
-                denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+                denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7, on_cancel_check=on_cancel_check)
             if _gen_config["sampler"] == "cfg_pp":
                 loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
             else:
@@ -925,7 +1063,7 @@ class SplitModelManager:
 
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
-            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25, on_cancel_check=on_cancel_check)
         if _gen_config["sampler"] == "cfg_pp":
             loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
@@ -947,6 +1085,11 @@ class SplitModelManager:
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
             worker.ledger._cache[k] = None
+        # Load-bearing: spatial_upsampler + video_encoder refs were dropped
+        # above. gc.collect handles any cycles in the Module hierarchy;
+        # empty_cache returns their GPU memory to the allocator before VAE
+        # decode's peak ~15 GB activations. Not safely dedup-able to
+        # cleanup_memory() — its current-device sync is insufficient here.
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -959,11 +1102,14 @@ class SplitModelManager:
         with _timed(f"video_decode+encode job=t2v"):
             return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
+    @_with_oom_recovery
     @torch.inference_mode()
     def _run_t2v_hq(
         self, worker: DenoiserWorker, prompt: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -973,7 +1119,7 @@ class SplitModelManager:
 
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
-        ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt)
+        ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, on_enhanced=on_prompt_enhanced)
         ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -1006,7 +1152,7 @@ class SplitModelManager:
             audio_guider=MultiModalGuider(params=hq_params.audio_guider_params, negative_context=a_context_n),
         )
         if on_progress:
-            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_nfe, offset=0.0, scale=0.7)
+            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_nfe, offset=0.0, scale=0.7, on_cancel_check=on_cancel_check)
         video_state, audio_state = res2s_audio_video_denoising_loop(
             sigmas=sigmas, video_state=video_state, audio_state=audio_state,
             stepper=stepper, transformer=transformer, denoiser=denoiser,
@@ -1047,7 +1193,7 @@ class SplitModelManager:
 
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
-            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_nfe, offset=0.7, scale=0.25)
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_nfe, offset=0.7, scale=0.25, on_cancel_check=on_cancel_check)
         video_state, audio_state = res2s_audio_video_denoising_loop(
             sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state,
             stepper=stepper, transformer=transformer, denoiser=denoiser_s2,
@@ -1068,6 +1214,11 @@ class SplitModelManager:
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
             worker.ledger._cache[k] = None
+        # Load-bearing: spatial_upsampler + video_encoder refs were dropped
+        # above. gc.collect handles any cycles in the Module hierarchy;
+        # empty_cache returns their GPU memory to the allocator before VAE
+        # decode's peak ~15 GB activations. Not safely dedup-able to
+        # cleanup_memory() — its current-device sync is insufficient here.
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1080,11 +1231,14 @@ class SplitModelManager:
         with _timed("video_decode+encode job=t2v_hq"):
             return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
+    @_with_oom_recovery
     @torch.inference_mode()
     def _run_i2v(
         self, worker: DenoiserWorker, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -1100,12 +1254,12 @@ class SplitModelManager:
         self._page_encoder_to_gpu()
         _enhance_image = images[0].path if images else None
         if is_fast:
-            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
+            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image, on_enhanced=on_prompt_enhanced)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
+            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image, on_enhanced=on_prompt_enhanced)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -1152,7 +1306,7 @@ class SplitModelManager:
                 audio_guider_factory=create_multimodal_guider_factory(params=params.audio_guider_params, negative_context=a_context_n),
             )
         if on_progress:
-            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7, on_cancel_check=on_cancel_check)
         if _gen_config["sampler"] == "cfg_pp":
             # i2v/a2v: always eta=0 — ancestral noise destroys image/audio conditioning
             loop_fn = partial(euler_cfg_pp_loop, eta=0.0, generator=generator)
@@ -1199,7 +1353,7 @@ class SplitModelManager:
 
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
-            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25, on_cancel_check=on_cancel_check)
         if _gen_config["sampler"] == "cfg_pp":
             loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
@@ -1221,6 +1375,11 @@ class SplitModelManager:
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
             worker.ledger._cache[k] = None
+        # Load-bearing: spatial_upsampler + video_encoder refs were dropped
+        # above. gc.collect handles any cycles in the Module hierarchy;
+        # empty_cache returns their GPU memory to the allocator before VAE
+        # decode's peak ~15 GB activations. Not safely dedup-able to
+        # cleanup_memory() — its current-device sync is insufficient here.
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1232,12 +1391,15 @@ class SplitModelManager:
         with _timed("video_decode+encode job=i2v"):
             return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
 
+    @_with_oom_recovery
     @torch.inference_mode()
     def _run_a2v(
         self, worker: DenoiserWorker, prompt: str, audio_path: str, image_path: str | None,
         width: int, height: int, num_frames: int, fps: float, seed: int,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
         model: str = "ltx-2-3-pro",
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -1249,12 +1411,12 @@ class SplitModelManager:
         self._page_encoder_to_gpu()
         _enhance_image = image_path
         if is_fast:
-            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
+            (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image, on_enhanced=on_prompt_enhanced)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = None, None
         else:
-            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image)
+            ctx_p, ctx_n = self._encode_prompts([prompt, DEFAULT_NEGATIVE_PROMPT], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image, on_enhanced=on_prompt_enhanced)
             ctx_p, ctx_n = self._contexts_to_device([ctx_p, ctx_n], device)
             v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
             v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -1326,7 +1488,7 @@ class SplitModelManager:
                 audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
             )
         if on_progress:
-            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7)
+            denoiser = self._wrap_denoiser(denoiser, on_progress, s1_steps, offset=0.0, scale=0.7, on_cancel_check=on_cancel_check)
         if _gen_config["sampler"] == "cfg_pp":
             # i2v/a2v: always eta=0 — ancestral noise destroys image/audio conditioning
             loop_fn = partial(euler_cfg_pp_loop, eta=0.0, generator=generator)
@@ -1371,7 +1533,7 @@ class SplitModelManager:
 
         denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
         if on_progress:
-            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25)
+            denoiser_s2 = self._wrap_denoiser(denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25, on_cancel_check=on_cancel_check)
         if _gen_config["sampler"] == "cfg_pp":
             loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
@@ -1392,6 +1554,11 @@ class SplitModelManager:
         for k in ("spatial_upsampler", "video_encoder"):
             worker.cache[k] = None
             worker.ledger._cache[k] = None
+        # Load-bearing: spatial_upsampler + video_encoder refs were dropped
+        # above. gc.collect handles any cycles in the Module hierarchy;
+        # empty_cache returns their GPU memory to the allocator before VAE
+        # decode's peak ~15 GB activations. Not safely dedup-able to
+        # cleanup_memory() — its current-device sync is insufficient here.
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1403,11 +1570,14 @@ class SplitModelManager:
         with _timed("video_decode+encode job=a2v"):
             return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
 
+    @_with_oom_recovery
     @torch.inference_mode()
     def _run_retake(
         self, worker: DenoiserWorker, video_path: str, start_time: float, duration: float,
         mode: str, prompt: str, seed: int,
         on_progress=None, user_lora=None,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         device = worker.device
         dtype = torch.bfloat16
@@ -1428,9 +1598,10 @@ class SplitModelManager:
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
-        # Evict transformer (~44GB) to make room for VAE encode (~46GB intermediates)
+        # Evict transformer (~44GB) to make room for VAE encode (~46GB intermediates).
+        # evict_transformer already did gc.collect+synchronize+empty_cache — no
+        # need to gc again here (nothing has been allocated in between).
         worker.evict_transformer()
-        gc.collect()
 
         # Encode input video on GPU:0, transfer to worker device
         video_encoder_enc = self._encoder_ledger.video_encoder()
@@ -1514,7 +1685,7 @@ class SplitModelManager:
             audio_guider=MultiModalGuider(params=params.audio_guider_params, negative_context=a_context_n),
         )
         if on_progress:
-            denoiser = self._wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=0.95)
+            denoiser = self._wrap_denoiser(denoiser, on_progress, total_steps, offset=0.0, scale=0.95, on_cancel_check=on_cancel_check)
         if _gen_config["sampler"] == "cfg_pp":
             loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
         else:
@@ -1526,10 +1697,11 @@ class SplitModelManager:
         audio_state = a_tools.clear_conditioning(audio_state)
         audio_state = a_tools.unpatchify(audio_state)
 
-        # Evict transformer (~22GB) before VAE decode to avoid OOM
+        # Evict transformer (~22GB) before VAE decode to avoid OOM.
+        # evict_transformer already did gc.collect+synchronize+empty_cache — no
+        # need to gc again here (the local `transformer` was the only extra ref).
         del transformer
         worker.evict_transformer()
-        gc.collect()
 
         _emit_phase(on_progress, 0.90, "decoding")
         decoded_video = _decode_video_fp32(video_state.latent, worker.ledger.video_decoder(), _get_decode_tiling(num_frames), generator)
@@ -1546,6 +1718,8 @@ class SplitModelManager:
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
         enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
@@ -1553,14 +1727,24 @@ class SplitModelManager:
             loop = asyncio.get_running_loop()
             if model == "ltx-2-3-hq":
                 return await loop.run_in_executor(
-                    None, self._run_t2v_hq, worker, prompt, width, height,
-                    num_frames, fps, seed, generate_audio, on_progress, user_lora,
-                    enhance_prompt,
+                    None,
+                    partial(
+                        self._run_t2v_hq, worker, prompt, width, height,
+                        num_frames, fps, seed, generate_audio, on_progress, user_lora,
+                        enhance_prompt,
+                        on_prompt_enhanced=on_prompt_enhanced,
+                        on_cancel_check=on_cancel_check,
+                    ),
                 )
             return await loop.run_in_executor(
-                None, self._run_t2v, worker, prompt, model, width, height,
-                num_frames, fps, seed, generate_audio, on_progress, user_lora,
-                enhance_prompt,
+                None,
+                partial(
+                    self._run_t2v, worker, prompt, model, width, height,
+                    num_frames, fps, seed, generate_audio, on_progress, user_lora,
+                    enhance_prompt,
+                    on_prompt_enhanced=on_prompt_enhanced,
+                    on_cancel_check=on_cancel_check,
+                ),
             )
         finally:
             worker.lock.release()
@@ -1570,15 +1754,22 @@ class SplitModelManager:
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
         enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._run_i2v, worker, prompt, keyframes, model, width, height,
-                num_frames, fps, seed, generate_audio, on_progress, user_lora,
-                enhance_prompt,
+                None,
+                partial(
+                    self._run_i2v, worker, prompt, keyframes, model, width, height,
+                    num_frames, fps, seed, generate_audio, on_progress, user_lora,
+                    enhance_prompt,
+                    on_prompt_enhanced=on_prompt_enhanced,
+                    on_cancel_check=on_cancel_check,
+                ),
             )
         finally:
             worker.lock.release()
@@ -1588,15 +1779,22 @@ class SplitModelManager:
         model: str, width: int, height: int, num_frames: int, fps: float, seed: int,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
         enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._run_a2v, worker, prompt, audio_path, image_path,
-                width, height, num_frames, fps, seed, on_progress, user_lora,
-                enhance_prompt, model,
+                None,
+                partial(
+                    self._run_a2v, worker, prompt, audio_path, image_path,
+                    width, height, num_frames, fps, seed, on_progress, user_lora,
+                    enhance_prompt, model,
+                    on_prompt_enhanced=on_prompt_enhanced,
+                    on_cancel_check=on_cancel_check,
+                ),
             )
         finally:
             worker.lock.release()
@@ -1605,14 +1803,21 @@ class SplitModelManager:
         self, video_path: str, start_time: float, duration: float,
         mode: str, prompt: str, seed: int,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
         worker = await self._acquire_worker()
         user_lora = (lora_path, lora_strength) if lora_path else None
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._run_retake, worker, video_path, start_time, duration,
-                mode, prompt, seed, on_progress, user_lora,
+                None,
+                partial(
+                    self._run_retake, worker, video_path, start_time, duration,
+                    mode, prompt, seed, on_progress, user_lora,
+                    on_prompt_enhanced=on_prompt_enhanced,
+                    on_cancel_check=on_cancel_check,
+                ),
             )
         finally:
             worker.lock.release()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import sqlite3
 import time
@@ -14,6 +15,8 @@ from PIL import Image
 import config
 
 logger = logging.getLogger(__name__)
+
+CURRENT_SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS generations (
@@ -38,6 +41,73 @@ CREATE INDEX IF NOT EXISTS idx_api_key_hash ON generations(api_key_hash, created
 
 def _hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def _path_to_uri(path: str | None) -> str | None:
+    """Rewrite an on-disk uploads path to its canonical ``storage://<uuid>`` URI.
+
+    Leaves paths outside ``config.UPLOAD_DIR`` verbatim (LoRA files under
+    ``/mnt/nvme-1/servers/taco-backend/flux_loras``, ACE's ``/tmp/ace-*.wav``
+    staging files, etc.) so the history row still records where the input
+    came from even when it was never uploaded via the storage API.
+    """
+    if path is None:
+        return None
+    try:
+        p = Path(path)
+    except (TypeError, ValueError):
+        return path
+    if p.parent == config.UPLOAD_DIR:
+        return f"storage://{p.name}"
+    return path
+
+
+def _sanitize_params_for_history(job_type: str, params: dict) -> dict:
+    """Return a copy of ``params`` safe to persist as ``params_json``.
+
+    - Drops ``_``-prefixed internal markers the dispatcher attaches.
+    - Rewrites known on-disk path fields (``image_path``, ``audio_path``,
+      ``video_path``, ``source_audio_path``, ``reference_audio_path``) to
+      their ``*_uri`` counterparts via :func:`_path_to_uri`.
+    - Rewrites ``image_paths`` list to ``image_uris``.
+    - Rewrites each dict in a ``keyframes`` list, swapping ``image_path`` for
+      ``image_uri``.
+    - Leaves ``lora_path`` alone — LoRAs live outside ``UPLOAD_DIR``; the
+      raw-request blob carries the stable ``{id, strength}`` shape.
+    """
+    out: dict = {}
+    for key, value in params.items():
+        if key.startswith("_"):
+            continue
+        out[key] = value
+
+    for scalar_key in (
+        "image_path",
+        "audio_path",
+        "video_path",
+        "source_audio_path",
+        "reference_audio_path",
+    ):
+        if scalar_key in out:
+            uri_key = scalar_key.replace("_path", "_uri")
+            out[uri_key] = _path_to_uri(out.pop(scalar_key))
+
+    if "image_paths" in out:
+        raw_list = out.pop("image_paths") or []
+        out["image_uris"] = [_path_to_uri(p) for p in raw_list]
+
+    if "keyframes" in out and isinstance(out["keyframes"], list):
+        rewritten = []
+        for kf in out["keyframes"]:
+            if isinstance(kf, dict) and "image_path" in kf:
+                kf_copy = dict(kf)
+                kf_copy["image_uri"] = _path_to_uri(kf_copy.pop("image_path"))
+                rewritten.append(kf_copy)
+            else:
+                rewritten.append(kf)
+        out["keyframes"] = rewritten
+
+    return out
 
 
 def _is_mp4_bytes(data: bytes) -> bool:
@@ -132,7 +202,38 @@ class HistoryStore:
         # .db-shm sidecar files (see .gitignore).
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.commit()
+        self._migrate()
         logger.info("History DB opened at %s", self._db_path)
+
+    def _migrate(self) -> None:
+        """Run idempotent schema migrations keyed off ``PRAGMA user_version``.
+
+        v2 adds four nullable columns to ``generations``: ``params_json``,
+        ``gen_config_json``, ``seed``, ``enhanced_prompt``. Old rows remain
+        valid (all NULL for the new fields) — no backfill.
+        """
+        current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if current >= CURRENT_SCHEMA_VERSION:
+            return
+        try:
+            if current < 2:
+                for stmt in (
+                    "ALTER TABLE generations ADD COLUMN params_json TEXT",
+                    "ALTER TABLE generations ADD COLUMN gen_config_json TEXT",
+                    "ALTER TABLE generations ADD COLUMN seed INTEGER",
+                    "ALTER TABLE generations ADD COLUMN enhanced_prompt TEXT",
+                ):
+                    self._conn.execute(stmt)
+            self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            self._conn.commit()
+            logger.info(
+                "History DB migrated from user_version=%d to %d",
+                current,
+                CURRENT_SCHEMA_VERSION,
+            )
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def save(
         self,
@@ -150,6 +251,12 @@ class HistoryStore:
         created_at: float,
         completed_at: float | None,
         error: str | None = None,
+        *,
+        seed: int | None = None,
+        enhanced_prompt: str | None = None,
+        raw_request: dict | None = None,
+        gen_config_snapshot: dict | None = None,
+        dispatch_params: dict | None = None,
     ) -> None:
         thumb_uri = None
         if result_bytes and result_uri:
@@ -158,11 +265,26 @@ class HistoryStore:
             if thumb_id:
                 thumb_uri = f"thumb://{thumb_id}"
 
+        # Music dispatches go through the sanitizer because the request body
+        # was already lowered to on-disk paths before we got here. Video/image
+        # jobs ship the untouched raw request (already storage:// URIs from
+        # Pydantic model_dump). dispatch_params wins when both are provided.
+        if dispatch_params is not None:
+            params_payload: dict | None = _sanitize_params_for_history(job_type, dispatch_params)
+        else:
+            params_payload = raw_request
+
+        params_json = json.dumps(params_payload) if params_payload is not None else None
+        gen_config_json = (
+            json.dumps(gen_config_snapshot) if gen_config_snapshot is not None else None
+        )
+
         self._conn.execute(
             """INSERT OR REPLACE INTO generations
                (id, api_key_hash, job_type, prompt, model, width, height, turbo,
-                status, result_uri, thumbnail_uri, created_at, completed_at, error)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, result_uri, thumbnail_uri, created_at, completed_at, error,
+                params_json, gen_config_json, seed, enhanced_prompt)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job_id,
                 _hash_key(api_key),
@@ -178,6 +300,10 @@ class HistoryStore:
                 created_at,
                 completed_at,
                 error,
+                params_json,
+                gen_config_json,
+                seed,
+                enhanced_prompt,
             ),
         )
         self._conn.commit()

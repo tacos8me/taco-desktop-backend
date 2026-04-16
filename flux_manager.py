@@ -323,6 +323,7 @@ class FluxManager:
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
         phase_sink: Callable | None = None,
+        turbo_steps: int = 8, turbo_guidance: float = 2.5,
     ) -> bytes:
         """Generate an image (txt2img) and return WEBP bytes."""
         self.ensure_model(model, user_lora_path=lora_path)
@@ -341,8 +342,8 @@ class FluxManager:
             kwargs["guidance_scale"] = guidance_scale
         if turbo and model == "flux2-dev":
             kwargs["sigmas"] = config.FLUX_TURBO_SIGMAS
-            kwargs["num_inference_steps"] = 8
-            kwargs["guidance_scale"] = 2.5
+            kwargs["num_inference_steps"] = turbo_steps
+            kwargs["guidance_scale"] = turbo_guidance
 
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
@@ -372,6 +373,7 @@ class FluxManager:
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
         phase_sink: Callable | None = None,
+        turbo_steps: int = 8, turbo_guidance: float = 2.5,
     ) -> bytes:
         """Edit an image using single reference."""
         self.ensure_model(model, user_lora_path=lora_path)
@@ -390,8 +392,8 @@ class FluxManager:
             kwargs["guidance_scale"] = guidance_scale
         if turbo and model == "flux2-dev":
             kwargs["sigmas"] = config.FLUX_TURBO_SIGMAS
-            kwargs["num_inference_steps"] = 8
-            kwargs["guidance_scale"] = 2.5
+            kwargs["num_inference_steps"] = turbo_steps
+            kwargs["guidance_scale"] = turbo_guidance
 
         if callback_on_step_end is not None:
             kwargs["callback_on_step_end"] = callback_on_step_end
