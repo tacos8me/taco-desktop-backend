@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy as _copy
 import json as _json_mod
+import subprocess
 import time
 import torch
 import logging

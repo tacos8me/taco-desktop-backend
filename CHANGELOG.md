@@ -2,6 +2,20 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.4.1 — 2026-04-16
+
+### Hot-fix
+
+- **`import subprocess` missing from `server.py` top-level** — `_enter_turbo_mode` (line 1436) invokes `subprocess.run(["systemctl", "--user", "start", "ltx-sidecar"], ...)` inside a lambda, and `_warmup_page_cache` (line 529) invokes `subprocess.run` in an `asyncio.to_thread(...)` call. Both resolve `subprocess` via module scope, where it wasn't imported. Any `POST /v1/system/turbo {enable:true}` hit `NameError: name 'subprocess' is not defined` and left the system in a half-transitioned state (ACE stopped by `_ace_systemctl("stop")` before the lambda executed; LTX sidecar never started; no turbo dual-worker). Latent bug present since turbo mode landed in v1.2 — the page-cache warmup was also silently failing (`asyncio.create_task` swallowed the unhandled exception). The two functions that imported `subprocess` locally (`_ace_systemctl` at ~1078, `_query_gpu_info` at ~1324) worked fine, which masked the broader issue.
+
+Symptom in production today: `POST /v1/system/turbo {"enable":true}` → 500 `turbo_toggle_failed`; queued gens stuck because main worker held `_inference_lock` while `_enter_turbo_mode` crashed mid-handshake.
+
+Fix: one-line `import subprocess` at module top, covering all four call sites. No behavior change for previously-working paths.
+
+**File**: `server.py`.
+
+---
+
 ## v1.4 — 2026-04-16
 
 Five semi-independent changesets landed together.
