@@ -108,7 +108,7 @@ batch_store = BatchStore()
 _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 
 # Turbo mode — dual-GPU LTX inference (2 concurrent video jobs)
-_VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE}
+_VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE, JobType.VIDEO_OUTPAINT}
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None         # local sidecar worker (cuda:1)
 
@@ -373,6 +373,15 @@ async def _dispatch_job(job: Job) -> bytes:
             job.gen_config_snapshot = dict(split_model_manager._gen_config)
             return await manager.retake(
                 **p, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
+                on_cancel_check=_is_cancelled,
+            )
+        case JobType.VIDEO_OUTPAINT:
+            await _ensure_ltx_resident()
+            job.gen_config_snapshot = dict(split_model_manager._gen_config)
+            # Drop history-only fields that aren't generate_outpaint kwargs.
+            op_params = {k: v for k, v in p.items() if k not in ("width", "height", "model")}
+            return await manager.generate_outpaint(
+                **op_params, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
                 on_cancel_check=_is_cancelled,
             )
         case JobType.TEXT_TO_IMAGE:
@@ -686,6 +695,38 @@ class RetakeRequest(BaseModel):
     mode: RetakeMode
     prompt: str | None = Field(default=None, max_length=10000)
     lora: LoRAInput | None = None
+
+
+OutpaintPosition = Literal[
+    "center", "left", "right", "top", "bottom",
+    "top_left", "top_right", "bottom_left", "bottom_right",
+]
+
+
+class VideoOutpaintRequest(BaseModel):
+    """IC-LoRA video outpaint: expand source video canvas, LoRA fills black padding.
+
+    Uses `oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint` by default (registered as
+    LoRA id `ic-lora-outpaint`). Source video is scaled proportionally to
+    fit within `target_resolution`, padded with pure black (RGB 0,0,0) at
+    `position`; the LoRA was trained to treat black pixels as a fill
+    sentinel. Output is silent (no audio).
+
+    Always runs the distilled 2-stage pipeline (stage 1 at half target res
+    with IC-LoRA conditioning, stage 2 upsamples + refines). Set
+    `skip_stage_2=true` for a faster half-resolution preview.
+    """
+    video_uri: str
+    prompt: str = Field(max_length=10000)
+    target_resolution: Resolution
+    position: OutpaintPosition = "center"
+    duration: float = Field(gt=0, le=30)
+    fps: float = Field(gt=0, le=60)
+    seed: int = Field(default=0, ge=0)
+    enhance_prompt: bool = False
+    lora: LoRAInput | None = None
+    conditioning_strength: float = Field(default=1.0, ge=0.0, le=1.0)
+    skip_stage_2: bool = False
 
 
 class TextToImageRequest(BaseModel):
@@ -1520,13 +1561,25 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
                 new_kf["image_b64"] = _read_b64(new_kf.pop("image_path"))
             remote_keyframes.append(new_kf)
 
+    # v1.7.0: for outpaint, the Modal container has the outpaint LoRA baked
+    # into its volume at a known path. Rewrite taco-backend's lora_path to
+    # the Modal path so the fused-transformer cache key matches across
+    # requests (avoids per-request LoRA file re-staging).
+    remote_lora_path = p.get("lora_path")
+    if job.type == JobType.VIDEO_OUTPAINT and remote_lora_path:
+        local_loras_dir = str(config.LORAS_DIR).rstrip("/") + "/"
+        if remote_lora_path.startswith(local_loras_dir):
+            remote_lora_path = remote_lora_path.replace(
+                local_loras_dir, "/mnt/nvme-1/huggingface/loras/"
+            )
+
     return await ltx_remote_sidecar.generate(
         job_type=job.type,
         prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
         width=p["width"], height=p["height"],
         num_frames=p["num_frames"], fps=p.get("fps", 24),
         seed=p["seed"], generate_audio=p.get("generate_audio", False),
-        lora_path=p.get("lora_path"), lora_strength=p.get("lora_strength", 1.0),
+        lora_path=remote_lora_path, lora_strength=p.get("lora_strength", 1.0),
         enhance_prompt=p.get("enhance_prompt", False),
         keyframes=remote_keyframes,
         # v1.6.1: drop local paths, send base64 bytes instead
@@ -1536,6 +1589,10 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
         start_time=p.get("start_time"),
         duration=p.get("duration"),
         mode=p.get("mode"),
+        # v1.7.0 outpaint extras — None for non-outpaint job types
+        position=p.get("position"),
+        conditioning_strength=p.get("conditioning_strength"),
+        skip_stage_2=p.get("skip_stage_2"),
     )
 
 
@@ -1632,6 +1689,10 @@ async def _dispatch_job_turbo(job: Job) -> bytes:
             start_time=p.get("start_time"),
             duration=p.get("duration"),
             mode=p.get("mode"),
+            # v1.7.0 outpaint extras — None for non-outpaint job types
+            position=p.get("position"),
+            conditioning_strength=p.get("conditioning_strength"),
+            skip_stage_2=p.get("skip_stage_2"),
         )
     except LtxSidecarError as exc:
         # Transport-level failures (status 502/503/504) mean the sidecar is
@@ -2616,6 +2677,38 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
                   duration=body.duration, mode=body.mode, prompt=prompt, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength)
     return _submit_job(JobType.RETAKE, params, request, raw=body.model_dump(mode="json"))
+
+
+DEFAULT_OUTPAINT_LORA_ID = "ic-lora-outpaint"
+
+
+@app.post("/v2/video-outpaint")
+async def v2_video_outpaint(body: VideoOutpaintRequest, request: Request) -> JSONResponse:
+    # Default to the registered outpaint IC-LoRA when the client omits one.
+    if body.lora is None:
+        body = body.model_copy(update={"lora": LoRAInput(id=DEFAULT_OUTPAINT_LORA_ID, strength=1.0)})
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
+    if lora_path is None:
+        return _error(500, "outpaint LoRA resolve returned None — registry misconfigured")
+    video_path = str(uploads.resolve(body.video_uri))
+    width, height = _resolution_to_dims(body.target_resolution)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    seed = body.seed if body.seed else random.randint(0, 2**32 - 1)
+    params = dict(
+        video_path=video_path, prompt=body.prompt,
+        target_width=width, target_height=height, position=body.position,
+        num_frames=num_frames, fps=body.fps, seed=seed,
+        conditioning_strength=body.conditioning_strength,
+        skip_stage_2=body.skip_stage_2,
+        lora_path=lora_path, lora_strength=lora_strength,
+        enhance_prompt=body.enhance_prompt,
+        # History-only fields (stripped before generate_outpaint call):
+        width=width, height=height, model="ic-lora-outpaint",
+    )
+    return _submit_job(JobType.VIDEO_OUTPAINT, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/text-to-image")

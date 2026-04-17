@@ -36,6 +36,10 @@ from ltx_core.components.guiders import (
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning import (
+    ConditioningItemAttentionStrengthWrapper,
+    VideoConditionByReferenceLatent,
+)
 from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -95,6 +99,7 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.media_io import (
     decode_audio_from_file,
+    decode_video_by_frame,
     decode_video_from_file,
     encode_video,
     get_videostream_metadata,
@@ -165,6 +170,112 @@ _DEV_PARAMS = detect_params(config.DEV_CHECKPOINT)
 
 # skip_step=0: full STG on every step. skip_step=1 saved 33% NFE but created
 # temporal oscillation in guidance signal, contributing to ghost trails during fast motion.
+
+
+# ---------------------------------------------------------------------------
+# IC-LoRA outpaint helpers (v1.7.0)
+# ---------------------------------------------------------------------------
+
+
+def _read_lora_reference_downscale_factor(lora_path: str) -> int:
+    """Read an IC-LoRA's `reference_downscale_factor` from safetensors metadata.
+
+    Upstream IC-LoRAs train with downscaled reference videos; inference must
+    size the reference to match. Default 1 when missing (no downscale).
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(lora_path, framework="pt") as f:
+            md = f.metadata() or {}
+        raw = md.get("reference_downscale_factor")
+        if raw is None:
+            return 1
+        scale = int(raw)
+        return scale if scale >= 1 else 1
+    except Exception:
+        logger.debug("Failed to read reference_downscale_factor from %s", lora_path, exc_info=True)
+        return 1
+
+
+def _build_outpaint_reference_latent(
+    *,
+    video_path: str,
+    num_frames: int,
+    target_h: int,
+    target_w: int,
+    position: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    video_encoder,
+) -> torch.Tensor:
+    """Letterbox the source video into (target_h, target_w) and VAE-encode it.
+
+    The returned latent feeds ``VideoConditionByReferenceLatent`` for IC-LoRA
+    stage 1 conditioning. Source is scaled proportionally to fit, remainder
+    is padded with -1 (pure black in the [-1, 1] normalized pixel space).
+
+    If the source has fewer than ``num_frames`` frames, the temporal tail is
+    padded with black frames so the reference latent's token count matches
+    what stage 1 expects.
+    """
+    import torch.nn.functional as F  # noqa: N812
+
+    meta = get_videostream_metadata(video_path)
+    src_h, src_w = meta.height, meta.width
+    if src_h <= 0 or src_w <= 0:
+        raise ValueError(f"outpaint source has invalid dims {src_w}x{src_h}: {video_path}")
+
+    scale = min(target_h / src_h, target_w / src_w)
+    new_h = max(1, int(round(src_h * scale)))
+    new_w = max(1, int(round(src_w * scale)))
+
+    frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=device)
+    source = video_preprocess(frame_gen, new_h, new_w, dtype, device)
+    if source is None:
+        raise ValueError(f"outpaint source has no decodable frames: {video_path}")
+
+    # Pad temporal dim with black frames if source was shorter than target
+    F_got = source.shape[2]
+    if F_got < num_frames:
+        pad_frames = num_frames - F_got
+        time_pad = torch.full(
+            (source.shape[0], source.shape[1], pad_frames, new_h, new_w),
+            fill_value=-1.0, dtype=source.dtype, device=source.device,
+        )
+        source = torch.cat([source, time_pad], dim=2)
+        logger.info(
+            "outpaint: source had %d frames, padded %d black frames to reach %d",
+            F_got, pad_frames, num_frames,
+        )
+
+    # Compute spatial padding based on position
+    pad_h_total = target_h - new_h
+    pad_w_total = target_w - new_w
+    if position in ("left", "top_left", "bottom_left"):
+        pad_left = 0
+    elif position in ("right", "top_right", "bottom_right"):
+        pad_left = pad_w_total
+    else:
+        pad_left = pad_w_total // 2
+    pad_right = pad_w_total - pad_left
+
+    if position in ("top", "top_left", "top_right"):
+        pad_top = 0
+    elif position in ("bottom", "bottom_left", "bottom_right"):
+        pad_top = pad_h_total
+    else:
+        pad_top = pad_h_total // 2
+    pad_bottom = pad_h_total - pad_top
+
+    # F.pad on [B, C, F, H, W] with last-dims-first ordering.
+    # -1.0 = RGB black in the normalized pixel space the VAE expects.
+    letterboxed = F.pad(
+        source,
+        (pad_left, pad_right, pad_top, pad_bottom),
+        mode="constant", value=-1.0,
+    )
+    del source
+    return video_encoder(letterboxed)
 
 # ---------------------------------------------------------------------------
 # CachingModelFactory — cached models with lazy-load from SingleGPUModelBuilder
@@ -1711,6 +1822,221 @@ class SplitModelManager:
         with _timed("video_decode+encode job=retake"):
             return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
 
+    @_with_oom_recovery
+    @torch.inference_mode()
+    def _run_outpaint(
+        self, worker: DenoiserWorker, video_path: str, prompt: str,
+        target_width: int, target_height: int, position: str,
+        num_frames: int, fps: float, seed: int,
+        conditioning_strength: float, skip_stage_2: bool,
+        on_progress=None, user_lora=None, enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
+    ) -> bytes:
+        """IC-LoRA video outpaint. Mirrors `_run_t2v` fast branch with an IC-LoRA
+        `VideoConditionByReferenceLatent` appended to stage 1 conditionings.
+
+        Stage 1: distilled transformer + outpaint LoRA fused, half target res,
+        letterboxed-source reference latent as IC-LoRA conditioning.
+        Stage 2 (if not skipped): upsample 2x, refine at full target res; LoRA
+        stays fused (upstream ICLoraPipeline drops LoRA for stage 2, but our
+        ensure_transformer cache key makes a mid-request reload cost ~30 s;
+        see plan v1.7.0 "out of scope" for the accepted deviation).
+
+        Output is silent (no audio). Audio is not passed through from source —
+        that can be added as v1.7.x follow-up via ffmpeg re-mux.
+        """
+        if user_lora is None:
+            raise ValueError("outpaint requires an IC-LoRA (lora must be resolved)")
+        device = worker.device
+        dtype = torch.bfloat16
+
+        ref_scale = _read_lora_reference_downscale_factor(user_lora[0])
+        logger.info(
+            "outpaint: target=%dx%d, position=%s, ref_downscale=%d, skip_s2=%s",
+            target_width, target_height, position, ref_scale, skip_stage_2,
+        )
+
+        worker.ensure_transformer("distilled", user_lora=user_lora)
+
+        # Text encoding on GPU:0 (shared encoder)
+        self._page_encoder_to_gpu()
+        (ctx_p,) = self._encode_prompts(
+            [prompt], enhance_first_prompt=enhance_prompt, on_enhanced=on_prompt_enhanced,
+        )
+        (ctx_p,) = self._contexts_to_device([ctx_p], device)
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        self._page_encoder_to_cpu()
+
+        generator = torch.Generator(device=device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        stepper = EulerDiffusionStep()
+
+        # Stage 1 — half target res, IC-LoRA conditioning
+        stage_1_shape = VideoPixelShape(
+            batch=1, frames=num_frames,
+            width=target_width // 2, height=target_height // 2, fps=fps,
+        )
+        video_encoder = worker.ledger.video_encoder()
+
+        stage_1_cond = combined_image_conditionings(
+            images=[], height=stage_1_shape.height, width=stage_1_shape.width,
+            video_encoder=video_encoder, dtype=dtype, device=device,
+        )
+
+        # IC-LoRA reference latent: letterbox source into stage-1 canvas at
+        # (stage_1_height // ref_scale, stage_1_width // ref_scale). For
+        # reference_downscale_factor=1 (the default and what the outpaint LoRA
+        # ships with), the reference matches stage-1 resolution exactly.
+        if stage_1_shape.height % ref_scale != 0 or stage_1_shape.width % ref_scale != 0:
+            raise ValueError(
+                f"stage 1 dims ({stage_1_shape.height}x{stage_1_shape.width}) "
+                f"not divisible by reference_downscale_factor={ref_scale}"
+            )
+        ref_h = stage_1_shape.height // ref_scale
+        ref_w = stage_1_shape.width // ref_scale
+        ref_latent = _build_outpaint_reference_latent(
+            video_path=video_path, num_frames=num_frames,
+            target_h=ref_h, target_w=ref_w, position=position,
+            dtype=dtype, device=device, video_encoder=video_encoder,
+        )
+        ic_cond = VideoConditionByReferenceLatent(
+            latent=ref_latent, downscale_factor=ref_scale, strength=user_lora[1],
+        )
+        if conditioning_strength < 1.0:
+            ic_cond = ConditioningItemAttentionStrengthWrapper(
+                ic_cond, attention_mask=conditioning_strength,
+            )
+        stage_1_cond.append(ic_cond)
+
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
+
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_1_shape, fps, noiser, dtype, device, video_conds=stage_1_cond,
+        )
+
+        sigmas = LTX2Scheduler().execute(
+            steps=_gen_config["fast_stage1_steps"],
+            max_shift=_gen_config["scheduler_max_shift"],
+            base_shift=_gen_config["scheduler_base_shift"],
+        ).to(device=device, dtype=torch.float32)
+        s1_steps = len(sigmas) - 1
+
+        denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        if on_progress:
+            denoiser = self._wrap_denoiser(
+                denoiser, on_progress, s1_steps, offset=0.0,
+                scale=(0.95 if skip_stage_2 else 0.7),
+                on_cancel_check=on_cancel_check,
+            )
+        if _gen_config["sampler"] == "cfg_pp":
+            loop_fn = partial(euler_cfg_pp_loop, eta=_gen_config["eta_stage1"], generator=generator)
+        else:
+            loop_fn = euler_denoising_loop
+        video_state, audio_state = loop_fn(
+            sigmas=sigmas, video_state=video_state, audio_state=audio_state,
+            stepper=stepper, transformer=transformer, denoiser=denoiser,
+        )
+
+        # Post-process stage 1
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
+
+        stage_1_latent = video_state.latent[:1]
+        stage_1_audio_latent = audio_state.latent
+        del video_state, audio_state, stage_1_cond, ref_latent, ic_cond, sigmas, v_tools, a_tools
+        cleanup_memory()
+
+        if skip_stage_2:
+            # Decode stage 1 directly at half resolution
+            del transformer
+            worker.evict_transformer()
+            for k in ("spatial_upsampler", "video_encoder"):
+                worker.cache[k] = None
+                worker.ledger._cache[k] = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            _emit_phase(on_progress, 0.90, "decoding")
+            decoded_video = _decode_video_fp32(
+                stage_1_latent, worker.ledger.video_decoder(),
+                _get_decode_tiling(num_frames), generator,
+            )
+            _emit_phase(on_progress, 0.95, "encoding")
+            with _timed("video_decode+encode job=outpaint skip_s2=1"):
+                return _video_to_bytes(decoded_video, fps, None, num_frames, include_audio=False)
+
+        # Stage 2 — upsample 2x + refine at full target res
+        upscaled = upsample_video(
+            latent=stage_1_latent, video_encoder=video_encoder,
+            upsampler=worker.ledger.spatial_upsampler(),
+        )
+        del stage_1_latent
+
+        stage_2_shape = VideoPixelShape(
+            batch=1, frames=num_frames, width=target_width, height=target_height, fps=fps,
+        )
+        stage_2_cond = combined_image_conditionings(
+            images=[], height=stage_2_shape.height, width=stage_2_shape.width,
+            video_encoder=video_encoder, dtype=dtype, device=device,
+        )
+
+        transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
+        distilled_sigmas = torch.tensor(
+            _gen_config["stage2_sigmas"] or list(STAGE_2_DISTILLED_SIGMA_VALUES),
+            device=device, dtype=torch.float32,
+        )
+        s2_steps = len(distilled_sigmas) - 1
+
+        video_state, audio_state, v_tools, a_tools = self._create_av_states(
+            stage_2_shape, fps, noiser, dtype, device,
+            video_conds=stage_2_cond,
+            video_noise_scale=float(distilled_sigmas[0]),
+            audio_noise_scale=float(distilled_sigmas[0]),
+            initial_video=upscaled, initial_audio=stage_1_audio_latent,
+        )
+
+        denoiser_s2 = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
+        if on_progress:
+            denoiser_s2 = self._wrap_denoiser(
+                denoiser_s2, on_progress, s2_steps, offset=0.7, scale=0.25,
+                on_cancel_check=on_cancel_check,
+            )
+        if _gen_config["sampler"] == "cfg_pp":
+            loop_fn_s2 = partial(euler_cfg_pp_loop, eta=_gen_config["eta_default"], generator=generator)
+        else:
+            loop_fn_s2 = euler_denoising_loop
+        video_state, audio_state = loop_fn_s2(
+            sigmas=distilled_sigmas, video_state=video_state, audio_state=audio_state,
+            stepper=stepper, transformer=transformer, denoiser=denoiser_s2,
+        )
+
+        video_state = v_tools.clear_conditioning(video_state)
+        video_state = v_tools.unpatchify(video_state)
+        audio_state = a_tools.clear_conditioning(audio_state)
+        audio_state = a_tools.unpatchify(audio_state)
+
+        video_latent = video_state.latent
+        del video_state, audio_state, stage_2_cond, upscaled, stage_1_audio_latent
+        del transformer, denoiser_s2, distilled_sigmas, video_encoder, v_tools, a_tools
+        worker.evict_transformer()
+        for k in ("spatial_upsampler", "video_encoder"):
+            worker.cache[k] = None
+            worker.ledger._cache[k] = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        _emit_phase(on_progress, 0.90, "decoding")
+        decoded_video = _decode_video_fp32(
+            video_latent, worker.ledger.video_decoder(),
+            _get_decode_tiling(num_frames), generator,
+        )
+        _emit_phase(on_progress, 0.95, "encoding")
+        with _timed("video_decode+encode job=outpaint"):
+            return _video_to_bytes(decoded_video, fps, None, num_frames, include_audio=False)
+
     # --- Async API (matches PipelineManager interface) ---
 
     async def generate_text_to_video(
@@ -1815,6 +2141,40 @@ class SplitModelManager:
                 partial(
                     self._run_retake, worker, video_path, start_time, duration,
                     mode, prompt, seed, on_progress, user_lora,
+                    on_prompt_enhanced=on_prompt_enhanced,
+                    on_cancel_check=on_cancel_check,
+                ),
+            )
+        finally:
+            worker.lock.release()
+
+    async def generate_outpaint(
+        self, video_path: str, prompt: str,
+        target_width: int, target_height: int, position: str,
+        num_frames: int, fps: float, seed: int,
+        conditioning_strength: float = 1.0, skip_stage_2: bool = False,
+        on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
+        enhance_prompt: bool = False,
+        on_prompt_enhanced: Callable[[str], None] | None = None,
+        on_cancel_check: Callable[[], bool] | None = None,
+    ) -> bytes:
+        """Async wrapper around :meth:`_run_outpaint`.
+
+        Caller (server.py handler) must resolve the LoRA first — outpaint requires
+        an IC-LoRA and defaults to ``ic-lora-outpaint`` when the client omits it.
+        """
+        worker = await self._acquire_worker()
+        user_lora = (lora_path, lora_strength) if lora_path else None
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                partial(
+                    self._run_outpaint, worker, video_path, prompt,
+                    target_width, target_height, position,
+                    num_frames, fps, seed,
+                    conditioning_strength, skip_stage_2,
+                    on_progress, user_lora, enhance_prompt,
                     on_prompt_enhanced=on_prompt_enhanced,
                     on_cancel_check=on_cancel_check,
                 ),

@@ -12,6 +12,7 @@ uv.lock
 .env
 .api_keys
 .gstack/
+.claude/
 resume.md
 .gen_config.json
 .flux_config.json

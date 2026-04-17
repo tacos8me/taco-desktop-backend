@@ -2,21 +2,22 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.3 (2026-04-13)
+**Version**: v1.7.0 (2026-04-17)
 
 ## Features
 
 - **Video generation** -- LTX-2.3 (22B transformer, v1.1 distilled models) with text-to-video, image-to-video, audio-to-video, and temporal retake
+- **Video outpaint** *(v1.7.0)* -- IC-LoRA expands a source video's canvas to a larger target resolution; LoRA fills the black padding with temporally-consistent content. 9 placement positions, optional stage-2 skip for fast previews
 - **CFG++ sampler** -- ported from ComfyUI's `euler_ancestral_cfg_pp`, default ON, togglable via `/v1/system/sampler` and dashboard
 - **Image generation** -- Flux 2 Dev and Klein KV for text-to-image, image-to-image, and multi-reference editing
 - **Image editing** -- JoyAI instruction-based single-image editing via sidecar on cuda:1
 - **ERNIE-Image** -- baidu/ERNIE-Image 8B DiT text-to-image via sidecar on cuda:1, ~11 s at turbo steps
 - **Music generation** -- ACE Step xl-base+LM for text-to-music, covers, repainting, and stem extraction
 - **Dual-GPU architecture** -- 2-tenant auto-swap on cuda:0 (LTX and Flux), ACE + JoyAI/ERNIE swap on cuda:1
-- **DUAL_GPU_LTX mode** -- boot-time flag for 2 concurrent video workers (LTX sidecar on cuda:1), disables Flux/ACE/JoyAI
+- **Turbo mode + remote pool** -- runtime toggle claims both GPUs for LTX (2 concurrent local workers); optional Modal-backed pool *(v1.6)* adds up to 4 remote workers for **6 concurrent video workers** total, tunable live from the dashboard
 - **Batch scheduler** -- submit up to 50 generation jobs in a single request, auto-sorted to minimize GPU swaps, per-item result download
-- **Turbo mode** -- runtime toggle, claims both GPUs for LTX, 2 concurrent denoiser workers, 2x video throughput
-- **Dashboard** -- real-time GPU telemetry, sampler toggle, advanced generation controls (14 tunable params), and management at `/dashboard`
+- **Generation history + reproducibility** *(v1.4)* -- every completed v2 job persists to SQLite with raw request body, gen-config snapshot, seed, and enhanced prompt; thumbnails auto-generated
+- **Dashboard** -- real-time GPU telemetry, sampler toggle, advanced generation controls (14 tunable params), remote-pool slider, management at `/dashboard`
 
 ## Quick start
 
@@ -58,7 +59,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 
 ## Endpoints overview
 
-63 endpoints total. Key routes:
+71 endpoints total. Key routes:
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -68,6 +69,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | POST | `/v2/image-to-video` | Async video from image(s) / keyframes |
 | POST | `/v2/audio-to-video` | Async video synced to audio |
 | POST | `/v2/retake` | Async re-render video segment |
+| POST | `/v2/video-outpaint` *(v1.7.0)* | Async canvas expand via IC-LoRA |
 | POST | `/v2/text-to-image` | Async image from text |
 | POST | `/v2/image-to-image` | Async single-ref image edit |
 | POST | `/v2/image-edit` | Async multi-ref edit (Flux) or instruction edit (JoyAI) |
@@ -76,23 +78,28 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | GET | `/v2/jobs/{id}/stream` | SSE live progress (preferred over polling) |
 | GET | `/v2/jobs/{id}/result` | Download result (MP4/WEBP/audio) |
 | POST | `/v1/system/turbo` | Toggle dual-GPU turbo mode |
+| GET/POST | `/v1/system/pool` | Get state + scale remote Modal worker pool *(v1.6)* |
 | GET/POST | `/v1/system/sampler` | Get/toggle CFG++ vs Euler sampler |
 | GET/POST | `/v1/system/config` | Get/update all generation parameters |
 | POST | `/v1/system/pause` | Evict all models, free VRAM |
 | GET | `/v2/batch/{id}/result/{index}` | Download individual batch item result |
 | GET | `/v1/chat/completions` | Chat/vision proxy (OpenAI-compatible) |
 
-All endpoints except `/health` and `/v1/approved-images/events` require `Authorization: Bearer <api-key>`. Every generation endpoint has both sync (`/v1/...`) and async (`/v2/...`) variants. See [API Reference](docs/API.md) for the full spec.
+All endpoints except `/health` require `Authorization: Bearer <api-key>`. Every generation endpoint has both sync (`/v1/...`) and async (`/v2/...`) variants, except `/v2/video-outpaint` which is async-only. See [API Reference](docs/API.md) for the full spec.
 
 ## Documentation
 
 | Document | Contents |
 |----------|----------|
-| [API Reference](docs/API.md) | Full 63-endpoint spec with request/response schemas |
+| [API Reference](docs/API.md) | Full 71-endpoint spec with request/response schemas, error taxonomy, common types |
 | [Quick Start Guide](docs/QUICKSTART.md) | 5-minute integration guide for frontend devs |
-| [GPU Architecture](docs/gpu-architecture.md) | Dual-GPU layout, swap mechanics, turbo mode, latency tables |
-| [Models & Latency](docs/models.md) | All model specs, step counts, VRAM, speed benchmarks |
+| [Outpaint Frontend Guide](docs/outpaint-frontend-guide.md) | `/v2/video-outpaint` integration (v1.7.0) |
+| [Retake Frontend Guide](docs/retake-frontend-guide.md) | `/v2/retake` integration for noodle-v |
+| [GPU Architecture](docs/gpu-architecture.md) | Dual-GPU layout, swap mechanics, turbo mode, remote pool, latency tables |
+| [Models & Latency](docs/models.md) | All model specs (incl. LoRA registry), step counts, VRAM, speed benchmarks |
 | [Configuration](docs/configuration.md) | Environment variables, .env, systemd units |
+| [CLAUDE.md](CLAUDE.md) | Codebase onboarding guide for AI assistants |
+| [CHANGELOG](CHANGELOG.md) | Per-version deltas back to v1.1 |
 
 ## Tech stack
 

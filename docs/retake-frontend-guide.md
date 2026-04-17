@@ -1,5 +1,7 @@
 # Retake Tab — Frontend Integration Guide
 
+**Applies to:** taco-backend v1.7.0 (2026-04-17) and later. See [docs/API.md](./API.md) for the full canonical reference. Related: [outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
+
 ## What it does
 
 Regenerate a section of an existing video. Pick a time window, choose what to replace (video, audio, or both), optionally change the prompt. Everything outside the window stays untouched.
@@ -110,3 +112,9 @@ es.onmessage = (e) => {
 - FPS: matches source video
 - The source `video_uri` must be a valid `storage://` URI (from upload or previous gen)
 - Retake is single-stage (no upsampling) — quality matches the source
+
+## See also
+
+- **[outpaint-frontend-guide.md](./outpaint-frontend-guide.md)** — expand a video's canvas rather than replace a window (v1.7.0)
+- **[QUICKSTART.md](./QUICKSTART.md)** — base SSE / upload / auth flow shared across all v2 endpoints
+- **[API.md](./API.md)** — canonical reference for every endpoint, status code, and pydantic shape

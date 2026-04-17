@@ -2,6 +2,43 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.7.0 — 2026-04-17
+
+### IC-LoRA video outpaint — new `/v2/video-outpaint` endpoint
+
+Adds a new async endpoint that expands a source video's canvas to a larger target resolution by letterboxing with pure-black padding, then uses an IC-LoRA to fill the black regions with temporally coherent generated content. Backed by [`oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint`](https://huggingface.co/oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint) (Apache 2.0).
+
+Fully additive — no existing endpoints, request shapes, headers, or response semantics changed.
+
+- **Endpoint**: `POST /v2/video-outpaint`. Returns 202 + submission envelope, same pattern as other v2 endpoints.
+- **Request**: `VideoOutpaintRequest` with `video_uri`, `prompt`, `target_resolution` (reuses existing `Resolution` literal union), `position` (9-value enum: center + 4 edges + 4 corners), `duration`, `fps`, `seed`, `enhance_prompt`, `lora` (optional override; defaults to `id="ic-lora-outpaint"`), `conditioning_strength` ∈ [0, 1], `skip_stage_2` escape hatch.
+- **Pipeline**: 2-stage distilled, patterned on `_run_t2v` fast branch with an IC-LoRA `VideoConditionByReferenceLatent` appended to stage 1 conditionings:
+  - Stage 1 at half target res with the outpaint LoRA fused into the distilled transformer; letterboxed source is VAE-encoded and passed as `VideoConditionByReferenceLatent` (optionally wrapped in `ConditioningItemAttentionStrengthWrapper` when `conditioning_strength < 1.0`).
+  - Stage 2 (if not skipped) upsamples 2x and refines at full target res. LoRA stays fused across both stages (accepted deviation from upstream `ltx_pipelines.ic_lora.ICLoraPipeline`, which drops LoRA for stage 2; reloading mid-request would cost ~30 s of fusion work — see plan notes for the tradeoff).
+- **Letterbox**: scale source proportionally to fit target, pad remainder with -1 in normalized pixel space (= RGB 0,0,0 after VAE decode = the LoRA's training black sentinel). Temporal dim padded with black frames if source is shorter than `num_frames`. `reference_downscale_factor` read from LoRA safetensors metadata (default 1).
+- **Output**: silent MP4 (no audio). Source audio passthrough deferred to v1.7.x.
+- **Turbo + Modal parity**: outpaint works under turbo with local cuda:1 sidecar and via the Modal pool. Modal container has the outpaint LoRA pre-staged on the HF volume at `/mnt/nvme-1/huggingface/loras/ic-lora-outpaint.safetensors` (populated by `modal run modal_app.py::download_weights`); `_dispatch_job_turbo_remote` rewrites the local LoRA path to that volume path before calling remote. Custom IC-LoRAs over remote fall back to single-machine dispatch for v1.7.0.
+- **LoRA registered** under id `ic-lora-outpaint` (strategy `ic_lora_outpaint`). Download + registration script: `scripts/register_outpaint_lora.sh` (idempotent).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `server.py` | New `OutpaintPosition` + `VideoOutpaintRequest`; new `v2_video_outpaint` handler with default-LoRA substitution; `_dispatch_job` branch for `JobType.VIDEO_OUTPAINT`; `_dispatch_job_turbo` + `_dispatch_job_turbo_remote` pass outpaint extras; `_VIDEO_JOB_TYPES` includes new type |
+| `job_queue.py` | `JobType.VIDEO_OUTPAINT` enum value + `_MEDIA_TYPES` mapping (`video/mp4`) |
+| `split_model_manager.py` | New module-level helpers `_read_lora_reference_downscale_factor` + `_build_outpaint_reference_latent`; new `_run_outpaint` method (2-stage, IC-LoRA conditioning); new `generate_outpaint` async wrapper; added `VideoConditionByReferenceLatent` + `ConditioningItemAttentionStrengthWrapper` + `decode_video_by_frame` imports |
+| `ltx_sidecar_client.py` | `generate()` accepts `position`, `conditioning_strength`, `skip_stage_2` kwargs; payload includes them when set |
+| `loras/registry.json` | New entry: `id=ic-lora-outpaint`, name `IC-LoRA Outpaint`, strategy `ic_lora_outpaint` |
+| `loras/ic-lora-outpaint.safetensors` | Symlink to downloaded `ltx-2.3-22b-ic-lora-outpaint.safetensors` (1.3 GB, 960 tensors, metadata `reference_downscale_factor=1`) |
+| `docs/API.md` | New `POST /v2/video-outpaint` section with request shape, position values, known limitations (dark content + silent output) |
+| `scripts/register_outpaint_lora.sh` (new) | Idempotent LoRA fetch + registry insert for cold-start installs |
+
+Companion (ops trees, not in this repo):
+- `ltx-sidecar/sidecar.py`: `GenerateRequest` gains `position` / `conditioning_strength` / `skip_stage_2` + "video-outpaint" in the `job_type` Literal; new match case routes to `manager.generate_outpaint(...)`.
+- `ltx-sidecar-modal/modal_app.py`: same GenerateRequest + match case additions; `download_weights()` extended to fetch the outpaint LoRA into the HF volume at `/mnt/nvme-1/huggingface/loras/` + symlink to the canonical `ic-lora-outpaint.safetensors` ID.
+
+---
+
 ## v1.6.1 — 2026-04-17
 
 ### Hot-fix: remote sidecar can't see taco-backend's `uploads/` filesystem

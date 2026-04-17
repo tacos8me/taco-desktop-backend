@@ -2,6 +2,8 @@
 
 [Back to README](../README.md)
 
+**Current version:** v1.7.0 (2026-04-17). See [CHANGELOG](../CHANGELOG.md) for full release notes.
+
 ## LTX Video Models (cuda:0)
 
 LTX-2.3 powers all video generation -- text-to-video, image-to-video, audio-to-video, and temporal retake. Uses a 22B transformer with shared encoder hub (Gemma 3 12B text encoder + VAE + spatial upsampler). Running v1.1 distilled models (`ltx-2.3-22b-distilled-1.1.safetensors`, `ltx-2.3-22b-distilled-lora-384-1.1.safetensors`, `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`).
@@ -152,4 +154,27 @@ Turbo mode is intended for batch video processing. Entry takes ~20 s, exit ~15 s
 | Production video | `ltx-2-3-pro` (35 steps, ~65 s) |
 | Final render video | `ltx-2-3-hq` (20 steps, ~90 s) |
 | Music generation | ACE `text2music` (~2-10 s) |
+| Video canvas expansion | `/v2/video-outpaint` + `ic-lora-outpaint` (2-stage distilled, ~35-45 s @ 1080p/5 s) |
 | Batch video processing | Enable turbo mode for 2x throughput |
+
+## LTX LoRAs (registry.json)
+
+Registered LoRAs live under `/mnt/nvme-1/servers/taco-backend/loras/` with a JSON index at `loras/registry.json`. Strategy values map a LoRA to the generation path that accepts it.
+
+| ID | Name | Strategy | Size | Description |
+|----|------|----------|------|-------------|
+| `6c69727201bb48dbb8e9ec95ae73720e` | Farm MK1 S2000 | `t2v` | 192 MB | Farm style LoRA, 2000 steps (trigger: `FARM`) |
+| `0ecd0f15fa304cdbb82dd07752f6cf35` | TRASHVHS | `t2v` | 192 MB | TRASH VHS style LoRA (trigger: `TRASHVHS`) |
+| `5e70dcdb1e4047baa4b4b8b055269904` | trashvhs-mk1 | `t2v` | 816 MB | Noodle-t trained (trigger: `PUNKVHS`) |
+| `7db296bdfd1347c29e96fe9329419eeb` | punkdenim | `t2v` | 816 MB | Noodle-t trained (trigger: `PUNKDENIM`) |
+| `audioreactivev1` | Audio Reactive V1 | `a2v` | 643 MB | Audio-reactive motion LoRA for LTX 2.3 |
+| `licon-vbvr-i2v` | Licon VBVR I2V | `i2v` | 528 MB | Licon VBVR image-to-video, 96K steps, rank 32 |
+| `ic-lora-outpaint` | IC-LoRA Outpaint | `ic_lora_outpaint` | 1.3 GB | Video outpaint IC-LoRA by oumoumad. Fills pure-black regions in a letterboxed source video with temporally consistent content. Used by `/v2/video-outpaint`. File: `ltx-2.3-22b-ic-lora-outpaint.safetensors` (960 tensors, metadata `reference_downscale_factor=1`). Registered 2026-04-17 for v1.7.0. |
+
+**Strategy dispatch:**
+- `t2v` → text-to-video / image-to-video (generic style or subject LoRA)
+- `i2v` → image-to-video only
+- `a2v` → audio-to-video only
+- `ic_lora_outpaint` → `/v2/video-outpaint` canvas expansion (treated as a `VideoConditionByReferenceLatent` conditioning, not fused)
+
+Files referenced by `registry.json` must exist in `loras/`. To re-scan or edit the registry, use `scripts/register_outpaint_lora.sh` as an idempotent example or edit `registry.json` directly.

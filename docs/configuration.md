@@ -2,6 +2,8 @@
 
 [Back to README](../README.md)
 
+**Current version:** v1.7.0 (2026-04-17). See [CHANGELOG](../CHANGELOG.md).
+
 ## Environment Variables
 
 All environment variables are read from the `.env` file in the project root (`/mnt/nvme-1/servers/taco-backend/.env`). Changes require a server restart.
@@ -33,7 +35,17 @@ All environment variables are read from the `.env` file in the project root (`/m
 | `ACE_SIDECAR_URL` | `http://127.0.0.1:8001` | URL of the ACE Step music generation sidecar |
 | `JOYAI_SIDECAR_URL` | `http://127.0.0.1:8092` | URL of the JoyAI image-edit sidecar |
 | `ERNIE_SIDECAR_URL` | `http://127.0.0.1:8094` | URL of the ERNIE-Image text-to-image sidecar |
-| `LTX_SIDECAR_URL` | `http://127.0.0.1:8093` | URL of the LTX video sidecar (used in DUAL_GPU_LTX mode) |
+| `LTX_SIDECAR_URL` | `http://127.0.0.1:8093` | URL of the local LTX video sidecar on cuda:1 (used in turbo / `DUAL_GPU_LTX` modes) |
+
+### Remote LTX Sidecar Pool (v1.5 / v1.6)
+
+Optional HTTP sidecar(s) running on remote hardware (canonical deployment: Modal RTX Pro 6000). Adds 1..N extra concurrent video workers on top of the 2 local workers during turbo mode. Pool is turbo-scoped — workers only run while turbo is active.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LTX_REMOTE_SIDECAR_URL` | `""` (disabled) | Base URL of the remote LTX sidecar. When set, turbo mode can spawn extra worker loops dispatching to this URL. Leave empty to keep the pool disabled entirely. |
+| `LTX_REMOTE_SIDECAR_TOKEN` | `""` | Bearer token injected as `Authorization: Bearer <value>` on every request to the remote sidecar. This is the token value itself, not an env-var name |
+| `LTX_REMOTE_SIDECAR_MAX_WORKERS` | `4` | Upper bound on concurrent remote workers (each = one Modal container). Must NOT exceed the remote app's container cap, or jobs queue forever. User scales 0..MAX at runtime via `POST /v1/system/pool/remote-workers` |
 
 ### Queue Limits
 
@@ -42,6 +54,14 @@ All environment variables are read from the `.env` file in the project root (`/m
 | `MAX_MUSIC_PENDING` | `5` | Max concurrent music generation jobs. Returns `429 music_queue_full` when exceeded |
 | `MAX_BATCH_QUEUE_DEPTH` | `5` | Max concurrent batch submissions |
 | `MAX_BATCH_ITEMS` | `50` | Max items per single batch request (1-50) |
+| `AUTO_TURBO_IDLE_MINUTES` | `15` | Minutes of cuda:1 inactivity before an opportunistic turbo-mode elevation may occur |
+
+### Paths
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MP4_TMPDIR` | `/dev/shm` (falls back to `/tmp`) | Temp dir for intermediate MP4 encode buffer. PyAV needs a path, and `/dev/shm` is tmpfs (pure RAM). Saves 50-200 ms/job vs ext-backed `/tmp`. v1.4+ |
+| `TACO_API_KEY` | `""` | Additional API key appended to the set loaded from `.api_keys` (convenient for env-based deployments) |
 
 ### Example `.env`
 
@@ -56,6 +76,10 @@ MAX_BATCH_QUEUE_DEPTH=5
 MAX_BATCH_ITEMS=50
 # DUAL_GPU_LTX=1    # Uncomment for dedicated dual-GPU LTX mode
 # TORCH_COMPILE=1   # Uncomment to enable torch.compile (adds 60-120s warmup)
+# Remote-sidecar pool (v1.5+) — leave URL empty to disable
+# LTX_REMOTE_SIDECAR_URL=https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run
+# LTX_REMOTE_SIDECAR_TOKEN=your-bearer-token-here
+# LTX_REMOTE_SIDECAR_MAX_WORKERS=4
 ```
 
 ## Generation Config (`.gen_config.json`)

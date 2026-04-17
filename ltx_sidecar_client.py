@@ -133,6 +133,10 @@ class LtxSidecarClient:
         audio_b64: str | None = None,
         image_b64: str | None = None,
         video_b64: str | None = None,
+        # v1.7.0: IC-LoRA outpaint extras
+        position: str | None = None,
+        conditioning_strength: float | None = None,
+        skip_stage_2: bool | None = None,
     ) -> bytes:
         """POST /generate — returns raw MP4 bytes.
 
@@ -178,6 +182,13 @@ class LtxSidecarClient:
             payload["image_b64"] = image_b64
         if video_b64 is not None:
             payload["video_b64"] = video_b64
+        # v1.7.0 outpaint extras
+        if position is not None:
+            payload["position"] = position
+        if conditioning_strength is not None:
+            payload["conditioning_strength"] = conditioning_strength
+        if skip_stage_2 is not None:
+            payload["skip_stage_2"] = skip_stage_2
 
         url = f"{self._base_url}/generate"
         t0 = time.perf_counter()

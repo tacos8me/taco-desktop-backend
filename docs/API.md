@@ -1,38 +1,48 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.3 (2026-04-13)
+**Server version:** v1.7.0 (2026-04-17)
 **Base URL:** `http://<host>:8090`
-**Auth:** Bearer token in `Authorization` header. Required on ALL endpoints except `/health` and `/v1/approved-images/events`.
-**Content-Type:** JSON requests unless noted. Responses are JSON unless a binary media type is documented.
+**Source of truth:** `/mnt/nvme-1/servers/taco-backend/server.py`. This document is the client contract — any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes, auth) MUST update this file in the same commit.
 
-> 🚀 **New to the API?** Start with **[docs/QUICKSTART.md](./QUICKSTART.md)** — a 5-minute guide for frontend devs. This doc is the exhaustive spec.
->
-> **See also:** [GPU architecture & swap protocol](./gpu-architecture.md) · [Model specs & latency](./models.md) · [Configuration & env vars](./configuration.md)
-
-> **Maintenance rule:** Any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes) MUST update this file in the same commit. This doc is the contract.
+> **New to the API?** Start with [docs/QUICKSTART.md](./QUICKSTART.md). This doc is the exhaustive spec.
+> **See also:** [GPU architecture](./gpu-architecture.md) · [Model specs](./models.md) · [Configuration](./configuration.md)
 
 ---
 
 ## Table of contents
 
-1. [Conventions](#conventions)
-2. [Common request types](#common-request-types)
-3. [System & health](#system--health)
-4. [v1 synchronous generation](#v1-synchronous-generation) — blocks until media is ready
-5. [v2 async generation + jobs](#v2-async-generation--jobs) — 202 → poll → fetch
-6. [Music generation](#music-generation) — ACE Step on cuda:1 (v1.2)
-7. [Batch scheduler](#batch-scheduler) — multi-job batches (v1.2)
-8. [Uploads](#uploads)
-9. [LoRAs (LTX)](#loras-ltx)
-10. [Flux LoRAs](#flux-loras)
-11. [Chat completions](#chat-completions)
-12. [SSE session tokens](#sse-session-tokens)
-13. [Approved images](#approved-images)
-14. [Character-consistency vision ranking](#character-consistency-vision-ranking)
-15. [Generation history](#generation-history)
-16. [Compositions](#compositions)
-17. [Error codes](#error-codes)
-18. [Endpoint index](#endpoint-index)
+- [Conventions](#conventions) — auth, error shape, storage URIs, CORS, media types, rate limiting
+- [Common types](#common-types) — `LoRAInput`, `KeyframeInput`, `Resolution`, `ModelName`, `ImageModelName`, `RetakeMode`, `OutpaintPosition`, shared constraints
+- [System & health](#system--health)
+  - [`GET /health`](#get-health) · [`GET /dashboard`](#get-dashboard) · [`GET /v1/system/gpu`](#get-v1systemgpu)
+  - [`POST /v1/system/pause`](#post-v1systempause) · [`POST /v1/system/resume`](#post-v1systemresume)
+  - [`POST /v1/flux/unload`](#post-v1fluxunload) · [`POST /v1/flux/reload`](#post-v1fluxreload) · [`POST /v1/ltx/unload`](#post-v1ltxunload) · [`POST /v1/ltx/reload`](#post-v1ltxreload)
+  - [`POST /v1/system/turbo`](#post-v1systemturbo) · [`GET /v1/system/pool`](#get-v1systempool) · [`POST /v1/system/pool/remote-workers`](#post-v1systempoolremote-workers)
+  - [`GET/POST /v1/system/config`](#get-v1systemconfig) · [`POST /v1/system/config/reset`](#post-v1systemconfigreset)
+  - [`GET/POST /v1/system/flux-config`](#get-v1systemflux-config) · [`POST /v1/system/flux-config/reset`](#post-v1systemflux-configreset)
+  - [`GET/POST /v1/system/sampler`](#get-v1systemsampler)
+- [Uploads](#uploads) — [`POST /v1/upload`](#post-v1upload) · [`PUT /uploads/put/{upload_id}`](#put-uploadsputupload_id)
+- [LoRA registries](#lora-registries) — [LTX](#ltx-loras) · [Flux](#flux-loras)
+- [v1 sync generation](#v1-sync-generation)
+  - [`POST /v1/text-to-video`](#post-v1text-to-video) · [`POST /v1/image-to-video`](#post-v1image-to-video) · [`POST /v1/audio-to-video`](#post-v1audio-to-video) · [`POST /v1/retake`](#post-v1retake)
+  - [`POST /v1/text-to-image`](#post-v1text-to-image) · [`POST /v1/image-to-image`](#post-v1image-to-image) · [`POST /v1/image-edit`](#post-v1image-edit)
+  - [`POST /v1/music`](#post-v1music)
+- [v2 async generation](#v2-async-generation)
+  - [Submission envelope](#submission-envelope)
+  - [`POST /v2/text-to-video`](#post-v2text-to-video) · [`POST /v2/image-to-video`](#post-v2image-to-video) · [`POST /v2/audio-to-video`](#post-v2audio-to-video) · [`POST /v2/retake`](#post-v2retake)
+  - [`POST /v2/video-outpaint`](#post-v2video-outpaint) **(v1.7.0)**
+  - [`POST /v2/text-to-image`](#post-v2text-to-image) · [`POST /v2/image-to-image`](#post-v2image-to-image) · [`POST /v2/image-edit`](#post-v2image-edit) · [`POST /v2/music`](#post-v2music)
+- [Jobs lifecycle](#jobs-lifecycle) — [`GET /v2/jobs/{id}`](#get-v2jobsjob_id) · [`GET /v2/jobs/{id}/stream`](#get-v2jobsjob_idstream) · [`GET /v2/jobs/{id}/preview`](#get-v2jobsjob_idpreview) · [`GET /v2/jobs/{id}/result`](#get-v2jobsjob_idresult) · [`DELETE /v2/jobs/{id}`](#delete-v2jobsjob_id)
+- [Batch scheduler](#batch-scheduler) — [`POST /v2/batch`](#post-v2batch) · [`GET /v2/batch/{id}`](#get-v2batchbatch_id) · [`GET /v2/batch/{id}/result/{index}`](#get-v2batchbatch_idresultindex) · [`DELETE /v2/batch/{id}`](#delete-v2batchbatch_id)
+- [History](#history) — [`GET /v2/history`](#get-v2history) · [`GET /v2/history/{id}`](#get-v2historygeneration_id) · [`GET /v2/history/{id}/image`](#get-v2historygeneration_idimage) · [`GET /v2/history/{id}/thumbnail`](#get-v2historygeneration_idthumbnail) · [`DELETE /v2/history/{id}`](#delete-v2historygeneration_id)
+- [Chat & vision](#chat--vision) — [`POST /v1/chat/completions`](#post-v1chatcompletions) · [`POST /v2/char/rank`](#post-v2charrank)
+- [Approved images](#approved-images) — [`POST /v1/approved-images`](#post-v1approved-images) · [`GET /v1/approved-images`](#get-v1approved-images) · [`GET /v1/approved-images/events`](#get-v1approved-imagesevents) · [`GET /v1/approved-images/{id}/file`](#get-v1approved-imagesimage_idfile)
+- [Compositions](#compositions)
+- [SSE session tokens](#sse-session-tokens)
+- [Error taxonomy](#error-taxonomy)
+- [Endpoint index](#endpoint-index)
+- [Curl examples](#curl-examples)
+- [Changelog](#changelog)
 
 ---
 
@@ -44,10 +54,10 @@
 Authorization: Bearer <api-key>
 ```
 
-- Keys live in `.api_keys` on the server (one per line). Empty file ⇒ auth disabled.
+- Keys live in `.api_keys` on the server (one per line). Empty file ⇒ auth disabled process-wide.
 - Constant-time compare (`secrets.compare_digest`) against every configured key.
-- `401 {"error": "Invalid or missing API key"}` on any mismatch.
-- **No-auth endpoints:** `/health`, `/v1/approved-images/events` (SSE uses a disposable token — see §10).
+- Middleware rejects with `401 {"error": "Invalid or missing API key", "message": "...", "detail": "..."}` on any mismatch.
+- **No-auth endpoints:** `GET /health`, `GET /dashboard`, `GET /v1/system/gpu`, `GET /v1/approved-images/events`, `GET /v2/jobs/{id}/stream`. The two streaming endpoints accept either a bearer header (programmatic clients) or `?token=<sse-token>` query param (browsers, since `EventSource` cannot set custom headers).
 
 ### Error shape
 
@@ -57,45 +67,56 @@ Every error response has this exact body:
 {"error": "<message>", "message": "<message>", "detail": "<message>"}
 ```
 
-All three fields carry the same string so clients can use whichever they already parse. Filesystem paths are redacted to `"Internal server error"` before leaving the process.
+All three fields carry the same string so clients can parse whichever they already read. Filesystem paths are redacted to `"Internal server error"` before leaving the process (triggered when the message contains `/mnt/`, `/home/`, or `/tmp/`).
 
 ### Storage URIs
 
-Uploads and generated media are referenced by `storage://<uuid>` URIs. They resolve to files under the server's `UPLOAD_DIR`. Clients never see raw paths. See §6 for the upload flow.
+Uploads and generated media are referenced by `storage://<uuid>` URIs, resolved to files under `UPLOAD_DIR`. Clients never see raw paths. See [Uploads](#uploads) for the two-step upload flow. Treat `storage://` URIs as capabilities — anyone with the URI plus a valid API key can read the file.
 
 ### CORS
 
-`^https?://(localhost|192\.168\.\d+\.\d+)(:\d+)?$` is allowed. Methods: `GET, POST, PUT, DELETE`. Headers: `Authorization, Content-Type`.
+`allow_origin_regex = ^https?://(localhost|192\.168\.\d+\.\d+)(:\d+)?$`
+`allow_methods = GET, POST, PUT, DELETE`
+`allow_headers = Authorization, Content-Type`
 
 ### Media types
 
 | Kind | Content-Type |
 |---|---|
 | Video generation result | `video/mp4` |
-| Image generation result | `image/webp` (lossless VP8L) |
-| Preview frame (v2 `/preview`) | `image/jpeg` (quality 80) |
-| Thumbnail (history) | `image/jpeg` (quality 70, 256 px wide) |
+| Image generation result | `image/webp` (lossless VP8L, quality 95) |
+| Preview frame (`/v2/jobs/{id}/preview`) | `image/jpeg` (quality 80) |
+| Thumbnail (`/v2/history/{id}/thumbnail`) | `image/jpeg` (quality 70, 256 px wide) |
+| Music result | `audio/mpeg` \| `audio/flac` \| `audio/wav` \| `audio/opus` \| `audio/aac` (mirrors request `audio_format`) |
 | Chat completions | `application/json` (OpenAI-shaped) |
-| SSE | `text/event-stream` |
+| SSE streams | `text/event-stream` |
 
-### Rate limiting / queue
+### Rate limiting and queue depth
 
-- Single shared `_inference_lock` serializes all GPU work (FP8 + LTX cannot run concurrently in the same process).
-- v2 job queue cap: `config.MAX_QUEUE_DEPTH`. Exceeding returns `429 {"error": "queue_full"}` with `Retry-After: 30`.
-- `503` with `Retry-After: 300` while the system is paused.
+| Ceiling | Config | Overflow response |
+|---|---|---|
+| v2 job queue | `MAX_QUEUE_DEPTH = 10` | `429 {"error": "queue_full"}` + `Retry-After: 30` |
+| v2 music pending jobs | `MAX_MUSIC_PENDING = 5` | `429 {"error": "music_queue_full"}` + `Retry-After: 30` |
+| Batch queue | `MAX_BATCH_QUEUE_DEPTH = 5` | `429 {"error": "batch_queue_full"}` + `Retry-After: 30` |
+| Items per batch | `MAX_BATCH_ITEMS = 50` | `422` from Pydantic `max_length` |
+| Upload size | `MAX_UPLOAD_BYTES = 1 GiB` | `413` |
+| LoRA upload size | `MAX_LORA_SIZE_BYTES = 1 GiB` | `413` |
 
-### GPU layout (v1.2 — dual-GPU, 2-tenant swap on cuda:0)
+### System-wide state
 
-LTX and Flux target `cuda:0` and are **mutually exclusive**. cuda:1 runs ACE (music, :8001) alongside either JoyAI (image edit, :8092) or ERNIE-Image (t2i, :8094) — JoyAI and ERNIE swap (mutually exclusive). The server auto-swaps on cuda:0:
+- **Paused** (`POST /v1/system/pause`): all generation returns `503 {"error": "system_paused"}` + `Retry-After: 300`. `/health` still responds. Queued jobs are cancelled with error `"System paused"`.
+- **Turbo active** (`POST /v1/system/turbo`): Flux, ACE, JoyAI, ERNIE, and music endpoints return `503 turbo_mode_active`. Auto-exit is triggered when a JoyAI or music request arrives (blocks ~15 s, then serves).
+- **Single shared `_inference_lock`** serializes all in-process GPU work (Flux + LTX on cuda:0 cannot run concurrently).
 
-- Video request → evicts Flux if needed, ensures LTX resident (cold load ≈ 25–30 s).
-- Image request (Flux) → evicts LTX if resident (≈ 3 s), Flux's own offload hooks page weights in (≈ 15–60 s first call).
-- Long stretches of single-tenant workload pay zero swap overhead.
-- **Turbo mode** (`POST /v1/system/turbo`): claims both GPUs for LTX — 2 concurrent denoiser workers, 2 video jobs at a time. ACE, JoyAI, and Flux return `503` while active.
+### GPU layout (v1.7.0)
+
+- **cuda:0** (RTX PRO 6000 96 GB) — LTX ↔ Flux, mutually exclusive, auto-swap on dispatch.
+- **cuda:1** (RTX PRO 6000 96 GB) — ACE (~18 GB, port 8001) coexisting with either JoyAI (~50 GB, port 8092) or ERNIE-Image (~33 GB, port 8094); JoyAI and ERNIE are mutually exclusive.
+- **Turbo mode** claims cuda:1 for a second LTX worker + optional remote-sidecar pool (via `LTX_REMOTE_SIDECAR_URL`). Total capacity while turbo is on: `2 + remote_worker_active` concurrent video workers.
 
 ---
 
-## Common request types
+## Common types
 
 ### `LoRAInput`
 
@@ -103,10 +124,12 @@ LTX and Flux target `cuda:0` and are **mutually exclusive**. cuda:1 runs ACE (mu
 {"id": "my-style", "strength": 1.0}
 ```
 
-| Field | Type | Constraints |
-|---|---|---|
-| `id` | string | Must exist in the corresponding registry (`/v1/loras` for LTX, `/v1/flux-loras` for Flux). |
-| `strength` | float | `0.0 ≤ x ≤ 2.0`, default `1.0`. Flux LoRAs are adapter-mode — strength changes are free. LTX LoRAs require a reload on strength change. |
+| Field | Type | Constraint | Default |
+|---|---|---|---|
+| `id` | string | Must exist in the corresponding registry (`/v1/loras` for LTX video + outpaint; `/v1/flux-loras` for Flux image) | required |
+| `strength` | float | `0.0 ≤ x ≤ 2.0` | `1.0` |
+
+Flux LoRAs run in adapter mode — strength changes are free (`pipe.set_adapters`, ~0 ms). LTX LoRAs are fused permanently at load time — a strength change forces a full transformer reload (~10 s cache miss on second pass). Cache key: `(model_name, lora_path)` for Flux (strength NOT in key); `(state_name, user_lora_tuple)` for LTX.
 
 ### `KeyframeInput`
 
@@ -114,40 +137,96 @@ LTX and Flux target `cuda:0` and are **mutually exclusive**. cuda:1 runs ACE (mu
 {"image_uri": "storage://...", "frame_index": "first", "strength": 1.0}
 ```
 
-| Field | Type | Notes |
+| Field | Type | Constraint | Default |
+|---|---|---|---|
+| `image_uri` | string | Must be a `storage://<uuid>` resolvable via [Uploads](#uploads) | required |
+| `frame_index` | int \| `"first"` \| `"middle"` \| `"last"` | Symbolic values resolved after `num_frames` is derived. Negative ints count from end (`-1` = last frame, `-12` = 12 frames before end) | `0` |
+| `strength` | float | `0.0 ≤ x ≤ 1.0`. Recommended: `first=1.0`, `middle=0.5`, `last=1.0` | `1.0` |
+
+**Resolution rules:**
+- `"first"` → `0`, `"middle"` → `num_frames // 2`, `"last"` → `num_frames - 1`
+- Negative int `i` → `num_frames + i`
+- Duplicate resolved indices → `422 "Duplicate frame_index values after resolution"`
+- Resolved index `< 0` or `>= num_frames` → `422 "Resolved frame_index ... is out of range"`
+
+Up to **8 keyframes per request**. `422 "At most 8 keyframes are allowed"` if exceeded.
+
+### `Resolution`
+
+Literal string union (server.py:642). All dimensions are multiples of 64; the server snaps via `_snap_to_multiple(..., 64)` rounding up if you send a non-standard value through the internal helper.
+
+```
+"1920x1080" | "1080x1920" | "2560x1440" | "1440x2560" | "3840x2160" | "2160x3840"
+```
+
+### `ModelName` (LTX video)
+
+```
+"ltx-2-3-fast" | "ltx-2-3-pro" | "ltx-2-3-hq"
+```
+
+| Model | Pipeline | Steps | Notes |
+|---|---|---|---|
+| `ltx-2-3-fast` | Distilled transformer | 8 | No CFG, uses `DISTILLED_SIGMA_VALUES` |
+| `ltx-2-3-pro` | Dev transformer + stage 2 dev_lora (5 steps) | 30 Euler + CFG + STG | Default for quality |
+| `ltx-2-3-hq` | Dev + distilled_lora@0.25 stage 1 (15 steps res2s), stage 2 dev_lora@0.50 | 15+5 | Highest quality |
+
+### `ImageModelName`
+
+```
+"flux2-dev" | "flux2-klein" | "joyai-edit" | "ernie-image"
+```
+
+| Model | Endpoint eligibility | Steps default | Notes |
+|---|---|---|---|
+| `flux2-dev` | t2i, i2i, image-edit | 50 | Full CFG, guidance `4.0` default |
+| `flux2-klein` | t2i, i2i, image-edit | 4 | Distilled, `guidance_scale` ignored |
+| `joyai-edit` | image-edit only | 30 | Single-image edit sidecar on cuda:1:8092. `lora` NOT supported. Exactly 1 `image_uri`. |
+| `ernie-image` | text-to-image only | 50 | Baidu ERNIE 8B DiT sidecar on cuda:1:8094. Resolutions: 1024×1024, 848×1264, 1264×848, others. |
+
+### `RetakeMode`
+
+```
+"replace_audio_and_video" | "replace_video" | "replace_video_only" | "replace_audio"
+```
+
+### `OutpaintPosition` (v1.7.0)
+
+```
+"center" | "left" | "right" | "top" | "bottom" | "top_left" | "top_right" | "bottom_left" | "bottom_right"
+```
+
+### Shared scalar constraints
+
+| Field | Constraint | Default |
 |---|---|---|
-| `image_uri` | string | `storage://<uuid>` — upload via §6 first. |
-| `frame_index` | int \| `"first"` \| `"middle"` \| `"last"` | Default `0`. Negative ints count from end (`-1` = last). Symbolic values resolved after `num_frames` is computed. Duplicate resolved indices → `422`. Out-of-range → `422`. |
-| `strength` | float | `0.0 ≤ x ≤ 1.0`. Recommended: first=1.0, middle=0.5, last=1.0. |
+| `prompt` | ≤ 10 000 chars (`max_length=10000` in Pydantic) | required where present |
+| `camera_motion` | ≤ 200 chars | `null` |
+| `duration` (video) | `0 < x ≤ 30` seconds | varies |
+| `fps` (video) | `0 < x ≤ 60` | `24` (a2v, elsewhere required) |
+| `num_frames` (internal) | Derived as `8k + 1` nearest `duration × fps` via `_duration_to_frames` | — |
+| `width` / `height` (image) | `64 ≤ x ≤ 4096`, snapped to multiples of 16 server-side | `1024` |
+| `num_inference_steps` (image) | `1 ≤ x ≤ 100` | `50` (dev), `4` (klein), `30` (joyai) |
+| `guidance_scale` (image) | `0 ≤ x ≤ 20` | `4.0` (Klein silently ignores, JoyAI respects) |
+| `seed` | `null` → server picks a random 32-bit uint; explicit ints are used verbatim | `null` |
+| `image_uris` (image-edit) | Length `1–10` for `flux2-dev` / `flux2-klein`; **exactly `1`** for `joyai-edit` | required |
 
-Up to 8 keyframes per request.
+### Invariants (easy to miss)
 
-### Shared constraints
-
-| Field | Constraint |
-|---|---|
-| `prompt` | ≤ 10 000 chars |
-| `camera_motion` | ≤ 200 chars |
-| `duration` | `0 < x ≤ 30` seconds |
-| `fps` | `0 < x ≤ 60` |
-| `model` (video) | `"ltx-2-3-fast"` \| `"ltx-2-3-pro"` \| `"ltx-2-3-hq"` |
-| `model` (image) | `"flux2-dev"` \| `"flux2-klein"` \| `"joyai-edit"` (edit only) \| `"ernie-image"` (t2i only) |
-| `resolution` | `"1920x1080"` \| `"1080x1920"` \| `"2560x1440"` \| `"1440x2560"` \| `"3840x2160"` \| `"2160x3840"` |
-| `width` / `height` (Flux / JoyAI) | `64 ≤ x ≤ 4096`, snapped to multiples of 16 server-side |
-| `num_inference_steps` (Flux / JoyAI) | `1 ≤ x ≤ 100`. Defaults: 50 (dev), 4 (klein), 30 (joyai-edit). Turbo mode overrides to 8. |
-| `guidance_scale` (Flux / JoyAI) | `0 ≤ x ≤ 20`. Defaults: 4.0. Klein silently ignores this (distilled, no CFG). JoyAI respects it. |
-| `image_uris` (image-edit) | Length `1–10` for `flux2-dev` / `flux2-klein`. **Exactly `1`** for `joyai-edit` (422 otherwise). |
-| `lora` (image-edit) | Supported for `flux2-dev` / `flux2-klein`. **Not supported** for `joyai-edit` — request returns `422 {"error": "joyai-edit does not support LoRA"}`. |
-
-Frame counts are derived as `8k + 1` closest to `duration * fps`. Actual frame count can drift by ±4 frames.
+- **Frame count** is always `8k + 1` — the server rounds `duration × fps` up to the nearest value. Actual output frame count drifts ±4 frames from what the math says.
+- **Resolution dims** are always multiples of 64, snapped up by `_resolution_to_dims`.
+- **Flux image dims** are always multiples of 16, snapped down by `(x // 16) * 16` in the handler.
+- **seed** on every video/image endpoint: if `null`/absent, server assigns `random.randint(0, 2**32 - 1)` and stores the resolved integer in history.
+- **LoRA requests**: 404 is returned when the LoRA id isn't registered. LTX LoRAs resolve via `lora_registry`; Flux LoRAs resolve via `flux_lora_registry`; outpaint resolves via `lora_registry` (id defaults to `ic-lora-outpaint`).
 
 ---
 
 ## System & health
 
-### `GET /health` — (no auth)
+### `GET /health`
 
-Liveness + model readiness. Never blocks.
+**Auth:** none.
+**Response:** `200 application/json`.
 
 ```json
 {
@@ -155,186 +234,22 @@ Liveness + model readiness. Never blocks.
   "ltx": "ready" | "not_loaded" | "paused",
   "flux": "ready" | "not_loaded" | "paused",
   "ace": "enabled" | "disabled" | "paused",
+  "ernie": "ready" | "enabled" | "disabled" | "paused",
   "chat": "ready" | "not_loaded",
   "queue": {"queued": 0, "processing": 0, "completed": 12, "failed": 1}
 }
 ```
 
-### `POST /v1/system/pause`
+### `GET /dashboard`
 
-Evicts LTX and Flux, cancels all queued (not yet processing) v2 jobs, and flips the server into a paused state. Use before a training run.
+**Auth:** none.
+**Response:** `200 text/html` — static SPA from `dashboard.html`. Real-time GPU telemetry, turbo controls, advanced generation controls (14 tunable parameters with presets + reset).
+**Errors:** `404` if the file is missing.
 
-- While paused: all generation endpoints return `503` with `Retry-After: 300`.
-- `/health` still responds and reports `"paused"`.
+### `GET /v1/system/gpu`
 
-Response: `{"status": "paused" | "already_paused"}`
-
-### `POST /v1/system/resume`
-
-Reloads LTX (and Flux if `LOAD_FLUX=1`). Response: `{"status": "ready" | "already_running"}`. On failure: `500 {"error": "resume_failed", "status": "paused"}`.
-
-### `POST /v1/flux/unload`
-
-Unloads Flux only (LTX stays). Response: `{"status": "unloaded" | "already_unloaded"}`.
-
-### `POST /v1/flux/reload`
-
-Reloads Flux only. Response: `{"status": "loaded" | "already_loaded"}`.
-
-### `POST /v1/ltx/unload`
-
-Unloads LTX only (Flux stays). In single-GPU mode this fully frees `cuda:0` so a subsequent Flux request has room. The next video request auto-reloads LTX (~25–30 s cold). Response: `{"status": "unloaded" | "already_unloaded"}`.
-
-### `POST /v1/ltx/reload`
-
-Reloads LTX. Response: `{"status": "loaded" | "already_loaded"}`.
-
-### `POST /v1/system/turbo` (v1.2)
-
-Toggle turbo mode — claims both GPUs for LTX, enabling 2 concurrent denoiser workers and 2x video throughput. While active, Flux/ACE/JoyAI/music endpoints return `503`.
-
-**Body:**
-
-```json
-{"enable": true}
-```
-
-**Response:**
-
-```json
-{
-  "turbo": true,
-  "flux_device": "cuda:0",
-  "ltx_device": "cuda:0",
-  "ace_status": "unloaded",
-  "joyai_status": "unloaded"
-}
-```
-
-- `409 {"error": "already_enabled"}` if already in turbo mode.
-- `409 {"error": "already_disabled"}` if already in normal mode.
-- `503` if the system is paused.
-
-Updated in v1.6: turbo mode now stacks an OPTIONAL remote-sidecar pool on top of the 2 local workers, for a total of up to 6 concurrent video workers. See `/v1/system/pool` below.
-
-### `GET /v1/system/pool` (v1.6)
-
-Inspect the LTX remote-sidecar pool state. Used by the dashboard + optionally by clients that want to display current capacity.
-
-**Response:**
-
-```json
-{
-  "turbo_active": true,
-  "remote_sidecar_configured": true,
-  "remote_sidecar_url": "https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run",
-  "remote_worker_target": 3,
-  "remote_worker_active": 3,
-  "remote_worker_max": 4
-}
-```
-
-- `remote_sidecar_configured`: whether `LTX_REMOTE_SIDECAR_URL` is set in `.env`.
-- `remote_worker_target`: the operator's desired active count; persists across turbo toggles.
-- `remote_worker_active`: currently live worker tasks. Always 0 when `turbo_active` is false (the pool is turbo-scoped — only video jobs flow through the queue during turbo, so remote workers can't accidentally steal image/music jobs).
-- `remote_worker_max`: upper bound from `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4).
-
-Total concurrent video-worker capacity when turbo is on = `2 + remote_worker_active` (main cuda:0 + local cuda:1 sidecar + N remote).
-
-### `POST /v1/system/pool/remote-workers` (v1.6)
-
-Set the target remote-worker count. **Operator endpoint — typical clients don't need this.**
-
-**Body:**
-
-```json
-{"count": 3}
-```
-
-Count is clamped to `[0, remote_worker_max]`. If turbo is on, the live pool scales immediately. If turbo is off, the target is stored and applied at the next `/v1/system/turbo` enable.
-
-**Response:**
-
-```json
-{
-  "remote_worker_target": 3,
-  "remote_worker_active": 3,
-  "remote_worker_max": 4,
-  "applied_now": true
-}
-```
-
-- `applied_now`: `true` iff turbo was active and the live pool was resized during this call.
-- `400 {"error": "remote_sidecar_not_configured"}` if `LTX_REMOTE_SIDECAR_URL` is empty.
-
-### `GET /v1/system/sampler` (v1.3)
-
-Get current sampler configuration.
-
-```json
-{
-  "use_cfg_pp": true,
-  "eta_stage1": 1.0,
-  "eta_default": 0.0,
-  "stage2_sigmas_override": null
-}
-```
-
-### `POST /v1/system/sampler` (v1.3)
-
-Toggle sampler between Euler and CFG++.
-
-**Body:**
-
-```json
-{"use_cfg_pp": false}
-```
-
-**Response:** Same shape as GET. Takes effect immediately on the next generation request — no restart needed.
-
-### `GET /v1/system/config` (v1.3)
-
-Get all generation configuration parameters. Persisted to `.gen_config.json`.
-
-```json
-{
-  "sampler": "cfg_pp",
-  "fast_stage1_steps": 8,
-  "pro_stage1_steps": 30,
-  "scheduler_max_shift": 2.05,
-  "scheduler_base_shift": 0.95,
-  "cfg_scale": 3.0,
-  "stg_scale": 1.0,
-  "stg_blocks": [28],
-  "rescale_scale": 0.7,
-  "modality_scale": 3.0,
-  "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0],
-  "eta_stage1": 1.0,
-  "eta_default": 0.0
-}
-```
-
-### `POST /v1/system/config` (v1.3)
-
-Merge-update generation config. Send only the keys you want to change — unknown keys are ignored.
-
-**Body (partial example):**
-
-```json
-{"fast_stage1_steps": 12, "cfg_scale": 4.0}
-```
-
-**Response:** `{"status": "ok", ...}` with full config after merge. Persisted to `.gen_config.json`. Takes effect on the next generation request — no restart needed.
-
-### `POST /v1/system/config/reset` (v1.3)
-
-Reset all generation parameters to defaults. No body required.
-
-**Response:** `{"status": "reset", ...}` with full default config.
-
-### `GET /v1/system/gpu` (v1.2)
-
-nvidia-smi GPU telemetry (2 s cache). Used by the dashboard.
+**Auth:** none.
+2-second cached `nvidia-smi` snapshot. Used by the dashboard.
 
 ```json
 {
@@ -350,548 +265,216 @@ nvidia-smi GPU telemetry (2 s cache). Used by the dashboard.
     }
   ],
   "turbo": false,
-  "gpu0_tenant": "ltx",
-  "gpu1_tenant": "ace"
+  "sampler": "cfg_pp",
+  "gen_config": { "...": "see /v1/system/config" },
+  "flux_config": { "...": "see /v1/system/flux-config" },
+  "gpu0_tenant": "ltx" | "flux" | "idle",
+  "gpu1_tenant": "ltx-sidecar" | "ace+joyai" | "idle"
 }
 ```
 
-### `GET /dashboard` (v1.2, no auth)
+On `nvidia-smi` failure: `{"gpus": [], "turbo": ..., "error": "..."}` (200).
 
-Serves the GPU management dashboard as a static HTML SPA. Provides real-time GPU telemetry, turbo toggle controls, advanced generation controls (14 tunable parameters with presets and reset), and system status.
+### `POST /v1/system/pause`
 
----
+Evict all models, cancel queued v2 jobs and batches, flip server to paused. Safe to call while paused (returns `already_paused`).
 
-## v1 synchronous generation
+**Response:** `{"status": "paused" | "already_paused"}`
+**Errors:** `500 {"error": "pause_failed", "status": "paused"}`.
 
-Synchronous endpoints block until the result media is in RAM and return it directly. Good for quick one-shots and for clients that don't want to poll. **For anything more than a few requests, use v2 (§5).**
+### `POST /v1/system/resume`
 
-All v1 generation endpoints can return:
+Reloads LTX (and Flux if `LOAD_FLUX=1`).
 
-- `503` — system paused
-- `500` — Flux requested but `LOAD_FLUX=0`
-- `422` — invalid LoRA, keyframe bounds, or retake content rejection
-- `404` — referenced upload not found
-- `500` — generic failure (error text sanitized of paths)
+**Response:** `{"status": "ready" | "already_running"}`
+**Errors:** `500 {"error": "resume_failed", "status": "paused"}`.
 
-### `POST /v1/text-to-video`
+### `POST /v1/flux/unload`
 
-**Body:** `TextToVideoRequest`
+Unloads Flux only (LTX stays). In single-GPU swap mode this frees cuda:0 for a video request.
 
+**Response:** `{"status": "unloaded" | "already_unloaded"}`
+**Errors:** `500 {"error": "flux_unload_failed"}`.
+
+### `POST /v1/flux/reload`
+
+**Response:** `{"status": "loaded" | "already_loaded"}`
+**Errors:** `500 {"error": "flux_reload_failed"}`.
+
+### `POST /v1/ltx/unload`
+
+Unloads LTX only (Flux stays). Next video request auto-reloads (~25-30 s cold).
+
+**Response:** `{"status": "unloaded" | "already_unloaded"}`
+**Errors:** `500 {"error": "ltx_unload_failed"}`.
+
+### `POST /v1/ltx/reload`
+
+**Response:** `{"status": "loaded" | "already_loaded"}`
+**Errors:** `500 {"error": "ltx_reload_failed"}`.
+
+### `POST /v1/system/turbo`
+
+Claim/release cuda:1 for dual-GPU LTX. Evicts ACE/JoyAI/ERNIE/Flux on entry. Flux, ACE, JoyAI, ERNIE, music endpoints return `503` while active.
+
+**Body:** `{"enable": true | false}` (`TurboRequest`)
+**Response:**
 ```json
 {
-  "prompt": "a cat walks across a sunlit hardwood floor",
-  "model": "ltx-2-3-pro",
-  "resolution": "1920x1080",
-  "duration": 5.0,
-  "fps": 24,
-  "generate_audio": false,
-  "camera_motion": "slow dolly in",
-  "lora": {"id": "my-style", "strength": 1.0},
-  "enhance_prompt": false
+  "turbo": true,
+  "flux_device": "cuda:0",
+  "ltx_device": "cuda:0",
+  "ace_status": "unloaded" | "loaded" | "disabled",
+  "joyai_status": "unloaded" | "loaded" | "disabled"
 }
 ```
 
-**Response:** `200 video/mp4` raw bytes.
+**Errors:**
+- `409 {"error": "already_enabled", "turbo": true}`
+- `409 {"error": "already_disabled", "turbo": false}`
+- `503 {"error": "system_paused"}` + `Retry-After: 300`
+- `500 {"error": "turbo_toggle_failed"}`
 
-### `POST /v1/image-to-video`
+Turbo entry ~20 s, exit ~15 s. v1.6+: turbo stacks the optional remote-sidecar pool for up to `2 + LTX_REMOTE_SIDECAR_MAX_WORKERS` (default max 4) concurrent workers.
 
-Takes either `image_uri` (single start frame) OR `keyframes` (up to 8). Mutually exclusive — providing both returns `422`.
+### `GET /v1/system/pool`
+
+Inspect the LTX remote-sidecar pool.
 
 ```json
 {
-  "prompt": "she turns to face the camera",
-  "image_uri": "storage://...",
-  "image_strength": 0.85,
-  "keyframes": null,
-  "model": "ltx-2-3-pro",
-  "resolution": "1920x1080",
-  "duration": 6.0,
-  "fps": 24,
-  "generate_audio": false,
-  "lora": null,
-  "enhance_prompt": false
+  "turbo_active": true,
+  "remote_sidecar_configured": true,
+  "remote_sidecar_url": "https://example.modal.run",
+  "remote_worker_target": 3,
+  "remote_worker_active": 3,
+  "remote_worker_max": 4
 }
 ```
 
-With keyframes:
+- `remote_sidecar_configured` — `true` iff `LTX_REMOTE_SIDECAR_URL` is set.
+- `remote_worker_target` — operator's desired count; persists across turbo toggles.
+- `remote_worker_active` — currently live worker tasks. Always `0` when `turbo_active` is false (the pool is turbo-scoped).
+- `remote_worker_max` — `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4).
 
+Total concurrent video workers when turbo is on: `2 + remote_worker_active`.
+
+### `POST /v1/system/pool/remote-workers`
+
+Set target remote-worker count. Clamped to `[0, remote_worker_max]`. Immediate if turbo is on; stored for next turbo-enable otherwise.
+
+**Body:** `{"count": 3}` (`PoolCountRequest`, `count >= 0`)
+**Response:**
 ```json
 {
-  "prompt": "walk cycle",
-  "keyframes": [
-    {"image_uri": "storage://a", "frame_index": "first", "strength": 1.0},
-    {"image_uri": "storage://b", "frame_index": "middle", "strength": 0.5},
-    {"image_uri": "storage://c", "frame_index": "last", "strength": 1.0}
-  ],
-  "model": "ltx-2-3-pro",
-  "resolution": "1920x1080",
-  "duration": 6.0,
-  "fps": 24
+  "remote_worker_target": 3,
+  "remote_worker_active": 3,
+  "remote_worker_max": 4,
+  "applied_now": true
 }
 ```
 
-**Response:** `200 video/mp4`.
+**Errors:**
+- `400 {"error": "remote_sidecar_not_configured: set LTX_REMOTE_SIDECAR_URL in .env"}`
+- `500 {"error": "pool_scale_failed: ..."}`
 
-### `POST /v1/audio-to-video`
+### `GET /v1/system/config`
 
-Generates video timed to an uploaded audio track. Optional conditioning image.
+Full LTX generation-config snapshot. Persisted to `.gen_config.json`, survives restart.
 
 ```json
 {
-  "prompt": "lip-synced interview, warm studio light",
-  "audio_uri": "storage://...",
-  "image_uri": "storage://...",
-  "model": "ltx-2-3-fast",
-  "resolution": "1080x1920",
-  "duration": 6.0,
-  "fps": 24
+  "sampler": "cfg_pp",
+  "eta_stage1": 1.0,
+  "eta_default": 0.0,
+  "fast_stage1_steps": 8,
+  "pro_stage1_steps": 30,
+  "scheduler_max_shift": 2.05,
+  "scheduler_base_shift": 0.95,
+  "cfg_scale": 3.0,
+  "stg_scale": 1.0,
+  "stg_blocks": [28],
+  "rescale_scale": 0.7,
+  "modality_scale": 3.0,
+  "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0]
 }
 ```
 
-**Response:** `200 video/mp4`.
+Defaults live in `split_model_manager._DEFAULT_GEN_CONFIG`.
 
-### `POST /v1/retake`
+### `POST /v1/system/config`
 
-Regenerates a span of an existing video.
+Merge-update LTX generation config. Send only the keys you want to change — unknown keys are silently ignored. Effect is immediate on the next generation request (no restart).
 
-```json
-{
-  "video_uri": "storage://...",
-  "start_time": 1.5,
-  "duration": 3.0,
-  "mode": "replace_video",
-  "prompt": "make the sky overcast",
-  "lora": null
-}
-```
+**Body (partial example):** `{"fast_stage1_steps": 12, "cfg_scale": 4.0}`
+**Response:** `{"status": "ok", "...": "<full merged config>"}`
 
-`mode` ∈ `"replace_audio_and_video" | "replace_video" | "replace_video_only" | "replace_audio"`.
+### `POST /v1/system/config/reset`
 
-**Response:** `200 video/mp4`. On any failure: `422 Content rejected or generation failed: …`.
+Restore all LTX generation params to defaults. No body.
+**Response:** `{"status": "reset", "...": "<default config>"}`
 
-### `POST /v1/text-to-image`
+### `GET /v1/system/flux-config`
+
+Flux generation-config snapshot. Persisted to `.flux_config.json`.
 
 ```json
 {
-  "prompt": "cinematic portrait of a woman in a red coat, overcast afternoon",
-  "model": "flux2-dev",
-  "width": 1024,
-  "height": 1024,
-  "num_inference_steps": 50,
+  "default_model": "flux2-dev",
+  "t2i_steps": 50,
+  "edit_steps": 4,
   "guidance_scale": 4.0,
-  "seed": null,
   "turbo": false,
-  "lora": {"id": "mystyle", "strength": 0.8}
+  "turbo_steps": 8,
+  "turbo_guidance": 2.5
 }
 ```
 
-- `seed: null` → server picks a random 32-bit seed.
-- `turbo: true` → server forces 8 steps + turbo sigma schedule + guidance 2.5 (Flux only).
-- Width/height snapped to multiples of 16.
-- `model: "ernie-image"` routes to the ERNIE-Image sidecar on cuda:1 (v1.3). Supported resolutions: 1024x1024, 848x1264, 1264x848, etc. Returns `503 ernie_disabled` if `LOAD_ERNIE` is off or sidecar unreachable.
+### `POST /v1/system/flux-config`
 
-**Response:** `200 image/webp` (lossless VP8L).
+Merge-update Flux config. Same semantics as `/v1/system/config`.
+**Response:** `{"status": "ok", "...": "<full merged config>"}`
 
-### `POST /v1/image-to-image`
+### `POST /v1/system/flux-config/reset`
 
-Same fields as `text-to-image` plus required `image_uri`. Response `200 image/webp`.
+**Response:** `{"status": "reset", "...": "<default config>"}`
 
-### `POST /v1/image-edit`
+### `GET /v1/system/sampler`
 
-Image editing. Supports three models:
-
-- **`flux2-klein`** (default) — multi-reference Klein KV, 4 distilled steps, no CFG
-- **`flux2-dev`** — Flux 2 Dev, 50 steps, full CFG (v1.1.8 bug fix: prior versions silently fell back to Klein)
-- **`joyai-edit`** (v1.1.8) — instruction-based single-image editing via JoyImageEditPipeline, running out-of-process in the `joyai-sidecar` on `127.0.0.1:8092`
+Alias for the sampler subset of `/v1/system/config`.
 
 ```json
 {
-  "prompt": "replace the background with a rainy street",
-  "image_uris": ["storage://a"],
-  "model": "flux2-klein",
-  "width": 1024,
-  "height": 1024,
-  "num_inference_steps": 4,
-  "guidance_scale": 4.0,
-  "lora": null
+  "sampler": "cfg_pp",
+  "eta_stage1": 1.0,
+  "eta_default": 0.0,
+  "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0]
 }
 ```
 
-`image_uris` length: **1–10** for `flux2-dev` / `flux2-klein`, **exactly 1** for `joyai-edit`. Response `200 image/webp`.
+### `POST /v1/system/sampler`
 
-**`joyai-edit` specifics (v1.1.8)**:
+Toggle sampler. Writes into `_gen_config` (same store as `/v1/system/config`).
 
-```json
-{
-  "prompt": "Remove the construction crane from the top of the building.",
-  "image_uris": ["storage://abc123"],
-  "model": "joyai-edit",
-  "width": 1024,
-  "height": 1024,
-  "num_inference_steps": 30,
-  "guidance_scale": 4.0
-}
-```
-
-- `image_uris` must have exactly one entry. `len(image_uris) != 1` → `422`.
-- `lora` is **not supported**. Requests with `lora` set → `422 {"error": "joyai-edit does not support LoRA"}`.
-- Defaults: `num_inference_steps=30`, `guidance_scale=4.0`. JoyAI respects `guidance_scale` (unlike Klein).
-- Prompts are freeform English. **The server wraps the prompt in a chat template** (`<|im_start|>user\n<image>\n{prompt}<|im_end|>\n`) before dispatching to the sidecar — clients send plain text.
-- Width / height: multiples of 16, same as Flux.
-- Latency: ~78 s at 1024×1024 / 30 steps (comparable to Flux 2 Dev 50-step).
-- **Feature flag**: requires `LOAD_JOYAI=1` on the server. If unset, all `joyai-edit` requests return `503 {"error": "joyai_disabled: ..."}`.
-- **Sidecar health**: if the joyai-sidecar process is unreachable, requests return `503 {"error": "sidecar_unreachable"}`. Clients should fall back to `flux2-klein`.
-
----
-
-## v2 async generation + jobs
-
-v2 endpoints return `202 Accepted` with a `job_id`. Poll `/v2/jobs/{job_id}` until `status == "completed"`, then GET the result URL.
-
-### Common submission response
-
-```json
-{
-  "job_id": "job_01H...",
-  "status": "queued",
-  "poll_url": "/v2/jobs/job_01H...",
-  "stream_url": "/v2/jobs/job_01H.../stream"
-}
-```
-
-On pause: `503 {"error": "system_paused"}` + `Retry-After: 300`.
-On full queue: `429 {"error": "queue_full"}` + `Retry-After: 30`.
-
-### Endpoints
-
-All accept the **same bodies** as their v1 counterparts:
-
-| Endpoint | Request shape |
-|---|---|
-| `POST /v2/text-to-video` | `TextToVideoRequest` |
-| `POST /v2/image-to-video` | `ImageToVideoRequest` |
-| `POST /v2/audio-to-video` | `AudioToVideoRequest` |
-| `POST /v2/retake` | `RetakeRequest` |
-| `POST /v2/text-to-image` | `TextToImageRequest` |
-| `POST /v2/image-to-image` | `ImageToImageRequest` |
-| `POST /v2/image-edit` | `ImageEditRequest` |
-| `POST /v2/music` | `MusicGenerationRequest` (v1.2) |
-
-All return `202` + submission envelope.
-
-### `GET /v2/jobs/{job_id}` — status poll
-
-```json
-{
-  "job_id": "job_...",
-  "status": "queued" | "processing" | "completed" | "failed" | "cancelled",
-  "type": "text-to-video" | ...,
-  "progress": 0.42,
-  "phase": "denoising" | "decoding" | "encoding" | "saving" | null,
-  "queue_position": 3,
-  "error": {"code": "generation_failed", "message": "..."} | null,
-  "result_url": "/v2/jobs/job_.../result" | null,
-  "result_storage_uri": "storage://..." | null,
-  "result_media_type": "video/mp4" | "image/webp" | null
-}
-```
-
-- `progress` is only populated while `processing` (range `0.0–1.0`). Denoising reports up to `0.90`; the top 10% is reserved for post-denoise phases. Completed jobs report `1.0`.
-- `phase` is only populated while `processing`. Typical sequence: `denoising` → `decoding` (LTX only, VAE decode) → `encoding` (ffmpeg or WEBP) → `saving` (upload-store write). Use this to render "Decoding video…" / "Encoding MP4…" / etc. instead of a frozen percentage during the silent post-denoise tail.
-- **`joyai-edit` (v1.1.8) jobs only emit `phase="encoding"`** for the entire sidecar call — the sidecar is a single opaque HTTP round-trip, so taco-backend cannot report per-step progress. Progress jumps to `0.90` at job start, stays at `0.90` throughout the ~78 s call, then transitions to `0.99` (`"saving"`) and `1.0` (`null`) on completion. Clients should render a spinner and an "encoding" label, not a moving percentage.
-- `queue_position` is only populated while `queued`.
-- `result_url` / `result_storage_uri` / `result_media_type` are only populated when `completed`.
-- `404` if the job id is unknown or expired (job store TTL applies).
-
-### `GET /v2/jobs/{job_id}/preview`
-
-Returns a low-res preview JPEG at three possible states:
-
-| State | Response |
-|---|---|
-| Flux step-end callback already cached a preview | `200 image/jpeg` (live as the image denoises) |
-| Completed video job — first frame extracted lazily via PyAV | `200 image/jpeg` (cached on first call) |
-| Queued / processing video / no data yet | **`204 No Content`** — **not** `404`. Keep polling. |
-| Unknown job id | `404 Job not found` |
-
-**Client note:** treat `204` as "no preview yet, poll again". Historic clients that treated `404` as "broken job" will need to switch to `204`.
-
-### `GET /v2/jobs/{job_id}/result`
-
-- `200` with `FileResponse` (streaming) + `Cache-Control: no-store` when complete.
-- `409 Job result not ready` if the job isn't `completed`.
-- `404 Job not found` / `404 Result file expired or not found`.
-
-### `DELETE /v2/jobs/{job_id}` — cancel
-
-- `200 {"job_id": "...", "status": "cancelled"}` if queued or processing.
-- `409 Cannot cancel a finished job` if already completed / failed / cancelled.
-- `404 Job not found`.
-
-### `GET /v2/jobs/{job_id}/stream` — SSE live updates
-
-Server-Sent Events stream for live job state. **Use this instead of polling `/v2/jobs/{id}`** — one long-lived connection replaces the entire poll loop.
-
-**Auth**: `EventSource` can't set custom headers, so the endpoint accepts either a bearer `Authorization` header (for programmatic clients) or a `?token=<sse-token>` query param (for browsers). Get a short-lived token via `POST /v1/sse-token`.
-
-**Event shape**: each `data:` line contains the same JSON as `GET /v2/jobs/{id}` (status, progress, phase, queue_position, error, result_url, …). Drop it into your existing polling parser as-is.
-
-**Delivery semantics**:
-- Emits one event immediately on connect with the current state.
-- Emits again every time `(status, progress, phase, error_code)` changes. Progress is rounded to 3 decimals to avoid flooding on micro-ticks.
-- Emits a `: keepalive` comment every 15 s during idle periods (queued with no position change) to prevent intermediate proxies from closing the connection.
-- Emits one final event on terminal state (completed / failed / cancelled), then closes the stream.
-- Emits `event: error` with `{"error": "job_expired"}` and closes if the job is evicted from the store mid-stream.
-
-**Status codes**:
-- `200 text/event-stream` — stream opened.
-- `404 Job not found` — unknown job id (before stream opens).
-- `401 Missing API key` — neither bearer nor valid token.
-
-**Browser example**:
-
-```js
-// 1. Submit the job (normal POST with bearer)
-const { job_id } = await fetch("/v2/text-to-video", { ... }).then(r => r.json());
-
-// 2. Get a disposable SSE token
-const { token } = await fetch("/v1/sse-token", { method: "POST", headers: { Authorization: `Bearer ${KEY}` } }).then(r => r.json());
-
-// 3. Open the live stream
-const es = new EventSource(`/v2/jobs/${job_id}/stream?token=${token}`);
-es.onmessage = (ev) => {
-  const { progress, phase, status, result_url } = JSON.parse(ev.data);
-  setProgress(progress);
-  setPhase(phase);
-  if (status === "completed") {
-    fetch(result_url, { headers: { Authorization: `Bearer ${KEY}` } })
-      .then(r => r.blob())
-      .then(showResult);
-    es.close();
-  } else if (status === "failed" || status === "cancelled") {
-    es.close();
-  }
-};
-es.addEventListener("error", (ev) => {
-  // connection dropped OR server emitted `event: error` — retry or fall back to polling
-});
-```
-
-**curl example**:
-
-```bash
-curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
-```
-
----
-
-## Music generation
-
-ACE Step (xl-base + LM) on cuda:1 (`127.0.0.1:8001`). ~18 GB resident, runs as a separate systemd service, concurrent with JoyAI on the same GPU. Gated by `LOAD_ACE=1` env var.
-
-### `POST /v1/music`
-
-Synchronous music generation. Blocks until the audio is ready.
-
-**Body:** `MusicGenerationRequest`
-
-```json
-{
-  "prompt": "upbeat electronic dance track with heavy bass",
-  "lyrics": "[Instrumental]",
-  "duration": 60.0,
-  "audio_format": "mp3",
-  "task_type": "text2music",
-  "num_inference_steps": 50,
-  "guidance_scale": 7.0,
-  "bpm": 128,
-  "seed": 42
-}
-```
-
-| Field | Type | Default | Constraints |
-|---|---|---|---|
-| `prompt` | string | required | Music description, max 10,000 chars |
-| `lyrics` | string | `"[Instrumental]"` | Song lyrics, max 50,000 chars |
-| `duration` | float | `60.0` | `0 < x ≤ 600` seconds |
-| `audio_format` | string | `"mp3"` | `"mp3"` \| `"flac"` \| `"wav"` \| `"wav32"` \| `"opus"` \| `"aac"` |
-| `seed` | int | null | For reproducibility |
-| `bpm` | int | null | `30 ≤ x ≤ 300` |
-| `key_scale` | string | null | Musical key (e.g. `"C major"`) |
-| `time_signature` | string | null | e.g. `"4/4"` |
-| `vocal_language` | string | null | e.g. `"en"` |
-| `num_inference_steps` | int | `50` | `1 ≤ x ≤ 200` |
-| `guidance_scale` | float | `7.0` | `0 ≤ x ≤ 15` |
-| `shift` | float | `3.0` | `1.0 ≤ x ≤ 5.0` |
-| `infer_method` | string | `"ode"` | `"ode"` \| `"sde"` |
-| `use_adg` | bool | `false` | Adaptive denoising guidance |
-| `cfg_interval_start` | float | `0.0` | `0 ≤ x ≤ 1` |
-| `cfg_interval_end` | float | `1.0` | `0 ≤ x ≤ 1` |
-| `batch_size` | int | `1` | `1 ≤ x ≤ 8` |
-| `task_type` | string | `"text2music"` | `"text2music"` \| `"cover"` \| `"repaint"` \| `"extract"` \| `"lego"` \| `"complete"` |
-| `source_audio_uri` | string | null | Required for cover/repaint/extract/lego/complete |
-| `reference_audio_uri` | string | null | Optional reference audio |
-| `audio_cover_strength` | float | `1.0` | `0 ≤ x ≤ 1` |
-| `repainting_start` | float | `0.0` | `≥ 0` |
-| `repainting_end` | float | null | |
-| `repaint_mode` | string | `"balanced"` | `"conservative"` \| `"balanced"` \| `"aggressive"` |
-| `repaint_strength` | float | `0.5` | `0 ≤ x ≤ 1` |
-| `track_name` | string | null | Required for extract/lego/complete tasks |
-| `thinking` | bool | `false` | Enable LM thinking mode |
-| `sample_mode` | bool | `false` | |
-| `sample_query` | string | null | |
-| `lm_temperature` | float | `0.85` | `0 ≤ x ≤ 2` |
-| `lm_top_p` | float | `0.9` | `0 ≤ x ≤ 1` |
-
-**Task type requirements:**
-- `cover`, `repaint`, `extract`, `lego`, `complete` → require `source_audio_uri`
-- `extract`, `lego`, `complete` → additionally require `track_name`
-
-**Response:** raw audio bytes with `Content-Type` matching the format (e.g., `audio/mpeg` for mp3).
-
-- `503 Music generation not enabled (LOAD_ACE=0)` if the feature is disabled.
-- `503 turbo_mode_active` if turbo mode is enabled (ACE is evicted during turbo).
-- `422` if task_type requirements are not met.
-- `404` if `source_audio_uri` or `reference_audio_uri` not found.
-
-### `POST /v2/music`
-
-Async music generation. Returns `202` with the standard job envelope. Same body as `POST /v1/music`.
-
-- Music jobs use `phase="generating"` (not `"denoising"`).
-- Music queue cap: `MAX_MUSIC_PENDING` (default 5). Returns `429 {"error": "music_queue_full"}` when exceeded.
-
----
-
-## Batch scheduler
-
-Submit multiple generation jobs as a single batch. Items are executed sequentially (or 2-at-a-time in turbo mode), sorted to minimize GPU swaps (images before videos, Klein before Dev).
-
-### `POST /v2/batch`
-
-**Body:** `BatchRequest`
-
-```json
-{
-  "items": [
-    {
-      "type": "text-to-image",
-      "params": {
-        "prompt": "a cat",
-        "model": "flux2-klein",
-        "width": 1024,
-        "height": 1024,
-        "num_inference_steps": 4
-      }
-    },
-    {
-      "type": "text-to-video",
-      "params": {
-        "prompt": "a dog walking",
-        "model": "ltx-2-3-fast",
-        "resolution": "1920x1080",
-        "duration": 5,
-        "fps": 24
-      }
-    }
-  ],
-  "priority": "normal",
-  "callback_url": null
-}
-```
-
-| Field | Type | Default | Constraints |
-|---|---|---|---|
-| `items` | array of `BatchItem` | required | `1 ≤ length ≤ 50` |
-| `items[].type` | string | required | `"text-to-image"` \| `"image-to-image"` \| `"image-edit"` \| `"text-to-video"` \| `"image-to-video"` |
-| `items[].params` | object | required | Must validate against the corresponding Pydantic model |
-| `priority` | string | `"normal"` | `"normal"` \| `"high"` |
-| `callback_url` | string | null | Optional webhook URL for completion notification |
-
-**Response:** `202`
-
-```json
-{
-  "batch_id": "batch_...",
-  "status": "queued",
-  "total": 2,
-  "queue_position": 0
-}
-```
-
-- `429 {"error": "batch_queue_full"}` when `MAX_BATCH_QUEUE_DEPTH` (default 5) is exceeded.
-- `400` if an item type is invalid.
-- `422` if item params fail validation.
-- `503` if the system is paused.
-
-### `GET /v2/batch/{batch_id}`
-
-Poll batch status and partial results.
-
-```json
-{
-  "batch_id": "batch_...",
-  "status": "queued" | "processing" | "completed" | "failed" | "cancelled",
-  "total": 5,
-  "completed_count": 3,
-  "failed_count": 0,
-  "current_index": 3,
-  "turbo": false,
-  "results": [
-    {
-      "index": 0,
-      "type": "text-to-image",
-      "status": "completed",
-      "result_uri": "storage://...",
-      "media_type": "image/webp",
-      "error": null,
-      "elapsed_s": 3.2
-    }
-  ],
-  "created_at": 1712345678.9,
-  "started_at": 1712345679.0,
-  "completed_at": null
-}
-```
-
-- `404` if the batch_id is unknown.
-
-### `DELETE /v2/batch/{batch_id}`
-
-Cancel remaining items in a batch. The currently-running item (if any) will finish.
-
-```json
-{
-  "batch_id": "batch_...",
-  "status": "cancelled",
-  "completed_count": 2,
-  "cancelled_count": 3
-}
-```
-
-- `409 {"error": "batch_already_finished"}` if already completed/failed/cancelled.
-- `404` if not found.
-
-### `GET /v2/batch/{batch_id}/result/{index}` (v1.3)
-
-Download the result file for a completed batch item.
-
-- `index` is 0-based, matching the item order in the batch status response.
-- Returns the raw media file (video/mp4 or image/webp) with appropriate Content-Type.
-- `404` if batch or index not found.
-- `409` if the item is not yet completed.
+**Body:** `{"sampler": "cfg_pp" | "euler", "eta_stage1": 1.0, "eta_default": 0.0, "stage2_sigmas": [...]}`
+(all fields optional except `sampler`; server defaults `stage2_sigmas` to `[0.85, 0.725, 0.4219, 0.0]` when `sampler=cfg_pp` and `stage2_sigmas` is not provided)
+**Response:** `{"status": "ok", "sampler": "..."}`
 
 ---
 
 ## Uploads
 
-Two-step: get a presigned-style URL, then PUT the bytes.
+Two-step flow: create slot, PUT bytes.
 
 ### `POST /v1/upload`
 
+Get an upload slot. The returned URL is scoped to bearer auth plus the unguessable UUID.
+
+**Body:** ignored.
+**Response:**
 ```json
 {
-  "upload_url": "http://host:8090/uploads/put/<upload_id>",
+  "upload_url": "http://<host>/uploads/put/<upload_id>",
   "storage_uri": "storage://<upload_id>",
   "required_headers": {}
 }
@@ -901,19 +484,20 @@ Use the returned `storage_uri` in any generation request that takes an `image_ur
 
 ### `PUT /uploads/put/{upload_id}`
 
-- Body: raw file bytes. No multipart wrapping.
-- Max size: `upload_store.MAX_UPLOAD_BYTES`. Over → `413`.
-- Success: `201 Created` (empty body).
-
-Upload URLs are not signed — they rely on bearer auth plus the unguessable UUID. Treat `storage://` URIs as capabilities.
+- **Body:** raw file bytes. No multipart wrapping.
+- **Max size:** `MAX_UPLOAD_BYTES = 1 GiB`.
+- **Response:** `201 Created` (empty body).
+- **Errors:** `413 Upload exceeds 1024MB limit` when size exceeds the cap.
 
 ---
 
-## LoRAs (LTX)
+## LoRA registries
+
+### LTX LoRAs
 
 Full-fat registry with upload + delete. Stored in `LORAS_DIR/<filename>.safetensors` with `registry.json` metadata.
 
-### `GET /v1/loras`
+#### `GET /v1/loras`
 
 ```json
 {
@@ -934,38 +518,39 @@ Full-fat registry with upload + delete. Stored in `LORAS_DIR/<filename>.safetens
 }
 ```
 
-### `POST /v1/loras` — `201`
+#### `POST /v1/loras`
 
-Multipart form. Fields:
+**Status code on success:** `201 Created`.
+**Content-Type:** `multipart/form-data`.
 
 | Field | Required | Notes |
 |---|---|---|
 | `file` | yes | `.safetensors` file |
-| `name` | yes | Human-readable |
+| `name` | yes | Human-readable display name |
 | `description` | no | |
-| `base_model` | no | Default `ltx-2.3` |
+| `base_model` | no | Default `"ltx-2.3"` |
 | `trigger_word` | no | |
 | `strategy` | no | |
 
-- `400 Expected multipart/form-data` / `400 Missing 'file' field` / `400 File must be a .safetensors file`
-- `422 Missing 'name' field`
-- `413` if over `config.MAX_LORA_SIZE_BYTES`
-- `400` with a validation error text if the registry rejects it (e.g., duplicate id)
+**Response:** same row shape as `GET /v1/loras` items.
+**Errors:**
+- `400 "Expected multipart/form-data"`
+- `400 "Missing 'file' field"`
+- `400 "File must be a .safetensors file"`
+- `400 <validation error>` (e.g. duplicate id)
+- `422 "Missing 'name' field"`
+- `413 "File exceeds 1024MB limit"` (cap: `MAX_LORA_SIZE_BYTES = 1 GiB`)
 
-Returns the same row shape as `GET /v1/loras`.
+#### `DELETE /v1/loras/{lora_id}`
 
-### `DELETE /v1/loras/{lora_id}`
+- `200 {"deleted": true, "id": "<id>"}`
+- `404 "LoRA not found: <id>"`
 
-- `200 {"deleted": true, "id": "<id>"}` on success
-- `404 LoRA not found: <id>` otherwise
+### Flux LoRAs
 
----
+**Folder-drop model** — no upload endpoint. Files live under `FLUX_LORAS_DIR/`. The registry uses the slugified filename stem as the id. Optional sidecar `<stem>.json` adds metadata. Manage with `cp` / `rm` on the host, then `POST /v1/flux-loras/rescan`.
 
-## Flux LoRAs
-
-**Folder-drop model** — no upload endpoint. Files live under `FLUX_LORAS_DIR/`. The registry scans for `.safetensors`, using the slugified filename stem as the id. Optional sidecar `<stem>.json` adds metadata. Manage with `cp` / `rm` on the host, then `POST /v1/flux-loras/rescan`.
-
-### `GET /v1/flux-loras`
+#### `GET /v1/flux-loras`
 
 ```json
 {
@@ -984,164 +569,522 @@ Returns the same row shape as `GET /v1/loras`.
 }
 ```
 
-### `POST /v1/flux-loras/rescan`
+#### `POST /v1/flux-loras/rescan`
 
-Re-walks `FLUX_LORAS_DIR`. Returns `{"rescanned": true, "count": N}`.
+**Response:** `{"rescanned": true, "count": N}`.
 
 ---
 
-## Chat completions
+## v1 sync generation
 
-### `POST /v1/chat/completions`
+Synchronous endpoints block until the result media is in RAM and return it directly. Good for quick one-shots. **For anything more than a few requests, use [v2 async](#v2-async-generation).**
 
-Thin proxy to the external llama-swap server — the shape is OpenAI-compatible.
+All v1 generation endpoints can return:
+
+| Status | Condition |
+|---|---|
+| `503` | System paused, turbo mode conflict, ACE/JoyAI/ERNIE sidecar unavailable |
+| `500 "Flux not enabled"` / `"Flux pipeline not loaded"` | `LOAD_FLUX=0` and request targets Flux |
+| `404` | Referenced `storage://` not found, LoRA id not found |
+| `422` | Keyframe bounds, LoRA-model incompatibility, joyai-edit constraint violation, retake content rejection |
+| `500` | Generic failure; path-containing error messages are sanitized to `"Internal server error"` |
+
+### `POST /v1/text-to-video`
+
+**Body:** `TextToVideoRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | ≤ 10 000 chars |
+| `model` | [`ModelName`](#modelname-ltx-video) | required | |
+| `resolution` | [`Resolution`](#resolution) | required | |
+| `duration` | float | required | `0 < x ≤ 30` seconds |
+| `fps` | float | required | `0 < x ≤ 60` |
+| `generate_audio` | bool | `false` | |
+| `camera_motion` | string \| null | `null` | ≤ 200 chars; appended to prompt as `[...]` |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | |
+| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter |
+
+**Response:** `200 video/mp4` raw bytes.
+
+### `POST /v1/image-to-video`
+
+**Body:** `ImageToVideoRequest`. Accepts either `image_uri` (single start frame) OR `keyframes` (up to 8). Both → `422 "Cannot specify both image_uri and keyframes"`.
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | ≤ 10 000 chars |
+| `image_uri` | string \| null | `null` | `storage://<uuid>` (single keyframe at frame 0) |
+| `image_strength` | float | `0.85` | `0.0 ≤ x ≤ 1.0` |
+| `keyframes` | list\<[`KeyframeInput`](#keyframeinput)\> \| null | `null` | Max 8 |
+| `model` | [`ModelName`](#modelname-ltx-video) | required | |
+| `resolution` | [`Resolution`](#resolution) | required | |
+| `duration` | float | required | `0 < x ≤ 30` |
+| `fps` | float | required | `0 < x ≤ 60` |
+| `generate_audio` | bool | `false` | |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | |
+| `enhance_prompt` | bool | `false` | |
+
+**Response:** `200 video/mp4`.
+
+**Errors:** `422 "keyframes list must not be empty"`, `422 "At most 8 keyframes are allowed"`, `422 "Either image_uri or keyframes is required"`, `422 "Resolved frame_index N is out of range..."`, `422 "Duplicate frame_index values after resolution"`, `404` if any `storage://` URI fails to resolve.
+
+### `POST /v1/audio-to-video`
+
+**Body:** `AudioToVideoRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | ≤ 10 000 chars |
+| `audio_uri` | string | required | `storage://<uuid>` |
+| `image_uri` | string \| null | `null` | Optional conditioning image |
+| `model` | [`ModelName`](#modelname-ltx-video) | required | |
+| `resolution` | [`Resolution`](#resolution) | required | |
+| `duration` | float | `6.0` | `0 < x ≤ 30` |
+| `fps` | float | `24.0` | `0 < x ≤ 60` |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | |
+| `enhance_prompt` | bool | `false` | |
+
+**Response:** `200 video/mp4`.
+
+### `POST /v1/retake`
+
+**Body:** `RetakeRequest`. Regenerates a span of an existing video.
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `video_uri` | string | required | `storage://<uuid>` |
+| `start_time` | float | required | `≥ 0` seconds |
+| `duration` | float | required | `0 < x ≤ 30` |
+| `mode` | [`RetakeMode`](#retakemode) | required | |
+| `prompt` | string \| null | `null` | ≤ 10 000 chars |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | |
+
+**Response:** `200 video/mp4`. On any failure: `422 "Content rejected or generation failed: <detail>"`.
+
+### `POST /v1/text-to-image`
+
+**Body:** `TextToImageRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | ≤ 10 000 chars |
+| `model` | [`ImageModelName`](#imagemodelname) | `"flux2-dev"` | `ernie-image` routes to sidecar |
+| `width` | int | `1024` | `64 ≤ x ≤ 4096`, snapped to multiples of 16 |
+| `height` | int | `1024` | `64 ≤ x ≤ 4096`, snapped to multiples of 16 |
+| `num_inference_steps` | int | `50` | `1 ≤ x ≤ 100`; `turbo=true` overrides to `8` |
+| `guidance_scale` | float | `4.0` | `0 ≤ x ≤ 20`; `turbo=true` overrides to `2.5`. Klein silently ignores. |
+| `seed` | int \| null | `null` | `null` → random 32-bit uint |
+| `turbo` | bool | `false` | Flux only — adds `FLUX_TURBO_SIGMAS` schedule, forces 8 steps / guidance 2.5 |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | Flux-registry LoRA |
+
+**Response:** `200 image/webp` (lossless VP8L, quality 95).
+
+**`ernie-image` specifics:** Supported resolutions include 1024×1024, 848×1264, 1264×848. `lora` ignored. Returns `503 "ernie_disabled"` if `LOAD_ERNIE=0` or sidecar unreachable.
+
+**Errors:** `500 "Flux not enabled"` if `LOAD_FLUX=0`; `422 <flux lora error>` (e.g. LoRA-model incompat).
+
+### `POST /v1/image-to-image`
+
+**Body:** `ImageToImageRequest` — same fields as `text-to-image` plus required `image_uri`.
+
+| Field | Type | Constraint |
+|---|---|---|
+| `image_uri` | string | required, `storage://<uuid>` |
+| *all other fields same as [`/v1/text-to-image`](#post-v1text-to-image)* | | |
+
+**Response:** `200 image/webp`.
+
+### `POST /v1/image-edit`
+
+**Body:** `ImageEditRequest`. Dispatches to Flux (Dev or Klein, multi-image) or JoyAI (single-image sidecar) based on `model`.
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | ≤ 10 000 chars |
+| `image_uris` | list\<string\> | required | Length `1–10` for `flux2-dev`/`flux2-klein`; **exactly `1`** for `joyai-edit` |
+| `model` | [`ImageModelName`](#imagemodelname) | `"flux2-klein"` | `joyai-edit` routes to cuda:1 sidecar |
+| `width` | int | `1024` | `64 ≤ x ≤ 4096`, snapped to 16 |
+| `height` | int | `1024` | `64 ≤ x ≤ 4096`, snapped to 16 |
+| `num_inference_steps` | int | `4` | `1 ≤ x ≤ 100`. JoyAI default is 30 (passed by client). |
+| `guidance_scale` | float | `4.0` | Klein ignores. JoyAI respects. |
+| `seed` | int \| null | `null` | |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | Flux only; **NOT supported for `joyai-edit` (422)** |
+
+**Response:** `200 image/webp`.
+
+**JoyAI specifics:**
+- `image_uris` must be length 1 — otherwise `422 "joyai-edit requires exactly one image_uri"`.
+- Prompts are plain English. The server wraps them in `<|im_start|>user\n<image>\n{prompt}<|im_end|>\n` before dispatch.
+- Returns `503 "JoyAI not enabled (LOAD_JOYAI=0)"` if `LOAD_JOYAI` is unset.
+- Returns `503 "sidecar_unreachable"` if the joyai-sidecar process is down. Clients should fall back to `flux2-klein`.
+- Auto-exits turbo mode if active (blocks ~15 s).
+
+### `POST /v1/music`
+
+**Body:** `MusicGenerationRequest`. Blocks until audio is ready.
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | ≤ 10 000 chars |
+| `lyrics` | string | `"[Instrumental]"` | ≤ 50 000 chars |
+| `duration` | float | `60.0` | `0 < x ≤ 600` seconds |
+| `audio_format` | enum | `"mp3"` | `"mp3"` \| `"flac"` \| `"wav"` \| `"wav32"` \| `"opus"` \| `"aac"` |
+| `seed` | int \| null | `null` | |
+| `bpm` | int \| null | `null` | `30 ≤ x ≤ 300` |
+| `key_scale` | string \| null | `null` | e.g. `"C major"` |
+| `time_signature` | string \| null | `null` | e.g. `"4/4"` |
+| `vocal_language` | string \| null | `null` | e.g. `"en"` |
+| `num_inference_steps` | int | `50` | `1 ≤ x ≤ 200` |
+| `guidance_scale` | float | `7.0` | `0 ≤ x ≤ 15` |
+| `shift` | float | `3.0` | `1.0 ≤ x ≤ 5.0` |
+| `infer_method` | enum | `"ode"` | `"ode"` \| `"sde"` |
+| `use_adg` | bool | `false` | |
+| `cfg_interval_start` | float | `0.0` | `0 ≤ x ≤ 1` |
+| `cfg_interval_end` | float | `1.0` | `0 ≤ x ≤ 1` |
+| `batch_size` | int | `1` | `1 ≤ x ≤ 8` |
+| `task_type` | enum | `"text2music"` | `"text2music"` \| `"cover"` \| `"repaint"` \| `"extract"` \| `"lego"` \| `"complete"` |
+| `source_audio_uri` | string \| null | `null` | Required for cover/repaint/extract/lego/complete |
+| `reference_audio_uri` | string \| null | `null` | Optional reference audio |
+| `audio_cover_strength` | float | `1.0` | `0 ≤ x ≤ 1` |
+| `repainting_start` | float | `0.0` | `≥ 0` |
+| `repainting_end` | float \| null | `null` | |
+| `repaint_mode` | enum | `"balanced"` | `"conservative"` \| `"balanced"` \| `"aggressive"` |
+| `repaint_strength` | float | `0.5` | `0 ≤ x ≤ 1` |
+| `track_name` | string \| null | `null` | Required for extract/lego/complete |
+| `thinking` | bool | `false` | LM thinking mode |
+| `sample_mode` | bool | `false` | |
+| `sample_query` | string \| null | `null` | |
+| `lm_temperature` | float | `0.85` | `0 ≤ x ≤ 2` |
+| `lm_top_p` | float | `0.9` | `0 ≤ x ≤ 1` |
+
+**Task-type constraints:**
+- `cover` / `repaint` / `extract` / `lego` / `complete` require `source_audio_uri` → else `422 "task_type '<t>' requires source_audio_uri"`.
+- `extract` / `lego` / `complete` additionally require `track_name` → else `422 "task_type '<t>' requires track_name"`.
+
+**Response:** raw audio bytes; Content-Type derived from `audio_format` (`mp3` → `audio/mpeg`, `flac` → `audio/flac`, `wav`/`wav32` → `audio/wav`, `opus` → `audio/opus`, `aac` → `audio/aac`).
+
+**Errors:**
+- `503 "System is paused for maintenance"`
+- `503 "Music generation not enabled (LOAD_ACE=0)"`
+- `404 "source_audio_uri not found"` / `"reference_audio_uri not found"`
+- The v1 handler auto-exits turbo if active (blocks ~15 s).
+
+---
+
+## v2 async generation
+
+v2 endpoints return `202 Accepted` with a `job_id`. Poll [`GET /v2/jobs/{id}`](#get-v2jobsjob_id) until `status == "completed"`, then GET the result URL — or subscribe to [`GET /v2/jobs/{id}/stream`](#get-v2jobsjob_idstream) for push updates.
+
+### Submission envelope
+
+Every v2 submit returns this `202` body (`MusicGenerationRequest` included):
 
 ```json
 {
-  "model": "gemma-3-12b-nvfp4",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello"}
+  "job_id": "job_01H...",
+  "status": "queued",
+  "poll_url": "/v2/jobs/job_01H...",
+  "stream_url": "/v2/jobs/job_01H.../stream"
+}
+```
+
+**Shared submission errors:**
+- `503 {"error": "system_paused"}` + `Retry-After: 300`
+- `429 {"error": "queue_full"}` + `Retry-After: 30` (v2 depth ≥ `MAX_QUEUE_DEPTH = 10`)
+- `429 {"error": "music_queue_full"}` + `Retry-After: 30` (music only; ≥ `MAX_MUSIC_PENDING = 5`)
+- `503 {"error": "turbo_mode_active: ACE/JoyAI unavailable while turbo mode is enabled..."}` + `Retry-After: 10` (music only)
+- `503 "Music generation not enabled (LOAD_ACE=0)"` (music only)
+- Validation errors bubble up as `422` / `404` (LoRA not found, referenced URI not resolvable) from body-prep helpers before the job is enqueued.
+
+### Endpoints
+
+All accept the **same bodies** as their v1 counterparts.
+
+| Endpoint | Request shape | JobType | Result media type |
+|---|---|---|---|
+| `POST /v2/text-to-video` | `TextToVideoRequest` | `TEXT_TO_VIDEO` | `video/mp4` |
+| `POST /v2/image-to-video` | `ImageToVideoRequest` | `IMAGE_TO_VIDEO` | `video/mp4` |
+| `POST /v2/audio-to-video` | `AudioToVideoRequest` | `AUDIO_TO_VIDEO` | `video/mp4` |
+| `POST /v2/retake` | `RetakeRequest` | `RETAKE` | `video/mp4` |
+| `POST /v2/video-outpaint` | `VideoOutpaintRequest` | `VIDEO_OUTPAINT` | `video/mp4` (silent) |
+| `POST /v2/text-to-image` | `TextToImageRequest` | `TEXT_TO_IMAGE` | `image/webp` |
+| `POST /v2/image-to-image` | `ImageToImageRequest` | `IMAGE_TO_IMAGE` | `image/webp` |
+| `POST /v2/image-edit` | `ImageEditRequest` | `IMAGE_EDIT` | `image/webp` |
+| `POST /v2/music` | `MusicGenerationRequest` | `MUSIC_GENERATION` | mirrors `audio_format` |
+
+### `POST /v2/video-outpaint`
+
+**NEW in v1.7.0.** Expands a source video's canvas by letterboxing it into `target_resolution` with pure-black padding, then uses the **IC-LoRA Outpaint** LoRA (default id `ic-lora-outpaint`) to fill the black regions with temporally coherent content. Async only — no v1 sync endpoint.
+
+**Body:** `VideoOutpaintRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `video_uri` | string | required | `storage://<uuid>` — source video |
+| `prompt` | string | required | ≤ 10 000 chars — describes desired fill |
+| `target_resolution` | [`Resolution`](#resolution) | required | Final canvas size |
+| `position` | [`OutpaintPosition`](#outpaintposition-v170) | `"center"` | Where source video sits within target canvas |
+| `duration` | float | required | `0 < x ≤ 30` seconds — output duration |
+| `fps` | float | required | `0 < x ≤ 60` |
+| `seed` | int | `0` | `≥ 0`; `0` → server picks a random 32-bit uint |
+| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | `null` → defaults to `{"id": "ic-lora-outpaint", "strength": 1.0}`. Can point at any registered LTX IC-LoRA. |
+| `conditioning_strength` | float | `1.0` | `0.0 ≤ x ≤ 1.0` — scalar attention weight on the IC-LoRA conditioning; values < 1 loosen fidelity to the source |
+| `skip_stage_2` | bool | `false` | `true` → faster preview at half target resolution, lower quality |
+
+**Response:** `202` + submission envelope. Output is **silent MP4** (no audio passthrough — deferred to v1.7.x).
+
+**Latency** (measured):
+- `skip_stage_2=true`: ~20 s for 3 s output at 1920×1080.
+- Full 2-stage, 5 s output at 1920×1080: ~35–45 s.
+
+**Known limitations:**
+- **Dark-content gotcha:** the LoRA treats pure black (RGB 0,0,0) as the fill sentinel. Very dark source content (night scenes, deep shadows) can confuse this heuristic — the model may "fill" content where you wanted the source preserved. Workaround: gamma 2.0 on the source before upload, gamma 0.5 on the output after decode.
+- **Default `reference_downscale_factor` is 1** — the reference latent stays at stage-1 resolution. LoRA metadata override is supported but not exposed on the request body.
+- **Stage 2 keeps LoRA fused** — upstream ICLoraPipeline drops the LoRA for stage 2, but our cache-key design would cost ~30 s to reload. Accepted deviation; image quality matches upstream closely.
+- `lora` must resolve in the LTX registry — `404 "LoRA not found: <id>"` if missing. If the default id `ic-lora-outpaint` isn't registered: `500 "outpaint LoRA resolve returned None — registry misconfigured"`.
+
+**Example:**
+
+```json
+{
+  "video_uri": "storage://abc-123",
+  "prompt": "extend the scene naturally, matching lighting and style",
+  "target_resolution": "1920x1080",
+  "position": "center",
+  "duration": 5.0,
+  "fps": 24,
+  "seed": 42,
+  "enhance_prompt": false,
+  "lora": null,
+  "conditioning_strength": 1.0,
+  "skip_stage_2": false
+}
+```
+
+---
+
+## Jobs lifecycle
+
+### `GET /v2/jobs/{job_id}`
+
+Status poll snapshot.
+
+```json
+{
+  "job_id": "job_...",
+  "status": "queued" | "processing" | "completed" | "failed" | "cancelled",
+  "type": "text-to-video" | "image-to-video" | "audio-to-video" | "retake" | "video-outpaint" | "text-to-image" | "image-to-image" | "image-edit" | "music-generation" | "export-composition",
+  "progress": 0.42,
+  "phase": "denoising" | "decoding" | "encoding" | "saving" | "generating" | null,
+  "queue_position": 3,
+  "error": {"code": "generation_failed", "message": "..."} | null,
+  "result_url": "/v2/jobs/job_.../result" | null,
+  "result_storage_uri": "storage://..." | null,
+  "result_media_type": "video/mp4" | "image/webp" | "audio/mpeg" | null
+}
+```
+
+**Field semantics:**
+- `progress` — only populated while `processing` (range `0.0–1.0`). Denoising callbacks cap at **0.90**; the top 10% is reserved for post-denoise phases. Completed jobs report `1.0`.
+- `phase` — only populated while `processing`. LTX sequence: `denoising` → `decoding` (VAE) → `encoding` (ffmpeg) → `saving` (upload_store write). Flux: `denoising` → `encoding` (WEBP) → `saving`. Music jobs use `phase="generating"` for the entire ACE call. JoyAI jobs emit `phase="encoding"` for the entire ~78 s sidecar call (opaque to per-step callbacks) — render a spinner, not a moving percentage.
+- `queue_position` — only populated while `queued`.
+- `result_*` — only populated when `completed`.
+- `error.code` — see [Error taxonomy](#error-taxonomy) for the full set.
+
+**Errors:** `404 "Job not found"`.
+
+### `GET /v2/jobs/{job_id}/stream`
+
+**Server-Sent Events stream for live job state. Use this instead of polling.** One long-lived connection replaces the ~240 GETs per video job.
+
+**Auth:** bearer `Authorization` header (programmatic clients) OR `?token=<sse-token>` query param (browsers — issue one via [`POST /v1/sse-token`](#post-v1sse-token)).
+
+**Event format:** each `data:` line contains the same JSON snapshot as `GET /v2/jobs/{id}`. Keepalive comments (`: keepalive`) every 15 s during idle periods. Terminal states (completed / failed / cancelled) emit one final event and close the stream. If the job is evicted mid-stream: `event: error\ndata: {"error": "job_expired"}\n\n`, then close.
+
+**Delivery semantics:**
+- Emits one event immediately on connect with the current state.
+- Emits again when `(status, progress rounded to 3 decimals, phase, error_code)` changes.
+- Poll loop runs at 250 ms; disconnects are detected via `request.is_disconnected()`.
+
+**Status codes:**
+- `200 text/event-stream` — stream opened.
+- `401 "Missing API key"` — neither bearer nor valid token.
+- `404 "Job not found"` — unknown job id (before stream opens).
+
+**Browser example:**
+
+```js
+const { job_id } = await fetch("/v2/text-to-video", { /* ... */ }).then(r => r.json());
+const { token } = await fetch("/v1/sse-token", {
+  method: "POST",
+  headers: { Authorization: `Bearer ${KEY}` }
+}).then(r => r.json());
+
+const es = new EventSource(`/v2/jobs/${job_id}/stream?token=${token}`);
+es.onmessage = (ev) => {
+  const { progress, phase, status, result_url } = JSON.parse(ev.data);
+  setProgress(progress);
+  setPhase(phase);
+  if (status === "completed") {
+    fetch(result_url, { headers: { Authorization: `Bearer ${KEY}` } })
+      .then(r => r.blob()).then(showResult);
+    es.close();
+  } else if (status === "failed" || status === "cancelled") {
+    es.close();
+  }
+};
+es.addEventListener("error", () => { /* connection dropped or server error event */ });
+```
+
+**curl example:**
+```bash
+curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JID/stream"
+```
+
+### `GET /v2/jobs/{job_id}/preview`
+
+Returns a low-res preview JPEG through a 4-path decision:
+
+| State | Response |
+|---|---|
+| `job.preview_bytes` cached (Flux step-end callback or worker backfill) | `200 image/jpeg` |
+| Completed result; on-disk thumbnail from `history.save()` exists | `200 image/jpeg` (zero-copy `FileResponse`) |
+| Completed video job; no on-disk thumbnail; lazy PyAV first-frame extraction succeeds | `200 image/jpeg` (cached on job for subsequent polls) |
+| Queued / processing / no preview data | `204 No Content` — **not** `404`. Keep polling. |
+| Unknown job id | `404 "Job not found"` |
+
+Frontends must treat `204` as "no preview yet, keep polling". `404` shows up red in dev tools and confuses users.
+
+### `GET /v2/jobs/{job_id}/result`
+
+Download final media. Returns zero-copy `FileResponse` with `Cache-Control: no-store`.
+
+- `200` — `Content-Type` matches `job.result_media_type`.
+- `404 "Job not found"` — unknown id.
+- `409 "Job result not ready"` — job not `completed`.
+- `404 "Result file expired or not found"` — on-disk file missing (TTL eviction).
+
+### `DELETE /v2/jobs/{job_id}`
+
+Cancel a queued or processing job.
+
+- `200 {"job_id": "...", "status": "cancelled"}` — cancel accepted.
+- `404 "Job not found"` — unknown id.
+- `409 "Cannot cancel a finished job"` — already completed/failed/cancelled.
+
+Cancellation of a `processing` job is best-effort: the denoiser checks a cancel flag between steps, and post-denoise phases are cooperative.
+
+---
+
+## Batch scheduler
+
+Submit multiple generation jobs as a single batch. Items execute sequentially (or 2-at-a-time in turbo mode), sorted to minimize GPU swaps — all images before all videos, Klein before Dev within images. Auto-turbo may engage if cuda:1 has been idle ≥ `AUTO_TURBO_IDLE_MINUTES` (default 15) and the batch has ≥ 2 items.
+
+### `POST /v2/batch`
+
+**Body:** `BatchRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `items` | list\<`BatchItem`\> | required | `1 ≤ length ≤ MAX_BATCH_ITEMS (50)` |
+| `items[].type` | enum | required | `"text-to-image"` \| `"image-to-image"` \| `"image-edit"` \| `"text-to-video"` \| `"image-to-video"` (note: a2v, retake, outpaint, music NOT supported in batch) |
+| `items[].params` | object | required | Must validate against the matching Pydantic request model for the type |
+| `priority` | enum | `"normal"` | `"normal"` \| `"high"` |
+| `callback_url` | string \| null | `null` | Optional webhook; POSTed on completion with 3 retries (delays `[1, 5, 15]` s) |
+
+**Response:** `202`
+```json
+{
+  "batch_id": "batch_...",
+  "status": "queued",
+  "total": 2,
+  "queue_position": 0
+}
+```
+
+**Errors:**
+- `503 {"error": "system_paused"}` + `Retry-After: 300`
+- `429 {"error": "batch_queue_full"}` + `Retry-After: 30` (depth ≥ `MAX_BATCH_QUEUE_DEPTH = 5`)
+- `400 "Invalid item type at index N: ..."`
+- `422 "Validation failed at item N (<type>): <detail>"`
+
+### `GET /v2/batch/{batch_id}`
+
+Poll batch status + partial results.
+
+```json
+{
+  "batch_id": "batch_...",
+  "status": "queued" | "processing" | "completed" | "partial" | "failed" | "cancelled",
+  "total": 5,
+  "completed_count": 3,
+  "failed_count": 0,
+  "current_index": 3,
+  "turbo": false,
+  "results": [
+    {
+      "index": 0,
+      "type": "text-to-image",
+      "status": "completed" | "failed" | "cancelled",
+      "result_uri": "storage://...",
+      "result_url": "/v2/batch/batch_.../result/0",
+      "media_type": "image/webp",
+      "error": null,
+      "elapsed_s": 3.2
+    }
   ],
-  "temperature": 0.7,
-  "max_tokens": 512
+  "created_at": 1712345678.9,
+  "started_at": 1712345679.0,
+  "completed_at": null
 }
 ```
 
-`content` can be a string (plain text) or an OpenAI multimodal list (`[{"type": "text", ...}, {"type": "image_url", ...}]`).
+**Status semantics:**
+- `completed` — all items succeeded.
+- `partial` — some items succeeded, some failed.
+- `failed` — all items failed.
 
-Response: raw OpenAI chat-completion JSON, passed through from the upstream.
+**Errors:** `404 "Batch not found"`.
 
-- `500 Chat model not loaded` if the proxy isn't configured.
-- `422 Messages list cannot be empty`.
+### `GET /v2/batch/{batch_id}/result/{index}`
 
----
+Download the result file for a completed batch item.
 
-## SSE session tokens
+- `200 <media_type>` — `Cache-Control: no-store`, zero-copy `FileResponse`.
+- `404 "Batch not found"` — unknown batch id.
+- `404 "Batch item not found or not completed"` — bad index or item not yet complete.
+- `404 "Result file expired or not found"` — on-disk file missing.
 
-### `POST /v1/sse-token`
+Result files retained for `BATCH_RESULT_TTL_SECONDS = 1800` (30 min) after batch completion; cleanup loop runs every 60 s.
 
-EventSource can't send custom headers, so SSE endpoints accept a short-lived query-param token instead of a bearer header.
+### `DELETE /v2/batch/{batch_id}`
 
-```json
-{"token": "<32 url-safe bytes>", "expires_in": 300}
-```
+Cancel remaining items. Currently-running item (if any) will finish.
 
-- `401 Missing API key` if no valid bearer token in the request.
-- Tokens are single-use in the sense that they expire after 5 minutes. No refresh.
-- Pass to SSE as `?token=...`.
-
----
-
-## Approved images
-
-A per-API-key "approved feed" — noodle-i approves an image, noodle-v watches the feed.
-
-### `POST /v1/approved-images` — `201`
-
-```json
-{
-  "image_uri": "storage://...",
-  "prompt": "...",
-  "model": "flux2-dev",
-  "width": 1024,
-  "height": 1024
-}
-```
-
-Response: `{"id": "<16 hex>", "status": "approved"}`. `401` if no api key, `400` if `image_uri` is missing.
-
-### `GET /v1/approved-images?limit=50&offset=0`
-
-Returns a JSON array of entries (per-api-key scoped):
-
-```json
-[
-  {
-    "id": "...",
-    "image_uri": "storage://...",
-    "prompt": "...",
-    "model": "flux2-dev",
-    "width": 1024,
-    "height": 1024,
-    "created_at": 1712345678.9,
-    "image_url": "/v1/approved-images/<id>/file"
-  }
-]
-```
-
-`limit` is clamped elsewhere; default 50. `api_key_hash` is stripped from responses.
-
-### `GET /v1/approved-images/events` — SSE (no bearer required)
-
-Accepts `?token=<sse-token>` OR a bearer header. Streams newly-added entries as they land:
-
-```
-data: {"id": "...", "image_uri": "...", "image_url": "/v1/approved-images/.../file", ...}
-
-```
-
-Heartbeat: polls the manifest every 2 s via `mtime`. Closes on client disconnect. `401` if neither token nor bearer resolves.
-
-### `GET /v1/approved-images/{image_id}/file`
-
-Returns `image/webp` (or the original file's mime if different). `404` if the manifest entry doesn't exist for this api key or the file has been evicted.
+- `200 {"batch_id": "...", "status": "cancelled", "completed_count": 2, "cancelled_count": 3}`
+- `404 "Batch not found"`
+- `409 {"error": "batch_already_finished", "batch_id": "...", "status": "<terminal>"}` — already completed/failed/cancelled.
 
 ---
 
-## Character-consistency vision ranking
+## History
 
-### `POST /v2/char/rank`
+Per-API-key history of completed v2 jobs, keyed by SHA-256 of the raw bearer key (keys are never stored). Thumbnails at `THUMBNAIL_DIR/thumb_<uuid>` (JPEG 256 px wide). 30-day retention. SQLite WAL mode.
 
-Routes a two-image comparison to the Gemma 4 31B vision model on llama-swap. Used by noodle-i's character mode to score generated outputs against a reference.
+### `GET /v2/history`
 
-```json
-{
-  "rank_image_uri": "storage://ref",
-  "generated_image_uri": "storage://gen",
-  "prompt": "The original generation prompt"
-}
-```
+Query params:
+- `limit` — default 50, clamped to 200.
+- `offset` — default 0.
+- `type` — optional filter:
+  - `"image"` — any `*-image*` type
+  - `"video"` — any `*-video*` or `retake` type
+  - explicit JobType string, e.g. `"text-to-video"`
+  - unset → all
 
-Response: a strict-JSON body produced by the vision model:
-
-```json
-{
-  "score": 8.25,
-  "analysis": {
-    "face_match": 9,
-    "eyes": 8,
-    "proportions": 8,
-    "overall_likeness": 8
-  },
-  "edits": {
-    "add": ["slightly narrower jawline"],
-    "remove": [],
-    "modify": {}
-  }
-}
-```
-
-- `404` if either storage URI can't be resolved.
-- `500 Chat model not loaded` if the llama-swap proxy isn't ready.
-- `500 Vision model did not return valid JSON` if the model output can't be parsed.
-
----
-
-## Generation history
-
-Per-api-key history of completed v2 jobs, with thumbnails, keyed by SHA-256 of the api key. 30-day retention.
-
-### `GET /v2/history?limit=50&offset=0&type=<filter>`
-
-`type` can be:
-
-- `"image"` — any `*-image*` job type
-- `"video"` — any `*-video*` job type
-- A specific job type string (e.g., `"text-to-video"`)
-- Unset — all types
-
-Response is a JSON array; `limit` is clamped to `200`. **The list response shape is unchanged from v1.2** — the new full-fidelity fields (`seed`, `enhanced_prompt`, `params`, `gen_config`) are only returned by `GET /v2/history/{id}` below.
+**Response shape** (list — slimmer than the single-record shape; no `params`/`gen_config`/`seed`/`enhanced_prompt`):
 
 ```json
 [
@@ -1161,22 +1104,16 @@ Response is a JSON array; `limit` is clamped to `200`. **The list response shape
 ]
 ```
 
-### `GET /v2/history/{generation_id}` — full record (v1.3)
+### `GET /v2/history/{generation_id}`
 
-Returns the complete history row for a single generation, including the raw request body (`params`) and the generation-config snapshot captured at dispatch time (`gen_config`). Use this to reproduce a run, populate a "reuse settings" button, or show full provenance.
-
-- Bearer auth required.
-- Path param: `generation_id` (the job id returned by `POST /v2/*`).
-- `404` if the entry doesn't exist **or** belongs to a different API key — the ID space can't be probed.
-
-Response (200):
+Full record — includes raw request body (`params`), gen-config snapshot (`gen_config`), resolved `seed`, and `enhanced_prompt` text.
 
 ```json
 {
   "id": "job_...",
   "job_type": "text-to-video",
-  "prompt": "a neon jellyfish drifting through a rainstorm",
-  "enhanced_prompt": "A bioluminescent jellyfish ...",
+  "prompt": "...",
+  "enhanced_prompt": "A bioluminescent jellyfish..." | null,
   "model": "ltx-2-3-pro",
   "width": 1920,
   "height": 1080,
@@ -1186,202 +1123,191 @@ Response (200):
   "created_at": 1712345678.9,
   "completed_at": 1712345745.2,
   "error": null,
-  "result_url": "/v2/history/job_.../image",
-  "thumbnail_url": "/v2/history/job_.../thumbnail",
-  "params": { "...": "raw request body — see Captured params below" },
-  "gen_config": { "...": "LTX snapshot or Flux turbo snapshot — see gen_config snapshot below" }
+  "result_url": "/v2/history/job_.../image" | null,
+  "thumbnail_url": "/v2/history/job_.../thumbnail" | null,
+  "params": { "...": "raw Pydantic body" },
+  "gen_config": { "...": "LTX _gen_config snapshot OR Flux turbo snapshot OR null" }
 }
 ```
 
-Field notes:
+**Field semantics:**
+- `seed` — integer. If the client omitted it, the server auto-generated one; the stored value is what was actually used.
+- `enhanced_prompt` — text of the LTX-rewritten prompt when `enhance_prompt=true`. `null` for Flux/ERNIE/JoyAI/retake/outpaint and for any LTX request where `enhance_prompt=false`.
+- `params` — raw request body from `body.model_dump(mode="json")`. Preserves `storage://` URIs, `Resolution` enum string, `LoRAInput` `{id, strength}` shape, keyframe symbolic indices. Music jobs pass params through `_sanitize_params_for_history` to rewrite staged `/tmp/*` paths back to `storage://`.
+- `gen_config`:
+  - LTX jobs (`text-to-video`, `image-to-video`, `audio-to-video`, `retake`, `video-outpaint`) → snapshot of `_gen_config` at dispatch time (13 keys: sampler, etas, step counts, scheduler shifts, CFG/STG/rescale/modality scales, stg_blocks, stage2_sigmas).
+  - Flux turbo jobs (`text-to-image`, `image-to-image`, `image-edit` with `turbo=true`) → `{"turbo_steps": 8, "turbo_guidance": 2.5}`.
+  - Non-turbo Flux / ERNIE / JoyAI → `null`. Tunables live in `params`.
 
-- `seed` — always an integer for completed generations. If the client omitted it, the server auto-generated one; the stored value is what was actually used.
-- `enhanced_prompt` — the LTX-rewritten prompt text when `enhance_prompt=true` was set on the request. `null` for Flux / ERNIE / JoyAI / retake (no prompt-enhancement pipeline on those paths) and for any LTX request that left `enhance_prompt=false`.
-- `params` — the raw Pydantic request body (`body.model_dump(mode="json")`). Preserves `storage://` URIs, resolution enum strings, LoRA `{id, strength}` shape, and keyframe symbolic indices. Music jobs run the body through a sanitizer that rewrites staged `/tmp/*` paths back to `storage://` URIs.
-- `gen_config` — LTX `_gen_config` snapshot at dispatch time, or a Flux `{turbo_steps, turbo_guidance}` snapshot when `turbo=true`. `null` for non-turbo Flux, ERNIE-Image, and JoyAI.
-- `result_url` / `thumbnail_url` — `null` on failed rows.
-
-#### Captured params by job type
-
-Shape of the `params` object for each `job_type`. Fields reflect the corresponding Pydantic request body; unset optional fields are omitted by `model_dump`.
-
-**`text-to-video`** (`TextToVideoRequest`):
-
-```json
-{
-  "prompt": "a cat riding a horse",
-  "model": "ltx-2-3-pro",
-  "resolution": "1920x1080",
-  "duration": 5.0,
-  "fps": 24,
-  "generate_audio": false,
-  "camera_motion": "slow pan left",
-  "lora": {"id": "cinematic", "strength": 0.8},
-  "enhance_prompt": true
-}
-```
-
-**`image-to-video`** — adds `image_uri` OR `keyframes`:
-
-```json
-{
-  "prompt": "the subject walks forward",
-  "image_uri": "storage://abc-123",
-  "image_strength": 0.85,
-  "keyframes": [
-    {"image_uri": "storage://a", "frame_index": "first", "strength": 1.0},
-    {"image_uri": "storage://b", "frame_index": "last",  "strength": 1.0}
-  ],
-  "model": "ltx-2-3-fast",
-  "resolution": "1280x720",
-  "duration": 4.0, "fps": 24,
-  "lora": null, "enhance_prompt": false
-}
-```
-
-**`audio-to-video`** — adds `audio_uri`, optional `image_uri`:
-
-```json
-{
-  "prompt": "a dancer moves to the beat",
-  "audio_uri": "storage://track-uuid",
-  "image_uri": "storage://ref-uuid",
-  "model": "ltx-2-3-fast",
-  "resolution": "1280x720",
-  "duration": 6.0, "fps": 24,
-  "lora": null, "enhance_prompt": false
-}
-```
-
-**`retake`** — adds `video_uri`, `start_time`, `mode`:
-
-```json
-{
-  "video_uri": "storage://clip-uuid",
-  "start_time": 2.5,
-  "duration": 4.0,
-  "mode": "motion_retake",
-  "prompt": "stronger hand gesture",
-  "lora": null
-}
-```
-
-**`text-to-image`** (`TextToImageRequest`):
-
-```json
-{
-  "prompt": "cinematic portrait, studio lighting",
-  "model": "flux2-dev",
-  "width": 1024, "height": 1024,
-  "num_inference_steps": 50,
-  "guidance_scale": 4.0,
-  "seed": 845210937,
-  "turbo": false,
-  "lora": {"id": "film-grain", "strength": 0.6}
-}
-```
-
-**`image-to-image`** — same shape as `text-to-image`, adds `image_uri`:
-
-```json
-{
-  "prompt": "repaint in oil-painting style",
-  "image_uri": "storage://src-uuid",
-  "model": "flux2-dev",
-  "width": 1024, "height": 1024,
-  "num_inference_steps": 50,
-  "guidance_scale": 4.0,
-  "seed": 1234567,
-  "turbo": false,
-  "lora": null
-}
-```
-
-**`image-edit`** — same shape as `text-to-image`, adds `image_uris` (1–10):
-
-```json
-{
-  "prompt": "make the subject wear a red jacket",
-  "image_uris": ["storage://a", "storage://b"],
-  "model": "flux2-klein",
-  "width": 1024, "height": 1024,
-  "num_inference_steps": 4,
-  "guidance_scale": 4.0,
-  "seed": null,
-  "lora": null
-}
-```
-
-**`music`** (`MusicGenerationRequest`):
-
-```json
-{
-  "prompt": "uplifting cinematic synthwave",
-  "lyrics": "[Instrumental]",
-  "duration": 60.0,
-  "task_type": "text2music",
-  "num_inference_steps": 50,
-  "guidance_scale": 7.0,
-  "bpm": 120,
-  "key_scale": "C minor",
-  "source_audio_uri": "storage://stem-uuid"
-}
-```
-
-#### `gen_config` snapshot
-
-**LTX jobs** (`text-to-video`, `image-to-video`, `audio-to-video`, `retake`) capture a snapshot of `split_model_manager._gen_config` at dispatch time:
-
-```json
-{
-  "sampler": "cfg_pp",
-  "eta_stage1": 1.0,
-  "eta_default": 0.0,
-  "fast_stage1_steps": 8,
-  "pro_stage1_steps": 30,
-  "scheduler_max_shift": 2.05,
-  "scheduler_base_shift": 0.95,
-  "cfg_scale": 3.0,
-  "stg_scale": 1.0,
-  "stg_blocks": [28],
-  "rescale_scale": 0.7,
-  "modality_scale": 3.0,
-  "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0]
-}
-```
-
-**Flux turbo jobs** (`text-to-image`, `image-to-image`, `image-edit` with `turbo=true`) capture only the turbo sigma schedule inputs:
-
-```json
-{"turbo_steps": 8, "turbo_guidance": 2.5}
-```
-
-**Non-turbo Flux, ERNIE-Image, and JoyAI**: `gen_config` is `null`. All tunable parameters for those paths already live in `params` (steps, guidance, seed, etc.).
+**Errors:** `401 "Missing API key"`; `404 "Not found"` (also returned when the entry belongs to another key — IDs can't be probed).
 
 ### `GET /v2/history/{generation_id}/image`
 
-Returns the full-size generation. Media type is `video/mp4` for video jobs, `image/webp` otherwise. `404` if the entry or file is missing.
+Full-size result. Content-Type: `video/mp4` for video types, `image/webp` otherwise.
+
+- `200` — `FileResponse`.
+- `401` — no API key.
+- `404 "Not found"` — unknown entry or owned by another key.
+- `404 "Result file not found"` — on-disk file missing.
 
 ### `GET /v2/history/{generation_id}/thumbnail`
 
-Returns `image/jpeg` (256 px wide). For video jobs, the thumbnail is the first frame extracted via PyAV. `404` if no thumbnail was produced (very old entries, or decode failures).
+`200 image/jpeg` — 256 px wide. For video jobs the thumbnail is the first frame extracted via PyAV.
+
+- `401` — no API key.
+- `404 "Not found"` — unknown entry / owned by another key / no thumbnail stored.
+- `404 "Thumbnail not found"` — thumbnail file missing on disk.
 
 ### `DELETE /v2/history/{generation_id}`
 
-Removes a history entry and its associated result/thumbnail files. Scoped to the caller's API key — returns `404` both when the entry doesn't exist and when it belongs to another key (so the ID space can't be probed).
+Removes the history entry and its result/thumbnail files. Scoped to caller's API key.
 
-- `200 {"ok": true}` on success.
-- `401` if no API key.
-- `404` if not found or owned by another key.
+- `200 {"ok": true}`.
+- `401` — no API key.
+- `404 "Not found"` — unknown OR owned by another key.
+
+---
+
+## Chat & vision
+
+### `POST /v1/chat/completions`
+
+Proxies to the external llama-swap server. OpenAI-compatible shape.
+
+**Body:** `ChatCompletionRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `model` | string | `"gemma-3-12b-nvfp4"` | `llama-swap` model id |
+| `messages` | list\<`ChatMessage`\> | required | Non-empty |
+| `messages[].role` | string | required | `"system"` \| `"user"` \| `"assistant"` |
+| `messages[].content` | string \| list | required | Plain text string, OR OpenAI multimodal array `[{"type": "text", ...}, {"type": "image_url", ...}]` |
+| `temperature` | float | `0.7` | `0 ≤ x ≤ 2.0` |
+| `max_tokens` | int | `512` | `1 ≤ x ≤ 8192` |
+
+**Response:** raw OpenAI chat-completion JSON, passed through from upstream.
+
+**Errors:**
+- `500 "Chat model not loaded"` — proxy not configured.
+- `422 "Messages list cannot be empty"`.
+- `500 <sanitized>` on upstream failure.
+
+### `POST /v2/char/rank`
+
+Two-image comparison routed to the Gemma 4 31B vision model (via `CHAR_VISION_MODEL` override on llama-swap). Used by noodle-i character mode.
+
+**Body:** `CharRankRequest`
+
+| Field | Type | Constraint |
+|---|---|---|
+| `rank_image_uri` | string | Reference character image, `storage://<uuid>` |
+| `generated_image_uri` | string | Generated image to compare, `storage://<uuid>` |
+| `prompt` | string | Original generation prompt, ≤ 10 000 chars |
+
+**Response:** strict-JSON body produced by the vision model:
+
+```json
+{
+  "score": 8.25,
+  "analysis": {
+    "face_match": 9,
+    "eyes": 8,
+    "proportions": 8,
+    "overall_likeness": 8
+  },
+  "edits": {
+    "add": ["slightly narrower jawline"],
+    "remove": [],
+    "modify": {}
+  }
+}
+```
+
+Scale: 1-3 poor, 4-6 some resemblance, 7-8 good, 9-10 excellent. The system prompt (`CHAR_RANKING_PROMPT` in `server.py:3204`) enforces the JSON schema and the "only suggest edits if score < 9" rule.
+
+**Errors:**
+- `401 "Missing API key"`
+- `404 <FileNotFoundError message>` — either `storage://` URI unresolvable.
+- `500 "Chat model not loaded"` — llama-swap proxy not ready.
+- `500 "Vision model did not return valid JSON"` — response couldn't be parsed.
+- `500 "Failed to parse vision model response"` — JSON parse error in the regex-extracted block.
+
+---
+
+## Approved images
+
+A per-API-key "approved feed" — noodle-i approves an image, noodle-v watches the feed.
+
+### `POST /v1/approved-images`
+
+**Body:**
+```json
+{
+  "image_uri": "storage://...",
+  "prompt": "...",
+  "model": "flux2-dev",
+  "width": 1024,
+  "height": 1024
+}
+```
+
+**Response:** `201 {"id": "<16 hex>", "status": "approved"}`.
+**Errors:** `401 "Missing API key"`; `400 "Missing image_uri"`.
+
+### `GET /v1/approved-images`
+
+Query params: `limit` (default 50), `offset` (default 0).
+
+**Response:** JSON array, per-API-key scoped (`api_key_hash` is stripped from responses).
+
+```json
+[
+  {
+    "id": "...",
+    "image_uri": "storage://...",
+    "prompt": "...",
+    "model": "flux2-dev",
+    "width": 1024,
+    "height": 1024,
+    "created_at": 1712345678.9,
+    "image_url": "/v1/approved-images/<id>/file"
+  }
+]
+```
+
+### `GET /v1/approved-images/events`
+
+**Auth:** none at the middleware layer; the handler accepts `?token=<sse-token>` OR a bearer header.
+
+SSE stream of newly-added entries (scoped to caller's key). Heartbeat polls the manifest every 2 s via `mtime`.
+
+```
+data: {"id": "...", "image_uri": "...", "image_url": "/v1/approved-images/.../file", ...}
+
+```
+
+Closes on client disconnect.
+**Errors:** `401 "Missing API key"` if neither token nor bearer resolves.
+
+### `GET /v1/approved-images/{image_id}/file`
+
+Returns the referenced file.
+
+- `200 image/webp` (or the underlying file's mime).
+- `401 "Missing API key"`.
+- `404 "Not found"` — unknown id or owned by another key.
+- `404 "Image file not found"` — manifest entry exists but the file was evicted.
 
 ---
 
 ## Compositions
 
-Multi-clip composition timelines (noodle-v's export pipeline).
+Multi-clip composition timelines (noodle-v export pipeline). Shape is owned by `composition_store`.
 
-### `POST /v2/compositions` — `201`
+### `POST /v2/compositions`
 
+**Status code on success:** `201`.
+**Body:**
 ```json
 {
   "name": "My Cut",
@@ -1390,49 +1316,196 @@ Multi-clip composition timelines (noodle-v's export pipeline).
 }
 ```
 
-Returns the created row (shape owned by `composition_store`).
+**Response:** the created row.
+**Errors:** `401 "Missing API key"`.
 
-### `GET /v2/compositions?limit=50&offset=0`
+### `GET /v2/compositions`
 
-Returns an array of the caller's compositions (clamped to 200).
+Query params: `limit` (default 50, clamped to 200), `offset` (default 0). Returns array scoped to caller's API key.
+**Errors:** `401 "Missing API key"`.
 
 ### `GET /v2/compositions/{comp_id}`
 
-Returns the full composition row. `404` if not found or owned by another key.
+- `200 <row>`.
+- `401 "Missing API key"`.
+- `404 "Composition not found"` — unknown id or owned by another key.
 
 ### `PUT /v2/compositions/{comp_id}`
 
-Body: same as create. Response: `{"status": "updated"}` or `404`.
+**Body:** same as create.
+**Response:** `{"status": "updated"}`.
+**Errors:** `401 "Missing API key"`; `404 "Composition not found"`.
 
 ### `DELETE /v2/compositions/{comp_id}`
 
-Response: `{"status": "deleted"}` or `404`.
+**Response:** `{"status": "deleted"}`.
+**Errors:** `401 "Missing API key"`; `404 "Composition not found"`.
 
 ### `POST /v2/compositions/{comp_id}/export`
 
-Enqueues an `EXPORT_COMPOSITION` job. Returns the same `202` envelope as any v2 submit. Poll `/v2/jobs/{job_id}` for progress.
+Enqueues a `JobType.EXPORT_COMPOSITION` job; returns the same `202` envelope as any v2 submit. Poll via [`GET /v2/jobs/{id}`](#get-v2jobsjob_id).
 
 ---
 
-## Error codes
+## SSE session tokens
 
-Codes the backend actively returns:
+### `POST /v1/sse-token`
 
-| Status | Meaning |
-|---|---|
-| `200` | OK (sync generation returns binary; other responses are JSON) |
-| `201` | Resource created (LoRA upload, upload PUT, approved image) |
-| `202` | v2 job queued |
-| `204` | `/v2/jobs/{id}/preview` has nothing yet — poll again |
-| `400` | Malformed request (multipart / missing field / bad content-type) |
-| `401` | Missing or invalid bearer token |
-| `404` | Unknown id, storage URI, file, composition, LoRA, history entry |
-| `409` | `v2/jobs/{id}/result` not ready; cancel on finished job |
-| `413` | Upload or LoRA over size cap |
-| `422` | Pydantic validation, keyframe bounds, LoRA id mismatch, retake content rejection |
-| `429` | Queue full (`queue_full`, `Retry-After: 30`) |
-| `500` | Unhandled internal error, Flux disabled, chat proxy not ready |
-| `503` | Paused (`Retry-After: 300`), `joyai_disabled` (LOAD_JOYAI unset), `sidecar_unreachable` (joyai-sidecar down), `turbo_mode_active` (ACE/JoyAI/Flux unavailable during turbo), or `Music generation not enabled` (LOAD_ACE unset) |
+Short-lived disposable token for browser `EventSource` (which cannot send custom headers).
+
+**Response:** `{"token": "<32 url-safe bytes>", "expires_in": 300}`
+
+- Tokens expire after 5 minutes.
+- Pruned on each `POST /v1/sse-token` call (expired entries deleted).
+- Pass as `?token=...` on `/v2/jobs/{id}/stream` and `/v1/approved-images/events`.
+
+**Errors:** `401 "Missing API key"` if no valid bearer.
+
+---
+
+## Error taxonomy
+
+All error responses follow the shape described in [Error shape](#error-shape) (`{"error", "message", "detail"}` all equal). The table below lists every distinct error string that the server can emit, grouped by scenario.
+
+### Universal middleware
+
+| Status | Error string | When |
+|---|---|---|
+| `401` | `"Invalid or missing API key"` | Bearer missing or doesn't match any `.api_keys` line |
+
+### System state
+
+| Status | Error string / code | When |
+|---|---|---|
+| `503` | `"System is paused for maintenance"` (sync) / `"system_paused"` (v2/turbo) + `Retry-After: 300` | `_paused == True` |
+| `503` | `"turbo_mode_active: ACE/JoyAI unavailable..."` + `Retry-After: 10` | Music v2 submitted while turbo is active |
+| `503` | `"Music generation not enabled (LOAD_ACE=0)"` | `LOAD_ACE=0` |
+| `503` | `"JoyAI not enabled (LOAD_JOYAI=0)"` / `"joyai_disabled: ..."` | `LOAD_JOYAI=0` or sidecar error |
+| `503` | `"sidecar_unreachable"` / `"sidecar_timeout"` | JoyAI / ERNIE / LTX-sidecar HTTP failure |
+| `503` | `"ernie_disabled: ..."` | `LOAD_ERNIE=0` or ERNIE sidecar error |
+| `500` | `"Flux not enabled"` / `"Flux pipeline not loaded"` | `LOAD_FLUX=0` and request targets Flux |
+| `500` | `"Chat model not loaded"` | `chat.is_ready == False` |
+
+### System operations
+
+| Status | Error string | When |
+|---|---|---|
+| `500` | `"pause_failed"` | `/v1/system/pause` failed |
+| `500` | `"resume_failed"` | `/v1/system/resume` failed |
+| `500` | `"flux_unload_failed"` / `"flux_reload_failed"` | Flux unload/reload failed |
+| `500` | `"ltx_unload_failed"` / `"ltx_reload_failed"` | LTX unload/reload failed |
+| `409` | `"already_enabled"` / `"already_disabled"` | `/v1/system/turbo` called with state already matching body |
+| `500` | `"turbo_toggle_failed"` | Turbo transition failed |
+| `400` | `"remote_sidecar_not_configured: set LTX_REMOTE_SIDECAR_URL in .env"` | Pool endpoint called with no sidecar |
+| `500` | `"pool_scale_failed: ..."` | Pool resize failed |
+
+### Queue / rate limit
+
+| Status | Error code | When | Header |
+|---|---|---|---|
+| `429` | `"queue_full"` | `job_store.pending_count() >= MAX_QUEUE_DEPTH (10)` | `Retry-After: 30` |
+| `429` | `"music_queue_full"` | Music-specific depth ≥ `MAX_MUSIC_PENDING (5)` | `Retry-After: 30` |
+| `429` | `"batch_queue_full"` | `batch_store.active_count() >= MAX_BATCH_QUEUE_DEPTH (5)` | `Retry-After: 30` |
+
+### Uploads
+
+| Status | Error string | When |
+|---|---|---|
+| `413` | `"Upload exceeds 1024MB limit"` | `PUT /uploads/put/{id}` body > `MAX_UPLOAD_BYTES` |
+| `413` | `"File exceeds 1024MB limit"` | `POST /v1/loras` file > `MAX_LORA_SIZE_BYTES` |
+| `400` | `"Expected multipart/form-data"` | `POST /v1/loras` content-type mismatch |
+| `400` | `"Missing 'file' field"` | `POST /v1/loras` no file |
+| `400` | `"File must be a .safetensors file"` | `POST /v1/loras` wrong extension |
+| `422` | `"Missing 'name' field"` | `POST /v1/loras` no name |
+| `400` | `<registry validation error>` | `POST /v1/loras` duplicate id etc. |
+
+### LoRA / asset resolution
+
+| Status | Error string | When |
+|---|---|---|
+| `404` | `"LoRA not found: <id>"` | `lora.id` not in LTX registry |
+| `404` | `"Flux LoRA not found: <id>"` | `lora.id` not in Flux registry |
+| `404` | `"LoRA not found: <id>"` | `DELETE /v1/loras/{id}` with unknown id |
+| `422` | `<FluxLoraError message>` | LoRA/model incompatibility on Flux path |
+| `500` | `"outpaint LoRA resolve returned None — registry misconfigured"` | Default `ic-lora-outpaint` missing |
+
+### Generation request validation
+
+| Status | Error string | When |
+|---|---|---|
+| `422` | `"Cannot specify both image_uri and keyframes"` | i2v with both fields set |
+| `422` | `"keyframes list must not be empty"` | i2v empty keyframes array |
+| `422` | `"At most 8 keyframes are allowed"` | i2v keyframes > 8 |
+| `422` | `"Either image_uri or keyframes is required"` | i2v no image input |
+| `422` | `"Resolved frame_index N is out of range for M frames"` | Keyframe bounds violation |
+| `422` | `"Duplicate frame_index values after resolution"` | Two keyframes resolve to same index |
+| `422` | `"joyai-edit requires exactly one image_uri"` | `joyai-edit` with `image_uris.length != 1` |
+| `422` | `"task_type '<t>' requires source_audio_uri"` | Music task-type missing `source_audio_uri` |
+| `422` | `"task_type '<t>' requires track_name"` | extract/lego/complete missing `track_name` |
+| `422` | `"Content rejected or generation failed: <detail>"` | Retake generation failure |
+| `422` | `"Messages list cannot be empty"` | Chat completions no messages |
+
+### URI / file resolution
+
+| Status | Error string | When |
+|---|---|---|
+| `404` | `<FileNotFoundError message>` | `uploads.resolve()` fails on any `storage://` |
+| `404` | `"source_audio_uri not found"` | Music `source_audio_uri` fails resolve |
+| `404` | `"reference_audio_uri not found"` | Music `reference_audio_uri` fails resolve |
+
+### Jobs / batch lifecycle
+
+| Status | Error string | When |
+|---|---|---|
+| `404` | `"Job not found"` | Unknown job id on `/v2/jobs/*` |
+| `409` | `"Job result not ready"` | `GET /v2/jobs/{id}/result` on non-completed job |
+| `404` | `"Result file expired or not found"` | Job complete but file missing (TTL evicted) |
+| `409` | `"Cannot cancel a finished job"` | `DELETE /v2/jobs/{id}` on terminal-state job |
+| `404` | `"Batch not found"` | Unknown batch id |
+| `404` | `"Batch item not found or not completed"` | Bad batch index or not yet complete |
+| `409` | `"batch_already_finished"` | `DELETE /v2/batch/{id}` on terminal batch |
+| `400` | `"Invalid item type at index N: ..."` | Batch item has unsupported type |
+| `422` | `"Validation failed at item N (<type>): <detail>"` | Batch item params fail Pydantic validation |
+
+### Job `error.code` values (v2 status)
+
+On failure, `GET /v2/jobs/{id}` returns an `error: {code, message}` block. Codes emitted by the worker:
+
+| Code | Source | Meaning |
+|---|---|---|
+| `"generation_failed"` | `job_queue.py:300` default | Generic failure during generate |
+| `"cuda_oom"` | `job_queue.py:300` | `"out of memory"` substring in exception |
+| `"ace_error"` | `server.py:282` | Music dispatch raised `AceError` |
+
+### Approved images / history / compositions
+
+| Status | Error string | When |
+|---|---|---|
+| `401` | `"Missing API key"` | Auth layer not satisfied |
+| `400` | `"Missing image_uri"` | `POST /v1/approved-images` no body field |
+| `404` | `"Not found"` | Unknown approved image id OR owned by another key |
+| `404` | `"Image file not found"` | Manifest entry exists, file evicted |
+| `404` | `"Not found"` (history) | Unknown generation id OR owned by another key |
+| `404` | `"Result file not found"` (history image) | On-disk result missing |
+| `404` | `"Thumbnail not found"` | On-disk thumbnail missing |
+| `404` | `"Composition not found"` | Unknown composition id OR owned by another key |
+
+### Char rank
+
+| Status | Error string | When |
+|---|---|---|
+| `500` | `"Vision model did not return valid JSON"` | No JSON regex match in model output |
+| `500` | `"Failed to parse vision model response"` | JSON parse error in extracted block |
+
+### Dashboard
+
+| Status | Error string | When |
+|---|---|---|
+| `404` | `"dashboard.html not found"` | Static file missing |
+
+### Path redaction
+
+Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 chars and then replaced with `"Internal server error"` (all three fields) before leaving the server.
 
 ---
 
@@ -1441,87 +1514,102 @@ Codes the backend actively returns:
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | no | Liveness + model status |
-| GET | `/dashboard` | no | GPU management dashboard (v1.2) |
-| POST | `/v1/system/pause` | yes | Evict all models + cancel queued jobs |
-| POST | `/v1/system/resume` | yes | Reload all models |
-| POST | `/v1/system/turbo` | yes | Toggle turbo mode (v1.2) |
-| GET | `/v1/system/sampler` | yes | Get sampler configuration (v1.3) |
-| POST | `/v1/system/sampler` | yes | Toggle CFG++ vs Euler sampler (v1.3) |
-| GET | `/v1/system/config` | yes | Get all generation parameters (v1.3) |
-| POST | `/v1/system/config` | yes | Update generation parameters (v1.3) |
-| POST | `/v1/system/config/reset` | yes | Reset generation config to defaults (v1.3) |
-| GET | `/v1/system/gpu` | yes | nvidia-smi GPU telemetry (v1.2) |
-| POST | `/v1/flux/unload` | yes | Unload Flux only |
-| POST | `/v1/flux/reload` | yes | Reload Flux only |
-| POST | `/v1/ltx/unload` | yes | Unload LTX only |
-| POST | `/v1/ltx/reload` | yes | Reload LTX only |
-| POST | `/v1/text-to-video` | yes | Sync video gen |
-| POST | `/v1/image-to-video` | yes | Sync i2v / keyframe gen |
+| GET | `/dashboard` | no | GPU management SPA |
+| GET | `/v1/system/gpu` | no | `nvidia-smi` telemetry |
+| POST | `/v1/system/pause` | yes | Evict all + cancel queued |
+| POST | `/v1/system/resume` | yes | Reload all |
+| POST | `/v1/flux/unload` | yes | Unload Flux |
+| POST | `/v1/flux/reload` | yes | Reload Flux |
+| POST | `/v1/ltx/unload` | yes | Unload LTX |
+| POST | `/v1/ltx/reload` | yes | Reload LTX |
+| POST | `/v1/system/turbo` | yes | Toggle turbo mode |
+| GET | `/v1/system/pool` | yes | Remote-sidecar pool state |
+| POST | `/v1/system/pool/remote-workers` | yes | Set target remote worker count |
+| GET | `/v1/system/sampler` | yes | Sampler subset of gen config |
+| POST | `/v1/system/sampler` | yes | Toggle CFG++ / Euler |
+| GET | `/v1/system/config` | yes | Full LTX gen config |
+| POST | `/v1/system/config` | yes | Merge-update LTX gen config |
+| POST | `/v1/system/config/reset` | yes | Reset LTX gen config |
+| GET | `/v1/system/flux-config` | yes | Full Flux gen config |
+| POST | `/v1/system/flux-config` | yes | Merge-update Flux gen config |
+| POST | `/v1/system/flux-config/reset` | yes | Reset Flux gen config |
+| POST | `/v1/text-to-video` | yes | Sync t2v |
+| POST | `/v1/image-to-video` | yes | Sync i2v / keyframe |
 | POST | `/v1/audio-to-video` | yes | Sync a2v |
 | POST | `/v1/retake` | yes | Sync retake |
-| POST | `/v1/text-to-image` | yes | Sync Flux t2i |
+| POST | `/v1/text-to-image` | yes | Sync Flux t2i / ERNIE t2i |
 | POST | `/v1/image-to-image` | yes | Sync Flux i2i |
-| POST | `/v1/image-edit` | yes | Sync image edit (Flux multi-image or `joyai-edit` single-image) |
-| POST | `/v1/music` | yes | Sync music generation (ACE, v1.2) |
-| POST | `/v1/chat/completions` | yes | Chat proxy |
-| POST | `/v1/upload` | yes | Get upload URL |
+| POST | `/v1/image-edit` | yes | Sync edit (Flux multi / JoyAI single) |
+| POST | `/v1/music` | yes | Sync music (ACE) |
+| POST | `/v1/chat/completions` | yes | llama-swap proxy |
+| POST | `/v1/upload` | yes | Get upload slot |
 | PUT | `/uploads/put/{upload_id}` | yes | Upload bytes |
 | GET | `/v1/loras` | yes | List LTX LoRAs |
 | POST | `/v1/loras` | yes | Upload LTX LoRA (multipart) |
 | DELETE | `/v1/loras/{lora_id}` | yes | Delete LTX LoRA |
 | GET | `/v1/flux-loras` | yes | List Flux LoRAs |
 | POST | `/v1/flux-loras/rescan` | yes | Re-scan Flux LoRA folder |
-| POST | `/v2/text-to-video` | yes | Async video gen |
-| POST | `/v2/image-to-video` | yes | Async i2v |
-| POST | `/v2/audio-to-video` | yes | Async a2v |
-| POST | `/v2/retake` | yes | Async retake |
-| POST | `/v2/text-to-image` | yes | Async Flux t2i |
-| POST | `/v2/image-to-image` | yes | Async Flux i2i |
-| POST | `/v2/image-edit` | yes | Async image edit (Flux multi-image or `joyai-edit` single-image) |
-| POST | `/v2/music` | yes | Async music generation (ACE, v1.2) |
-| POST | `/v2/batch` | yes | Submit batch of generation jobs (v1.2) |
-| GET | `/v2/batch/{batch_id}` | yes | Poll batch status + partial results (v1.2) |
-| GET | `/v2/batch/{batch_id}/result/{index}` | yes | Download individual batch item result (v1.3) |
-| DELETE | `/v2/batch/{batch_id}` | yes | Cancel remaining batch items (v1.2) |
-| GET | `/v2/jobs/{job_id}` | yes | Poll job status |
-| GET | `/v2/jobs/{job_id}/preview` | yes | Preview JPEG (204 when empty) |
-| GET | `/v2/jobs/{job_id}/result` | yes | Download final media |
-| GET | `/v2/jobs/{job_id}/stream` | yes (bearer OR token) | SSE live status/progress/phase stream |
-| DELETE | `/v2/jobs/{job_id}` | yes | Cancel job |
 | POST | `/v1/sse-token` | yes | Issue 5-min SSE token |
 | POST | `/v1/approved-images` | yes | Approve an image |
 | GET | `/v1/approved-images` | yes | List approved images |
-| GET | `/v1/approved-images/events` | no (token or bearer) | SSE feed |
-| GET | `/v1/approved-images/{id}/file` | yes | Fetch approved image file |
-| POST | `/v2/char/rank` | yes | Vision character consistency rank |
-| GET | `/v2/history` | yes | Per-key generation history (list — unchanged shape) |
-| GET | `/v2/history/{id}` | yes | Full record with parsed params + gen_config (v1.3) |
+| GET | `/v1/approved-images/events` | no | SSE feed (bearer OR `?token=`) |
+| GET | `/v1/approved-images/{id}/file` | yes | Fetch approved file |
+| POST | `/v2/text-to-video` | yes | Async t2v |
+| POST | `/v2/image-to-video` | yes | Async i2v |
+| POST | `/v2/audio-to-video` | yes | Async a2v |
+| POST | `/v2/retake` | yes | Async retake |
+| POST | `/v2/video-outpaint` | yes | **v1.7.0** Async IC-LoRA outpaint |
+| POST | `/v2/text-to-image` | yes | Async t2i |
+| POST | `/v2/image-to-image` | yes | Async i2i |
+| POST | `/v2/image-edit` | yes | Async edit |
+| POST | `/v2/music` | yes | Async music |
+| GET | `/v2/jobs/{id}` | yes | Poll status |
+| GET | `/v2/jobs/{id}/preview` | yes | Preview JPEG (204 when empty) |
+| GET | `/v2/jobs/{id}/result` | yes | Download final media |
+| GET | `/v2/jobs/{id}/stream` | no (bearer OR `?token=`) | SSE live status |
+| DELETE | `/v2/jobs/{id}` | yes | Cancel job |
+| POST | `/v2/batch` | yes | Submit batch |
+| GET | `/v2/batch/{id}` | yes | Poll batch status |
+| GET | `/v2/batch/{id}/result/{index}` | yes | Download batch item result |
+| DELETE | `/v2/batch/{id}` | yes | Cancel batch |
+| GET | `/v2/history` | yes | Per-key history list |
+| GET | `/v2/history/{id}` | yes | Full record with params + gen_config |
 | GET | `/v2/history/{id}/image` | yes | Full-size history media |
 | GET | `/v2/history/{id}/thumbnail` | yes | History thumbnail |
 | DELETE | `/v2/history/{id}` | yes | Delete history entry |
+| POST | `/v2/char/rank` | yes | Vision character consistency rank |
 | POST | `/v2/compositions` | yes | Create composition |
 | GET | `/v2/compositions` | yes | List compositions |
 | GET | `/v2/compositions/{id}` | yes | Get composition |
 | PUT | `/v2/compositions/{id}` | yes | Update composition |
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
-| POST | `/v2/compositions/{id}/export` | yes | Enqueue composition export job |
+| POST | `/v2/compositions/{id}/export` | yes | Enqueue export job |
 
-Total: 63 routes.
+**Total: 71 routes.**
 
 ---
 
 ## Curl examples
 
-**Upload + sync text-to-image:**
+Set `API` and `KEY` env vars first:
 
 ```bash
-API="http://localhost:8090"
-KEY="your-key"
+export API="http://localhost:8090"
+export KEY="your-api-key"
+```
 
-# 1. Get an upload slot (only needed for i2i/i2v)
-curl -X POST "$API/v1/upload" \
+### Upload + sync t2i
+
+```bash
+# 1. Upload only needed for i2i/i2v/a2v/retake/outpaint/image-edit
+SLOT=$(curl -s -X POST "$API/v1/upload" \
   -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" -d '{}'
+  -H "Content-Type: application/json" -d '{}')
+UPLOAD_URL=$(echo $SLOT | jq -r '.upload_url')
+STORAGE_URI=$(echo $SLOT | jq -r '.storage_uri')
+curl -X PUT "$UPLOAD_URL" \
+  -H "Authorization: Bearer $KEY" \
+  --data-binary @input.jpg
 
 # 2. Straight text-to-image
 curl -X POST "$API/v1/text-to-image" \
@@ -1531,7 +1619,7 @@ curl -X POST "$API/v1/text-to-image" \
   --output out.webp
 ```
 
-**Async video job → poll → fetch:**
+### Async video job → poll → fetch
 
 ```bash
 JOB=$(curl -s -X POST "$API/v2/text-to-video" \
@@ -1539,7 +1627,6 @@ JOB=$(curl -s -X POST "$API/v2/text-to-video" \
   -d '{"prompt":"a cat","model":"ltx-2-3-fast","resolution":"1920x1080","duration":4,"fps":24}' \
   | jq -r '.job_id')
 
-# Poll
 while true; do
   STATUS=$(curl -s -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB" | jq -r '.status')
   [ "$STATUS" = "completed" ] && break
@@ -1547,63 +1634,105 @@ while true; do
   sleep 2
 done
 
-# Fetch
 curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output out.mp4
+```
+
+### Async video job via SSE
+
+```bash
+# Open a long-lived SSE connection; close when terminal state arrives.
+JOB=$(curl -s -X POST "$API/v2/text-to-video" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"prompt":"a cat","model":"ltx-2-3-fast","resolution":"1920x1080","duration":4,"fps":24}' \
+  | jq -r '.job_id')
+
+curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/stream"
+```
+
+### Video outpaint (v1.7.0)
+
+```bash
+# 1. Upload source video → $STORAGE_URI
+# 2. Submit async outpaint (silent MP4 output)
+JOB=$(curl -s -X POST "$API/v2/video-outpaint" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d @- <<EOF | jq -r '.job_id'
+{
+  "video_uri": "$STORAGE_URI",
+  "prompt": "extend the scene naturally, matching lighting and style",
+  "target_resolution": "1920x1080",
+  "position": "center",
+  "duration": 5.0,
+  "fps": 24,
+  "skip_stage_2": false
+}
+EOF
+)
+
+# 3. Stream status until completion
+curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/stream"
+
+# 4. Download
+curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output outpaint.mp4
+```
+
+### Batch submit
+
+```bash
+curl -X POST "$API/v2/batch" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {"type":"text-to-image","params":{"prompt":"cat","model":"flux2-klein","width":1024,"height":1024,"num_inference_steps":4}},
+      {"type":"text-to-video","params":{"prompt":"dog","model":"ltx-2-3-fast","resolution":"1280x720","duration":4,"fps":24}}
+    ]
+  }'
 ```
 
 ---
 
 ## Changelog
 
+- **v1.7.0** (2026-04-17)
+  - `POST /v2/video-outpaint` — IC-LoRA Outpaint (`oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint`, registered id `ic-lora-outpaint`). Silent MP4 output; black-sentinel LoRA fills padded regions; `skip_stage_2` fast path.
+  - `JobType.VIDEO_OUTPAINT` added.
+  - New [`OutpaintPosition`](#outpaintposition-v170) enum (9 values).
+- **v1.6** (2026-04-15)
+  - LTX remote-sidecar pool: `GET /v1/system/pool`, `POST /v1/system/pool/remote-workers`. Turbo + up to 4 Modal workers for 6-way concurrent video.
+  - `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_TOKEN`, `LTX_REMOTE_SIDECAR_MAX_WORKERS` env vars.
+- **v1.5**
+  - Turbo entry hardening: cuda:1 drain verification via `nvidia-smi` bus-id matching.
+  - `_systemctl_unit` helper with proper error surfacing.
+- **v1.4**
+  - Auto-turbo: batch worker engages turbo when cuda:1 idle ≥ `AUTO_TURBO_IDLE_MINUTES` and batch has ≥ 2 items.
 - **v1.3** (2026-04-13)
-  - **Upstream LTX-2 migration**: ModelLedger → SingleGPUModelBuilder, CachingModelLedger → CachingModelFactory, new Denoiser classes (SimpleDenoiser/GuidedDenoiser/FactoryGuidedDenoiser).
-  - **ltx-core 1.1.1 + ltx-pipelines 1.1.1**: vocoder fp32 fix, cosine tiling, layer streaming, BatchSplitAdapter.
-  - **v1.1 distilled models**: `ltx-2.3-22b-distilled-1.1.safetensors` + `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` + `ltx-2.3-spatial-upscaler-x2-1.1.safetensors`.
-  - **CFG++ sampler**: `GET/POST /v1/system/sampler` — toggle between CFG++ (default) and Euler. Dashboard toggle. No restart needed.
-  - **Generation config API**: `GET/POST /v1/system/config` + `POST /v1/system/config/reset` — 14 tunable generation parameters (sampler, step counts, scheduler shifts, CFG/STG/rescale scales, stage 2 sigmas, eta controls). Persisted to `.gen_config.json`, survives restarts. Dashboard exposes all params with preset dropdowns and reset button.
-  - **DUAL_GPU_LTX mode**: `DUAL_GPU_LTX=1` env flag for 2 concurrent video workers via LTX sidecar on cuda:1:8093. Disables Flux/ACE/JoyAI.
-  - **Batch result download**: `GET /v2/batch/{id}/result/{index}` — download individual completed batch item results.
-  - **BatchSplitAdapter**: all transformer calls wrapped for correct multi-pass batching.
-  - **bf16 precision fix**: removed forced float32 accumulation (training/inference mismatch).
-  - **A2V fixes**: GuidedDenoiser (static) for stage 1, frozen audio noise_scale=0.0, null check, padding.
-  - **TilingConfig.default()**: upstream cosine tiling for VAE decode.
-  - **Sidecar timeouts**: 300s → 600s for generate calls.
-  - **torch.compile**: `TORCH_COMPILE=1` flag available, default OFF.
-  - New env vars: `DUAL_GPU_LTX`, `LTX_SIDECAR_URL`, `TORCH_COMPILE`.
+  - Upstream LTX-2 migration: `SingleGPUModelBuilder`, `CachingModelFactory`, new Denoiser classes.
+  - `GET/POST /v1/system/config`, `POST /v1/system/config/reset` — 13 tunable LTX params persisted to `.gen_config.json`.
+  - `GET/POST /v1/system/sampler` — CFG++ default; Euler fallback.
+  - `GET /v2/history/{id}` — full record with `params`, `gen_config`, `seed`, `enhanced_prompt`.
+  - `GET /v2/batch/{id}/result/{index}` — individual batch-item download.
+  - BatchSplitAdapter, bf16 precision fix, TilingConfig.default() for VAE decode.
+  - `DUAL_GPU_LTX` env flag, `torch.compile` flag (default OFF).
 - **v1.2** (2026-04-11)
-  - **Dual-GPU layout**: cuda:0 = LTX ↔ Flux (2-tenant swap), cuda:1 = ACE + JoyAI (coexisting). JoyAI migrated from cuda:0 to cuda:1.
-  - **Music generation**: `POST /v1/music` (sync) + `POST /v2/music` (async) — ACE Step xl-base+LM on cuda:1:8001. `MusicGenerationRequest` with 30+ fields, 6 task types (text2music/cover/repaint/extract/lego/complete), 6 audio formats. Gated by `LOAD_ACE=1`.
-  - **Batch scheduler**: `POST /v2/batch` + `GET /v2/batch/{id}` + `DELETE /v2/batch/{id}` — submit 1-50 generation jobs as a batch. Swap-optimized sort (images before videos). Max queue depth 5.
-  - **Turbo mode**: `POST /v1/system/turbo` — claims both GPUs for LTX with 2 concurrent denoiser workers, 2x video throughput. ACE/JoyAI/Flux return 503 while active. `worker_loop` turbo_check callback, batch_worker asyncio.gather for 2-at-a-time processing.
-  - **Dashboard**: `GET /dashboard` — static HTML SPA for GPU management with turbo controls.
-  - **GPU telemetry**: `GET /v1/system/gpu` — nvidia-smi per-GPU memory/temp/utilization, turbo state, tenant info (2 s cache).
-  - `/health` now includes `ace` field.
-  - New env vars: `LOAD_ACE`, `ACE_SIDECAR_URL`, `MAX_MUSIC_PENDING`, `TURBO_GPU_DEVICES`, `MAX_BATCH_QUEUE_DEPTH`, `MAX_BATCH_ITEMS`.
+  - Dual-GPU layout: cuda:0 = LTX ↔ Flux swap; cuda:1 = ACE + JoyAI (or ERNIE) coexist.
+  - Music: `POST /v1/music` + `POST /v2/music` (ACE Step). Gated by `LOAD_ACE`.
+  - Batch scheduler: `POST /v2/batch`, `GET /v2/batch/{id}`, `DELETE /v2/batch/{id}`.
+  - Turbo mode: `POST /v1/system/turbo` — 2 concurrent LTX workers.
+  - `GET /dashboard` SPA, `GET /v1/system/gpu` telemetry.
+  - `/health` adds `ace` field.
 - **v1.1.8** (2026-04-11)
-  - `model: "joyai-edit"` on `POST /v1/image-edit` and `POST /v2/image-edit` — single-image instruction-based editing via JoyAI-Image-Edit-Diffusers running in an out-of-process sidecar on 127.0.0.1:8092.
-  - Server wraps prompts in the `<|im_start|>user\n<image>\n{prompt}<|im_end|>\n` chat template — clients send plain English.
-  - `image_uris` must be length 1 for joyai-edit (422 otherwise). `lora` is not supported (422). `guidance_scale` is respected (unlike Klein).
-  - Latency ~78 s at 1024² / 30 steps. Phase field reports `"encoding"` for the entire sidecar call (JoyAI is opaque to per-step callbacks).
-  - Three-tenant swap protocol: LTX ↔ Flux ↔ JoyAI all mutually exclusive on cuda:0. `_ensure_joyai_ready()` helper mirrors `_ensure_ltx_resident()` / `_ensure_flux_ready()`.
-  - Feature-flagged via `LOAD_JOYAI=1` env var. If unset, joyai-edit returns 503 `{"error": "joyai_disabled"}`.
-  - Also fixes a pre-existing bug where `/v1/image-edit` silently ignored `model: "flux2-dev"` and always used Klein (the lambda in `flux_manager.generate_image_edit` dropped the `model` kwarg).
+  - `model: "joyai-edit"` on `/v1/image-edit` + `/v2/image-edit` — single-image editing via `JoyAI-Image-Edit-Diffusers` sidecar on 127.0.0.1:8092.
+  - Fixed `/v1/image-edit` silently ignoring `model: "flux2-dev"`.
+  - `phase="encoding"` during opaque sidecar calls.
 - **v1.1.7** (2026-04-11)
-  - `GET /v2/jobs/{id}/stream` — SSE endpoint that was previously advertised in the submission envelope but never implemented. One long-lived connection replaces the 240-GET polling loop per video job. Emits on state change + keepalive every 15 s. Accepts bearer header or `?token=` query param (for browser `EventSource`).
+  - `GET /v2/jobs/{id}/stream` — SSE endpoint (bearer OR `?token=`).
 - **v1.1.6** (2026-04-11)
-  - `/v2/jobs/{id}` status: new `phase` field ("denoising" / "decoding" / "encoding" / "saving" / null) so clients can render labels during the post-denoise tail instead of a frozen percentage. Denoising now reports progress up to `0.90` (was `0.99`); the top 10 % maps to the post-denoise phases.
-  - `/v2/jobs/{id}/preview`: reuses the on-disk thumbnail produced by `history.save()` via zero-copy `FileResponse`. Fallback lazy extraction still exists for jobs without api_key but is now offloaded via `asyncio.to_thread` so the event loop is never blocked.
-  - `history.save()` now runs in a background `asyncio.to_thread` task instead of on the queue worker's event loop. The worker dequeues the next job immediately; the previous ~300 ms thumbnail window no longer stalls the queue.
-  - SQLite history DB switched to WAL mode — readers no longer block behind the single writer. `/v2/history` list reads run concurrently with the worker's save.
-- **v1.1.5** (2026-04-09)
-  - `/v2/jobs/{id}/preview`: returns `204` (not `404`) while no preview is available.
-  - Lazy first-frame extraction for completed video jobs via PyAV; cached on job.
-  - `history_store` now generates thumbnails for video jobs (was silently failing on `PIL.UnidentifiedImageError`).
-- **v1.1.4** (2026-04-09) — Single-GPU swap mode
-  - `LTX_DEVICE = FLUX_DEVICE = "cuda:0"`. `cuda:1` reserved for external training.
-  - `evict_all()` leak fix: cleared `worker._model_ledger` + `_source_ledger`. Reclaims 99 % of LTX VRAM on unload (verified 66.9 GB → 683 MiB).
-  - Added `/v1/ltx/{unload,reload}` endpoints mirroring the existing Flux pair.
-  - Auto-swap helpers `_ensure_ltx_resident` / `_ensure_flux_ready` wired into `_dispatch_job` and every v1 sync handler.
+  - `phase` field on `/v2/jobs/{id}` (`denoising` / `decoding` / `encoding` / `saving`). Denoising caps at 0.90.
+  - `/v2/jobs/{id}/preview` zero-copy from history thumbnail; async fallback via PyAV.
+  - SQLite WAL mode; `history.save()` off the worker's event loop.
+- **v1.1.5** — `/v2/jobs/{id}/preview` returns `204` (not `404`) while empty; video-first-frame via PyAV.
+- **v1.1.4** — Single-GPU swap mode; `_ensure_ltx_resident` / `_ensure_flux_ready`; `evict_all` leak fix (reclaims 99% of LTX VRAM).
 - **v1.1.3** — VAE force-upcast fix (pre-hook + fp32 params).
-- **v1.1.2** — Lossless VP8L WEBP for Flux output (fixed "screendoor" artifact).
-- **v1.1.1** — Dropped FP8 layerwise casting on Flux 2 Dev; adapter-mode LoRA (strength changes are free).
+- **v1.1.2** — Lossless VP8L WEBP for Flux output.
+- **v1.1.1** — Dropped FP8 layerwise casting on Flux 2 Dev; adapter-mode LoRA (free strength changes).
 - **v1.1** — Flux LoRA folder-drop; first/middle/last keyframes; char rank; gen history.

@@ -2,6 +2,8 @@
 
 [Back to README](../README.md)
 
+**Current version:** v1.7.0 (2026-04-17). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6. See [CHANGELOG](../CHANGELOG.md).
+
 ## Dual-GPU Layout
 
 taco-backend runs on two RTX PRO 6000 Blackwell GPUs (96 GB each). Each GPU has a distinct role:
@@ -65,27 +67,42 @@ Flux Dev uses `enable_model_cpu_offload`, so its idle GPU footprint is near-zero
 
 Prior to v1.1.4, `DenoiserWorker` held strong refs to source model builders that kept ~22 GB of encoder hub pinned after eviction. Fix: explicitly null reference paths before dropping workers. Verified: cuda:0 drops from 66.9 GB to **683 MiB** after unload. (v1.3 refactored from `ModelLedger` → `SingleGPUModelBuilder` / `CachingModelFactory` but the eviction pattern is the same.)
 
-## Turbo Mode (v1.2)
+## Turbo Mode (v1.2, hardened v1.5)
 
-Turbo mode temporarily claims **both** GPUs for LTX, enabling 2 concurrent denoiser workers and 2x video throughput.
+Turbo mode temporarily claims **both** GPUs for LTX, enabling 2 concurrent local denoiser workers. Combined with the optional remote-sidecar pool (v1.6) it scales up to **6 concurrent video workers** (2 local + 4 Modal remote).
 
 Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 
-### Entry (~20 s)
-1. Evicts ACE, JoyAI, and Flux from both GPUs
-2. Loads dual-GPU LTX with encoder hub on cuda:0 and 2 denoiser workers
-3. Starts a second `worker_loop` pulling from `_job_queue`
+### Entry (~20 s, v1.5 hardening)
+1. Flux unload on cuda:0
+2. **`systemctl --user stop`** on ALL cuda:1 tenants (`ace-step`, `joyai-sidecar`, `ernie-image-sidecar`, plus any stale `ltx-sidecar`) — HTTP `/unload` is no longer trusted because sidecar Python processes could hold tensors resident after a successful /unload response, causing OOM during the subsequent LTX sidecar load.
+3. Wait for cuda:1 to drain below 2 GB (20 s deadline) via `nvidia-smi` polling. Abort and restore tenants if not drained.
+4. `systemctl --user start ltx-sidecar`, poll `/health`, call `/load`
+5. Spawn second in-process `worker_loop` pulling from `_job_queue`
+6. If `LTX_REMOTE_SIDECAR_URL` is configured and `_remote_worker_target > 0`, `_scale_remote_pool()` warms up the Modal containers and spawns N additional worker loops (up to `LTX_REMOTE_SIDECAR_MAX_WORKERS`, default 4).
 
 ### Active
-- **2 video jobs process concurrently** via `asyncio.gather` in the batch worker
-- Flux, ACE, JoyAI, and music endpoints all return `503 turbo_mode_active`
+- **2+ video jobs process concurrently** via dedicated worker loops (one per local GPU + one per remote container)
+- `asyncio.gather` in the batch worker dispatches multiple items in parallel
+- Flux, ACE, JoyAI, ERNIE, and music endpoints all return `503 turbo_mode_active`
 - Only video generation endpoints are functional
 
 ### Exit (~15 s)
-1. Cancels the second worker
-2. Evicts dual-GPU LTX
-3. Restores single-GPU LTX on cuda:0
-4. Restarts ACE + JoyAI on cuda:1
+1. Cancel the second (and remote) worker tasks
+2. HTTP `/unload` on local LTX sidecar; remote sidecars are left for Modal's native `scaledown_window` (5 min) to reclaim
+3. `systemctl --user stop ltx-sidecar` on cuda:1
+4. `_restore_cuda1_tenants()` — `systemctl --user start` each configured tenant (`LOAD_ACE` / `LOAD_JOYAI` / `LOAD_ERNIE`)
+
+### Remote-Sidecar Pool (v1.5, scaled v1.6)
+
+Optional third+ worker dispatches to HTTP sidecars running on remote hardware (Modal RTX Pro 6000 is the canonical deployment).
+
+- Config: `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_TOKEN`, `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4) in `.env`.
+- Scale 0..MAX via `POST /v1/system/pool/remote-workers {"count": N}` or the dashboard "Remote Pool" button grid.
+- Pool is turbo-scoped: workers only run while turbo is active, so non-video jobs queued outside turbo aren't stolen by remote workers that can only serve video.
+- Remote transport failures do NOT auto-exit turbo — a remote is treated as optional extra capacity; jobs on that worker fail individually but main + local-sidecar workers keep serving.
+- State query: `GET /v1/system/pool` returns `{turbo_active, remote_sidecar_configured, remote_sidecar_url, remote_worker_target, remote_worker_active, remote_worker_max}`.
+- `v1.6.1` hot-fix: `_dispatch_job_turbo_remote` base64-encodes local media (`image_path`, `audio_path`, `video_path`, keyframes) into the request body, since the Modal container has no mount of `uploads/`. v1.7.0 outpaint follows the same pattern for `video_path`.
 
 ## cuda:1 Tenants
 
@@ -134,5 +151,9 @@ For operators who want explicit control (all require Bearer auth):
 | `/v1/system/resume` | POST | Reload all models |
 | `/v1/system/turbo` | POST | Toggle turbo mode |
 | `/v1/system/sampler` | GET/POST | Get/toggle CFG++ vs Euler sampler |
+| `/v1/system/config` | GET/POST | Get/update generation config (14 LTX params, `.gen_config.json`) |
+| `/v1/system/config/reset` | POST | Reset generation config to defaults |
+| `/v1/system/pool` | GET | Remote-sidecar pool state (v1.6) |
+| `/v1/system/pool/remote-workers` | POST | Scale remote worker count 0..MAX (v1.6) |
 | `/v1/system/gpu` | GET | nvidia-smi telemetry (2 s cache) |
 | `/dashboard` | GET | GPU management dashboard (no auth) |

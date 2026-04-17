@@ -2,6 +2,13 @@
 
 Everything you need to ship a working client in 5 minutes. For everything else → [docs/API.md](./API.md).
 
+## What's new in v1.7.0 (2026-04-17)
+
+- **Video outpaint** — new `POST /v2/video-outpaint`. Expands a source video's canvas to a larger `target_resolution` and fills the pure-black letterbox with an IC-LoRA-generated extension. 9 positions (center + edges + corners). See [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
+- **Remote-sidecar pool scaling** (v1.6 precursor): `POST /v1/system/pool/remote-workers {"count": N}` and `GET /v1/system/pool`. Up to 4 Modal RTX Pro 6000 containers on top of the 2 local workers in turbo mode, for 6 concurrent video jobs.
+- **Turbo hardening** (v1.5): `systemctl`-based eviction of cuda:1 tenants on entry, 20 s drain deadline with automatic rollback on failure. No more half-transitioned states.
+- Additive — no existing endpoints, request shapes, or response semantics changed.
+
 ## The 60-second version
 
 ```
@@ -117,13 +124,14 @@ await fetch(`${API}/v2/image-to-video`, {
 
 ## Models at a glance
 
-### Video — `/v2/text-to-video`, `/v2/image-to-video`, `/v2/audio-to-video`, `/v2/retake`
+### Video — `/v2/text-to-video`, `/v2/image-to-video`, `/v2/audio-to-video`, `/v2/retake`, `/v2/video-outpaint`
 
 | Model | Latency (~5s @ 1080p) | Use case |
 |---|---|---|
 | `ltx-2-3-fast` | ~15 s | Previews, fast iteration, audio-to-video |
 | `ltx-2-3-pro` | ~65 s | Production default |
 | `ltx-2-3-hq` | ~90 s | Final render (res2s + CFG++ sampler, best motion) |
+| `ic-lora-outpaint` via `/v2/video-outpaint` | ~35-45 s full, ~20 s `skip_stage_2` | Canvas expansion — see [outpaint-frontend-guide.md](./outpaint-frontend-guide.md) |
 
 ### Image — `/v2/text-to-image`, `/v2/image-to-image`, `/v2/image-edit`
 
@@ -191,6 +199,25 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
 }
 ```
 `frame_index` accepts `int | "first" | "middle" | "last"` plus negative ints (Python-style: `-1` = last, `-12` = 12 frames before end). Up to 8 keyframes. Mutually exclusive with `image_uri`.
+
+### `POST /v2/video-outpaint` (v1.7.0)
+```json
+{
+  "video_uri": "storage://abc123",
+  "prompt": "extend the scene naturally, matching lighting and style",
+  "target_resolution": "1920x1080",
+  "position": "center",
+  "duration": 5.0,
+  "fps": 24,
+  "seed": 42,
+  "conditioning_strength": 1.0,
+  "skip_stage_2": false
+}
+```
+- Source is letterboxed into `target_resolution` with pure black; IC-LoRA fills the black.
+- `position` ∈ `"center" | "left" | "right" | "top" | "bottom" | "top_left" | "top_right" | "bottom_left" | "bottom_right"`.
+- `lora` defaults to `{"id": "ic-lora-outpaint", "strength": 1.0}`. Override for custom outpaint LoRAs.
+- Output is **silent MP4** (no audio passthrough in v1.7.0). Full integration walkthrough in [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
 
 ### `POST /v2/image-edit` (Flux Klein multi-reference)
 ```json
