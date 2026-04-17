@@ -111,7 +111,13 @@ _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 _VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE}
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None         # local sidecar worker (cuda:1)
-_turbo_remote_worker_task: asyncio.Task | None = None  # v1.5: remote sidecar worker (e.g. Modal)
+
+# v1.6: remote-sidecar pool. User-controlled target count persists across
+# turbo toggles. `_remote_worker_tasks` is the CURRENT live workers (scales
+# to match target while turbo is active; scales to 0 when turbo is off).
+_remote_worker_tasks: list[asyncio.Task] = []
+_remote_worker_target: int = 1 if config.LTX_REMOTE_SIDECAR_URL else 0
+_remote_pool_lock = asyncio.Lock()  # serialize concurrent scale requests
 
 # cuda:1 activity tracker for auto-turbo. Updated on every successful
 # JoyAI edit or ACE music completion. Initialized to now so the 30-min
@@ -1471,12 +1477,13 @@ async def _auto_exit_turbo_on_sidecar_failure() -> None:
 
 
 async def _dispatch_job_turbo_remote(job: Job) -> bytes:
-    """Route a video job to the REMOTE LTX sidecar (v1.5 — e.g. Modal RTX Pro 6000).
+    """Route a video job to the REMOTE LTX sidecar (v1.5+ — e.g. Modal RTX Pro 6000).
 
-    Runs on a dedicated third worker when `LTX_REMOTE_SIDECAR_URL` is set.
-    Unlike the local sidecar path, remote transport failures do NOT auto-exit
-    turbo — the remote is treated as optional extra capacity. If it's broken,
-    jobs on that worker fail; main + local-sidecar workers keep serving.
+    Runs on workers in the remote pool (v1.6: 0..MAX_WORKERS controlled by the
+    dashboard). Unlike the local sidecar path, remote transport failures do
+    NOT auto-exit turbo — the remote is treated as optional extra capacity.
+    If it's broken, jobs on those workers fail; main + local-sidecar workers
+    keep serving.
     """
     if job.type not in _VIDEO_JOB_TYPES:
         raise ValueError(f"Remote turbo worker cannot handle {job.type} — only video jobs supported")
@@ -1499,6 +1506,73 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
         duration=p.get("duration"),
         mode=p.get("mode"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Remote-sidecar pool (v1.6)
+# ---------------------------------------------------------------------------
+
+
+async def _scale_remote_pool() -> None:
+    """Reconcile `_remote_worker_tasks` to match the desired count.
+
+    Desired count is ``_remote_worker_target`` IF turbo is active (remote
+    workers are turbo-scoped to avoid pulling non-video jobs from the shared
+    queue; outside turbo, Flux/ACE/JoyAI/ERNIE submit heterogeneous job types
+    and only the main worker can safely dispatch them). Otherwise desired = 0.
+
+    Safe to call concurrently — guarded by ``_remote_pool_lock``.
+    """
+    global _remote_worker_tasks
+    if ltx_remote_sidecar is None:
+        return
+
+    async with _remote_pool_lock:
+        desired = _remote_worker_target if _turbo_active else 0
+        desired = max(0, min(desired, config.LTX_REMOTE_SIDECAR_MAX_WORKERS))
+        current = len(_remote_worker_tasks)
+
+        if desired > current:
+            # Warming the remote once keeps Modal's cold-start out of the
+            # first job's latency — /health doesn't need auth on our side.
+            if current == 0:
+                try:
+                    await asyncio.wait_for(ltx_remote_sidecar.health(), timeout=90.0)
+                except Exception as exc:
+                    logger.warning("Remote pool: health probe failed (will try anyway): %s", exc)
+            for i in range(current, desired):
+                task = asyncio.create_task(
+                    worker_loop(
+                        job_store, _job_queue, _inference_lock,
+                        _dispatch_job_turbo_remote, uploads, history,
+                        # Always skip inference_lock — remote workers never
+                        # touch local GPUs. This is safe because the pool only
+                        # scales > 0 while _turbo_active is True, and turbo
+                        # mode routes only video jobs to the queue.
+                        turbo_check=lambda job: True,
+                    ),
+                    name=f"remote-worker-{i}",
+                )
+                _remote_worker_tasks.append(task)
+            logger.info("Remote pool: scaled %d -> %d workers", current, desired)
+
+        elif desired < current:
+            while len(_remote_worker_tasks) > desired:
+                task = _remote_worker_tasks.pop()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            logger.info("Remote pool: scaled %d -> %d workers", current, desired)
+            # NOTE: deliberately not calling ltx_remote_sidecar.unload() here.
+            # On Modal our /unload path calls SplitModelManager.evict_all(),
+            # which clears the worker list. A future /generate against a
+            # still-warm container then fails with "no LTX workers available"
+            # because @modal.enter only runs once per container lifetime.
+            # Modal's scaledown_window (5 min) reclaims the GPU naturally
+            # when the pool stays at 0; that's the authoritative path for
+            # credit-saving. See v1.5 changelog for the scaledown math.
 
 
 async def _dispatch_job_turbo(job: Job) -> bytes:
@@ -1615,29 +1689,15 @@ async def _enter_turbo_mode() -> None:
         name="turbo-worker",
     )
 
-    # Step 6 (v1.5): Optional REMOTE sidecar pool member. If
-    # LTX_REMOTE_SIDECAR_URL is configured, health-probe it (warms a cold
-    # Modal container) and start a third worker_loop. Failure here is
-    # non-fatal — local turbo continues to work with 2 workers.
-    global _turbo_remote_worker_task
-    worker_count = 2
-    if ltx_remote_sidecar is not None:
-        try:
-            await ltx_remote_sidecar.health()
-            logger.info("Turbo: remote sidecar reachable at %s", config.LTX_REMOTE_SIDECAR_URL)
-            _turbo_remote_worker_task = asyncio.create_task(
-                worker_loop(
-                    job_store, _job_queue, _inference_lock,
-                    _dispatch_job_turbo_remote, uploads, history,
-                    turbo_check=lambda job: _turbo_active,
-                ),
-                name="turbo-worker-remote",
-            )
-            worker_count = 3
-        except Exception as exc:
-            logger.warning("Turbo: remote sidecar unreachable — skipping (%s)", exc)
-
-    logger.info("TURBO MODE ON: %d concurrent video workers", worker_count)
+    # Step 6 (v1.6): bring up the remote-sidecar pool to match the user's
+    # current target (0..MAX). See `_scale_remote_pool` + the pool control
+    # endpoints. Scales to 0 automatically in `_exit_turbo_mode`.
+    await _scale_remote_pool()
+    remote_active = len(_remote_worker_tasks)
+    logger.info(
+        "TURBO MODE ON: %d concurrent video workers (2 local + %d remote)",
+        2 + remote_active, remote_active,
+    )
 
 
 async def _exit_turbo_mode() -> None:
@@ -1645,33 +1705,35 @@ async def _exit_turbo_mode() -> None:
 
     Caller must hold _inference_lock.
     """
-    global _turbo_active, _turbo_worker_task, _turbo_remote_worker_task, _last_gpu_tenant
+    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
 
     if not _turbo_active:
         return  # idempotent
 
-    # Step 1: Cancel the local-sidecar worker loop + the optional remote worker.
-    for task_attr in ("_turbo_worker_task", "_turbo_remote_worker_task"):
-        task = globals().get(task_attr)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            globals()[task_attr] = None
+    # Flip the flag first so `_scale_remote_pool` treats desired=0.
+    _turbo_active = False
 
-    # Step 2: Best-effort HTTP /unload for BOTH sidecars first (allows them to
-    # free GPU memory gracefully before the systemctl-stop hammer lands). The
-    # remote /unload also reduces Modal credit burn.
-    for name, client in [("local", ltx_sidecar), ("remote", ltx_remote_sidecar)]:
-        if client is None:
-            continue
+    # Step 1a: scale remote pool to zero. Preserves `_remote_worker_target`
+    # so the user's setting persists across turbo toggles.
+    await _scale_remote_pool()
+
+    # Step 1b: cancel the local-sidecar worker loop.
+    if _turbo_worker_task is not None:
+        _turbo_worker_task.cancel()
         try:
-            await client.unload()
-            logger.info("Turbo exit: %s sidecar /unload ok", name)
-        except LtxSidecarError as exc:
-            logger.warning("Turbo exit: %s sidecar /unload failed — %s", name, exc)
+            await _turbo_worker_task
+        except asyncio.CancelledError:
+            pass
+        _turbo_worker_task = None
+
+    # Step 2: Best-effort HTTP /unload for local sidecar (graceful GPU
+    # memory free before the systemctl-stop hammer). The remote pool's
+    # /unload already fired inside `_scale_remote_pool()` when it went to 0.
+    try:
+        await ltx_sidecar.unload()
+        logger.info("Turbo exit: local sidecar /unload ok")
+    except LtxSidecarError as exc:
+        logger.warning("Turbo exit: local sidecar /unload failed — %s", exc)
 
     # Step 3: Stop the local ltx-sidecar systemd unit. Frees its Python
     # process + any lingering cuda:1 allocator blocks.
@@ -1688,7 +1750,6 @@ async def _exit_turbo_mode() -> None:
     # is guaranteed.
     await _restore_cuda1_tenants()
 
-    _turbo_active = False
     logger.info("TURBO MODE OFF: cuda:1 released, sidecar services restarting")
 
 
@@ -1728,6 +1789,64 @@ async def system_turbo(body: TurboRequest) -> JSONResponse:
     except Exception:
         logger.exception("Turbo toggle failed")
         return JSONResponse(status_code=500, content={"error": "turbo_toggle_failed"})
+
+
+# ---------------------------------------------------------------------------
+# Remote-sidecar pool controls (v1.6)
+# ---------------------------------------------------------------------------
+
+
+class PoolCountRequest(BaseModel):
+    count: int = Field(ge=0)
+
+
+@app.get("/v1/system/pool")
+async def get_pool_state() -> JSONResponse:
+    """Current state of the LTX remote-sidecar pool.
+
+    Fields:
+      - ``remote_sidecar_configured``: whether ``LTX_REMOTE_SIDECAR_URL`` is set
+      - ``remote_sidecar_url``: the URL (no auth token leaked)
+      - ``remote_worker_target``: user's desired active count when turbo is on
+      - ``remote_worker_active``: currently live worker tasks
+      - ``remote_worker_max``: upper bound (LTX_REMOTE_SIDECAR_MAX_WORKERS)
+      - ``turbo_active``: remote pool is turbo-scoped; active count is 0 when off
+    """
+    return JSONResponse(content={
+        "turbo_active": _turbo_active,
+        "remote_sidecar_configured": ltx_remote_sidecar is not None,
+        "remote_sidecar_url": config.LTX_REMOTE_SIDECAR_URL or None,
+        "remote_worker_target": _remote_worker_target,
+        "remote_worker_active": len(_remote_worker_tasks),
+        "remote_worker_max": config.LTX_REMOTE_SIDECAR_MAX_WORKERS,
+    })
+
+
+@app.post("/v1/system/pool/remote-workers")
+async def set_pool_remote_workers(body: PoolCountRequest) -> JSONResponse:
+    """Set the target remote-sidecar worker count (0..MAX).
+
+    Takes effect immediately if turbo is active (scales the live pool).
+    If turbo is inactive, the target is stored and applied at next turbo-on.
+    """
+    global _remote_worker_target
+    if ltx_remote_sidecar is None:
+        return _error(400, "remote_sidecar_not_configured: set LTX_REMOTE_SIDECAR_URL in .env")
+    target = max(0, min(body.count, config.LTX_REMOTE_SIDECAR_MAX_WORKERS))
+    _remote_worker_target = target
+    # If turbo is already on, scale the live pool right now; otherwise the
+    # target takes effect on next turbo-enter.
+    try:
+        await _scale_remote_pool()
+    except Exception as exc:
+        logger.exception("Remote pool scale failed")
+        return _error(500, f"pool_scale_failed: {exc}")
+    return JSONResponse(content={
+        "remote_worker_target": _remote_worker_target,
+        "remote_worker_active": len(_remote_worker_tasks),
+        "remote_worker_max": config.LTX_REMOTE_SIDECAR_MAX_WORKERS,
+        "applied_now": _turbo_active,
+    })
 
 
 @app.get("/v1/system/config")

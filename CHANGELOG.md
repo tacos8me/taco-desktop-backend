@@ -2,6 +2,56 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.6 — 2026-04-17
+
+### Remote-sidecar pool with dashboard controls (up to 4 Modal workers)
+
+Evolution of v1.5's single-remote-sidecar addition. The pool now scales 0..N on demand with a dashboard slider, giving a total of **up to 6 concurrent video workers** (2 local — main cuda:0 in-process + local cuda:1 sidecar — plus up to 4 remote Modal containers).
+
+- `config.LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4) caps the pool. Must not exceed Modal's `max_containers` or requests queue forever.
+- Modal app (`/mnt/nvme-1/servers/ltx-sidecar-modal/modal_app.py`) bumped to `max_containers=4` to match.
+- `server.py` now manages `_remote_worker_tasks: list[asyncio.Task]` + `_remote_worker_target: int` (persists across turbo toggles). `_scale_remote_pool()` reconciles the live workers to match target IF turbo is active (the pool is turbo-scoped because non-video jobs submitted while turbo is off would otherwise be stolen by remote workers that can only handle video).
+- New endpoints:
+  - `GET /v1/system/pool` — returns `{turbo_active, remote_sidecar_configured, remote_sidecar_url, remote_worker_target, remote_worker_active, remote_worker_max}`.
+  - `POST /v1/system/pool/remote-workers {"count": N}` — sets target. Scales live if turbo is on; else just stores target for next turbo-on.
+- Dashboard: new "Remote Pool" row under Controls, rendered with N+1 buttons (0..MAX). Active button is highlighted; status line reflects configured / target / active / turbo-pending states.
+- Backward compat: v1.5 clients that relied on "turbo-on auto-spawns 1 remote worker" still get that default — `_remote_worker_target` initializes to 1 when `LTX_REMOTE_SIDECAR_URL` is set, 0 otherwise.
+
+### Fix: Modal /unload no longer breaks the manager
+
+v1.5's pool scale-to-0 path called `ltx_remote_sidecar.unload()` which triggered Modal's `/unload` endpoint. That endpoint ran `manager.evict_all()`, which clears `self._workers` on `SplitModelManager`. Because `@modal.enter` only fires on container boot and not on subsequent requests, any future `/generate` against a still-warm container then failed with `"No LTX workers available — call load_all() first"`.
+
+Fixes:
+1. `_scale_remote_pool`'s scale-to-0 path no longer calls `/unload` — Modal's 5-min `scaledown_window` reclaims the GPU authoritatively.
+2. Modal's `/unload` endpoint now uses `worker.evict_transformer()` per worker (frees the ~46 GB transformer while keeping the worker registry intact) instead of `manager.evict_all()`.
+3. Modal's `/load` endpoint is now self-healing: if `manager.is_ready` is False (post-evict state), it re-runs `manager.load_all()` before returning.
+4. Modal's `/generate` adds a defensive inline reload — if a future stale container ever exists, the first request to it triggers `load_all()` instead of 500'ing.
+
+### Turbo toggle no longer /unloads the remote
+
+`_exit_turbo_mode` previously looped over both sidecars and called `/unload` on each. Now it only /unloads the local sidecar (the remote is scale-down-eligible via Modal's native mechanism).
+
+### Verified end-to-end
+
+5 concurrent `POST /v2/text-to-video {model: ltx-2-3-fast, resolution: 1920x1080, duration: 3s}` with pool target=3 + turbo on:
+- Dispatch: all 5 entered `processing` within 1 s (2 local + 3 remote warm containers).
+- All 5 completed in ~60 s wall clock (local done ~50 s, Modal ~60 s with warm containers).
+- 0 failures.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `server.py` | `_remote_worker_tasks`/`_remote_worker_target`; `_scale_remote_pool()`; pool GET/POST endpoints; `_enter_turbo_mode` / `_exit_turbo_mode` now use the pool scaler instead of the single-worker v1.5 path |
+| `ltx_sidecar_client.py` | (from v1.5) `auth_token` + `label` kwargs; `ltx_remote_sidecar` module instance (unchanged in v1.6) |
+| `config.py` | `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4) |
+| `dashboard.html` | "Remote Pool" button grid (0..MAX) + `pollPool()` / `updatePoolUI()` / `setRemoteWorkers()` JS, polled every 5 s |
+| `CLAUDE.md` / `CHANGELOG.md` | docs + version bump |
+
+Companion (not in this repo): `modal_app.py` gained `max_containers=4`, self-healing `/load`, worker-preserving `/unload`, defensive `/generate` reload.
+
+---
+
 ## v1.5 — 2026-04-17
 
 ### Turbo-mode hardening: systemctl-stop replaces HTTP /unload for cuda:1 tenants

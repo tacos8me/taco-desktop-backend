@@ -66,6 +66,10 @@ LTX_SIDECAR_URL = os.environ.get("LTX_SIDECAR_URL", "http://127.0.0.1:8093")
 # + remote). Leave empty to disable. Token is the Bearer value — NOT an env-var name.
 LTX_REMOTE_SIDECAR_URL = os.environ.get("LTX_REMOTE_SIDECAR_URL", "").strip()
 LTX_REMOTE_SIDECAR_TOKEN = os.environ.get("LTX_REMOTE_SIDECAR_TOKEN", "").strip()
+# v1.6: upper bound on concurrent remote workers (each = 1 Modal container).
+# User can scale 0..MAX via `POST /v1/system/pool/remote-workers`. Must not
+# exceed the Modal function's `max_containers` or we queue forever.
+LTX_REMOTE_SIDECAR_MAX_WORKERS = int(os.environ.get("LTX_REMOTE_SIDECAR_MAX_WORKERS", "4"))
 
 # ACE-Step music generation sidecar on cuda:1 (v1.2).
 ACE_SIDECAR_URL = os.environ.get("ACE_SIDECAR_URL", "http://127.0.0.1:8001")

@@ -215,6 +215,58 @@ Toggle turbo mode — claims both GPUs for LTX, enabling 2 concurrent denoiser w
 - `409 {"error": "already_disabled"}` if already in normal mode.
 - `503` if the system is paused.
 
+Updated in v1.6: turbo mode now stacks an OPTIONAL remote-sidecar pool on top of the 2 local workers, for a total of up to 6 concurrent video workers. See `/v1/system/pool` below.
+
+### `GET /v1/system/pool` (v1.6)
+
+Inspect the LTX remote-sidecar pool state. Used by the dashboard + optionally by clients that want to display current capacity.
+
+**Response:**
+
+```json
+{
+  "turbo_active": true,
+  "remote_sidecar_configured": true,
+  "remote_sidecar_url": "https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run",
+  "remote_worker_target": 3,
+  "remote_worker_active": 3,
+  "remote_worker_max": 4
+}
+```
+
+- `remote_sidecar_configured`: whether `LTX_REMOTE_SIDECAR_URL` is set in `.env`.
+- `remote_worker_target`: the operator's desired active count; persists across turbo toggles.
+- `remote_worker_active`: currently live worker tasks. Always 0 when `turbo_active` is false (the pool is turbo-scoped — only video jobs flow through the queue during turbo, so remote workers can't accidentally steal image/music jobs).
+- `remote_worker_max`: upper bound from `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4).
+
+Total concurrent video-worker capacity when turbo is on = `2 + remote_worker_active` (main cuda:0 + local cuda:1 sidecar + N remote).
+
+### `POST /v1/system/pool/remote-workers` (v1.6)
+
+Set the target remote-worker count. **Operator endpoint — typical clients don't need this.**
+
+**Body:**
+
+```json
+{"count": 3}
+```
+
+Count is clamped to `[0, remote_worker_max]`. If turbo is on, the live pool scales immediately. If turbo is off, the target is stored and applied at the next `/v1/system/turbo` enable.
+
+**Response:**
+
+```json
+{
+  "remote_worker_target": 3,
+  "remote_worker_active": 3,
+  "remote_worker_max": 4,
+  "applied_now": true
+}
+```
+
+- `applied_now`: `true` iff turbo was active and the live pool was resized during this call.
+- `400 {"error": "remote_sidecar_not_configured"}` if `LTX_REMOTE_SIDECAR_URL` is empty.
+
 ### `GET /v1/system/sampler` (v1.3)
 
 Get current sampler configuration.

@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.5 (2026-04-17).
+**Version**: v1.6 (2026-04-17).
 
 ## Structure
 - `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode, dashboard
