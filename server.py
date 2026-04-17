@@ -27,7 +27,7 @@ from flux_manager import FluxManager, FluxLoraError
 from joyai_client import joyai, JoyAIError
 from ernie_client import ernie, ErnieError
 from ace_client import ace, AceError
-from ltx_sidecar_client import ltx_sidecar, LtxSidecarError
+from ltx_sidecar_client import ltx_sidecar, ltx_remote_sidecar, LtxSidecarError
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
@@ -110,7 +110,8 @@ _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 # Turbo mode — dual-GPU LTX inference (2 concurrent video jobs)
 _VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE}
 _turbo_active: bool = False
-_turbo_worker_task: asyncio.Task | None = None  # second worker_loop for concurrent dispatch
+_turbo_worker_task: asyncio.Task | None = None         # local sidecar worker (cuda:1)
+_turbo_remote_worker_task: asyncio.Task | None = None  # v1.5: remote sidecar worker (e.g. Modal)
 
 # cuda:1 activity tracker for auto-turbo. Updated on every successful
 # JoyAI edit or ACE music completion. Initialized to now so the 30-min
@@ -1319,14 +1320,141 @@ def _get_gpu_free_mb(gpu_index: int) -> int:
         return 0
 
 
-async def _ace_systemctl(action: str) -> None:
-    """Start/stop ACE sidecar via systemctl --user."""
-    import subprocess
-    await asyncio.to_thread(
+async def _systemctl_unit(unit: str, action: str) -> None:
+    """Run `systemctl --user <action> <unit>` in a thread.
+
+    Raises RuntimeError with the stderr on non-zero exit. Distinguishes
+    from `_ace_systemctl`'s earlier implementation by reporting failure
+    explicitly — callers who want "best effort, don't raise" should wrap.
+    """
+    result = await asyncio.to_thread(
         subprocess.run,
-        ["systemctl", "--user", action, "ace-step"],
+        ["systemctl", "--user", action, unit],
         capture_output=True, text=True, timeout=15,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"systemctl {action} {unit}: exit={result.returncode} stderr={result.stderr.strip()!r}"
+        )
+
+
+async def _ace_systemctl(action: str) -> None:
+    """Back-compat alias for pre-v1.5 callers — delegates to _systemctl_unit."""
+    try:
+        await _systemctl_unit("ace-step", action)
+    except RuntimeError as exc:
+        # Preserve earlier silent-on-error semantics
+        logger.warning("ace_systemctl %s: %s", action, exc)
+
+
+# ---------------------------------------------------------------------------
+# cuda:1 drain verification — v1.5 turbo entry hardening
+# ---------------------------------------------------------------------------
+
+
+async def _cuda1_memory_used_mib() -> int:
+    """Return cuda:1's used VRAM in MiB via nvidia-smi. Returns -1 on failure."""
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = [line.strip() for line in result.stdout.strip().splitlines()]
+        if len(lines) >= 2:
+            return int(lines[1])
+        return -1
+    except Exception:
+        logger.exception("nvidia-smi memory query failed")
+        return -1
+
+
+async def _list_cuda1_processes() -> list[dict]:
+    """Enumerate processes with memory allocations on cuda:1.
+
+    Uses bus-id matching — cuda:1 on this host is PCI bus E1:00.0 (verified
+    via `nvidia-smi -L` which also lists GPU UUIDs). Fallback: any compute
+    app whose bus_id is NOT `01:00.0` is assumed to be cuda:1 (2-GPU box).
+    """
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory,gpu_bus_id",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        procs = []
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            pid_str, name, mem_str, bus_id = parts[:4]
+            # Heuristic: cuda:0 is bus 01:00.0, anything else = cuda:1
+            if "01:00.0" in bus_id:
+                continue
+            try:
+                procs.append({"pid": int(pid_str), "name": name, "mem_mib": int(mem_str), "bus": bus_id})
+            except ValueError:
+                continue
+        return procs
+    except Exception:
+        logger.exception("nvidia-smi compute-apps query failed")
+        return []
+
+
+async def _wait_cuda1_free(threshold_mib: int = 2000, timeout_s: float = 20.0) -> bool:
+    """Poll cuda:1 memory until below `threshold_mib`. Returns True if clear,
+    False if timeout expired with cuda:1 still crowded. Polls every 1s.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        used = await _cuda1_memory_used_mib()
+        if 0 <= used < threshold_mib:
+            return True
+        logger.info("Turbo: cuda:1 still has %d MiB used, waiting…", used)
+        await asyncio.sleep(1)
+    return False
+
+
+async def _stop_cuda1_tenants() -> None:
+    """Stop all cuda:1 systemd tenants (ACE, JoyAI, ERNIE, ltx-sidecar).
+
+    Always best-effort — if a unit isn't running, systemctl returns 0 or a
+    harmless non-zero; we log and continue. The subsequent _wait_cuda1_free
+    check is the actual correctness gate.
+    """
+    units = [
+        ("ace-step",              config.LOAD_ACE),
+        ("joyai-sidecar",         config.LOAD_JOYAI),
+        ("ernie-image-sidecar",   config.LOAD_ERNIE),
+        ("ltx-sidecar",           True),  # always stop — may be stale from prior turbo
+    ]
+    for unit, _ in units:
+        try:
+            await _systemctl_unit(unit, "stop")
+            logger.info("Turbo: systemctl stop %s", unit)
+        except RuntimeError as exc:
+            # "not running" is fine; only log
+            logger.info("Turbo: systemctl stop %s — %s", unit, exc)
+
+
+async def _restore_cuda1_tenants() -> None:
+    """Restart the cuda:1 systemd tenants (ACE/JoyAI/ERNIE) that were
+    configured LOAD_*=1. Inverse of `_stop_cuda1_tenants` (minus ltx-sidecar,
+    which is only started during turbo).
+    """
+    for unit, cfg_flag in [
+        ("ace-step",            config.LOAD_ACE),
+        ("joyai-sidecar",       config.LOAD_JOYAI),
+        ("ernie-image-sidecar", config.LOAD_ERNIE),
+    ]:
+        if not cfg_flag:
+            continue
+        try:
+            await _systemctl_unit(unit, "start")
+            logger.info("Turbo exit: systemctl start %s", unit)
+        except RuntimeError as exc:
+            logger.warning("Turbo exit: systemctl start %s failed: %s", unit, exc)
 
 
 async def _auto_exit_turbo_on_sidecar_failure() -> None:
@@ -1340,6 +1468,37 @@ async def _auto_exit_turbo_on_sidecar_failure() -> None:
         logger.warning("Auto-exited turbo mode after sidecar transport failure")
     except Exception:
         logger.exception("Auto-exit turbo after sidecar failure: failed")
+
+
+async def _dispatch_job_turbo_remote(job: Job) -> bytes:
+    """Route a video job to the REMOTE LTX sidecar (v1.5 — e.g. Modal RTX Pro 6000).
+
+    Runs on a dedicated third worker when `LTX_REMOTE_SIDECAR_URL` is set.
+    Unlike the local sidecar path, remote transport failures do NOT auto-exit
+    turbo — the remote is treated as optional extra capacity. If it's broken,
+    jobs on that worker fail; main + local-sidecar workers keep serving.
+    """
+    if job.type not in _VIDEO_JOB_TYPES:
+        raise ValueError(f"Remote turbo worker cannot handle {job.type} — only video jobs supported")
+    if ltx_remote_sidecar is None:
+        raise RuntimeError("remote_sidecar_not_configured")
+    p = job.params
+    return await ltx_remote_sidecar.generate(
+        job_type=job.type,
+        prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
+        width=p["width"], height=p["height"],
+        num_frames=p["num_frames"], fps=p.get("fps", 24),
+        seed=p["seed"], generate_audio=p.get("generate_audio", False),
+        lora_path=p.get("lora_path"), lora_strength=p.get("lora_strength", 1.0),
+        enhance_prompt=p.get("enhance_prompt", False),
+        keyframes=p.get("keyframes"),
+        audio_path=p.get("audio_path"),
+        image_path=p.get("image_path"),
+        video_path=p.get("video_path"),
+        start_time=p.get("start_time"),
+        duration=p.get("duration"),
+        mode=p.get("mode"),
+    )
 
 
 async def _dispatch_job_turbo(job: Job) -> bytes:
@@ -1385,11 +1544,16 @@ async def _dispatch_job_turbo(job: Job) -> bytes:
 
 
 async def _enter_turbo_mode() -> None:
-    """Enable turbo: tell the LTX sidecar to load its pipeline on cuda:1.
+    """Enable turbo: claim cuda:1 for LTX, start 2–3 concurrent workers.
 
-    The sidecar is managed via systemctl (already running as a service).
-    We call /load to ensure the pipeline is GPU-resident, then start a
-    second worker_loop that dispatches to the sidecar via HTTP.
+    v1.5 hardening — this used to trust HTTP /unload calls on JoyAI/ERNIE,
+    which could succeed on the wire while leaving GPU memory resident
+    (client reports "unloaded" but the Python process still holds tensors).
+    That caused a classic OOM on ltx-sidecar /load: cuda:1 already 97%
+    full, allocator hits the ceiling. We now use `systemctl stop` as the
+    hammer for every cuda:1 tenant + poll `nvidia-smi` to verify the GPU
+    is actually free before attempting the ltx-sidecar load. If it isn't,
+    we abort with a detailed error instead of hitting OOM.
 
     Flux, ACE, and JoyAI are unavailable during turbo.
     Caller must hold _inference_lock.
@@ -1399,55 +1563,81 @@ async def _enter_turbo_mode() -> None:
     if _turbo_active:
         return  # idempotent
 
-    # Step 1: Evict ACE from cuda:1
-    if config.LOAD_ACE:
-        try:
-            await _ace_systemctl("stop")
-            logger.info("Turbo: ACE stopped via systemctl")
-        except Exception:
-            logger.exception("Turbo: ACE stop failed — aborting turbo entry")
-            raise RuntimeError("turbo_entry_failed: could not stop ACE on cuda:1")
-
-    # Step 2: Evict JoyAI from cuda:1
-    if config.LOAD_JOYAI:
-        try:
-            await joyai.unload()
-            logger.info("Turbo: JoyAI unloaded from cuda:1")
-        except JoyAIError:
-            logger.warning("Turbo: JoyAI unload failed — continuing (non-critical)")
-
-    # Step 2b: Evict ERNIE from cuda:1
-    if ernie.is_loaded:
-        try:
-            await ernie.unload()
-            logger.info("Turbo: ERNIE unloaded from cuda:1")
-        except ErnieError:
-            logger.warning("Turbo: ERNIE unload failed — continuing (non-critical)")
-
-    # Step 3: Evict Flux from cuda:0 (LTX needs full GPU)
+    # Step 1: Evict Flux from cuda:0 first (different GPU — independent of cuda:1)
     flux.unload()
 
-    # Step 4: Start the LTX sidecar service if not running, then load pipeline.
+    # Step 2: Stop ALL cuda:1 systemd tenants (ACE + JoyAI + ERNIE + any
+    # stale ltx-sidecar). systemctl stop is the authority; we no longer
+    # trust the HTTP /unload path.
+    await _stop_cuda1_tenants()
+
+    # Step 3: Verify cuda:1 actually dropped to <2 GB. If a process is
+    # lingering (systemd unit reports stopped but PID kept around, or a
+    # non-managed orphan from a prior crash), abort with a clear error so
+    # the operator can clean up manually rather than auto-kill (destructive).
+    if not await _wait_cuda1_free(threshold_mib=2000, timeout_s=20.0):
+        offenders = await _list_cuda1_processes()
+        await _restore_cuda1_tenants()  # restart services we stopped
+        raise RuntimeError(
+            "turbo_entry_aborted: cuda:1 still crowded after systemctl-stop. "
+            f"Offenders: {offenders}. Investigate with `nvidia-smi`, SIGKILL "
+            "stale PIDs, then retry."
+        )
+    logger.info("Turbo: cuda:1 drained, starting ltx-sidecar")
+
+    # Step 4: Start the LTX sidecar service (we stopped it in Step 2 to
+    # clear stale state), wait for it to bind, then /load the pipeline.
     try:
-        health = await ltx_sidecar.health()
-    except Exception:
-        logger.info("Turbo: LTX sidecar not running — starting via systemctl")
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda: subprocess.run(["systemctl", "--user", "start", "ltx-sidecar"], check=True, timeout=10))
-        await asyncio.sleep(5)  # wait for sidecar to bind port
+        await _systemctl_unit("ltx-sidecar", "start")
+    except RuntimeError as exc:
+        await _restore_cuda1_tenants()
+        raise RuntimeError(f"turbo_entry_failed: ltx-sidecar start: {exc}")
+    # Poll /health until the FastAPI server is up (usually <10s).
+    for _ in range(30):
+        try:
+            await ltx_sidecar.health()
+            break
+        except LtxSidecarError:
+            await asyncio.sleep(1)
+    else:
+        await _restore_cuda1_tenants()
+        raise RuntimeError("turbo_entry_failed: ltx-sidecar /health never came up")
     await ltx_sidecar.load()
     _last_gpu_tenant = "ltx"
 
-    # Step 5: Start a second worker_loop dispatching to the sidecar.
-    # Both workers pull from _job_queue. The turbo worker skips _inference_lock
-    # because the sidecar runs on a separate GPU.
+    # Step 5: Start the local-sidecar turbo worker. Both workers pull from
+    # _job_queue and skip _inference_lock because the sidecar runs on a
+    # separate GPU.
     _turbo_active = True
     _turbo_worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo, uploads, history,
                     turbo_check=lambda job: _turbo_active),
         name="turbo-worker",
     )
-    logger.info("TURBO MODE ON: LTX sidecar on cuda:1, 2 concurrent video jobs")
+
+    # Step 6 (v1.5): Optional REMOTE sidecar pool member. If
+    # LTX_REMOTE_SIDECAR_URL is configured, health-probe it (warms a cold
+    # Modal container) and start a third worker_loop. Failure here is
+    # non-fatal — local turbo continues to work with 2 workers.
+    global _turbo_remote_worker_task
+    worker_count = 2
+    if ltx_remote_sidecar is not None:
+        try:
+            await ltx_remote_sidecar.health()
+            logger.info("Turbo: remote sidecar reachable at %s", config.LTX_REMOTE_SIDECAR_URL)
+            _turbo_remote_worker_task = asyncio.create_task(
+                worker_loop(
+                    job_store, _job_queue, _inference_lock,
+                    _dispatch_job_turbo_remote, uploads, history,
+                    turbo_check=lambda job: _turbo_active,
+                ),
+                name="turbo-worker-remote",
+            )
+            worker_count = 3
+        except Exception as exc:
+            logger.warning("Turbo: remote sidecar unreachable — skipping (%s)", exc)
+
+    logger.info("TURBO MODE ON: %d concurrent video workers", worker_count)
 
 
 async def _exit_turbo_mode() -> None:
@@ -1455,46 +1645,51 @@ async def _exit_turbo_mode() -> None:
 
     Caller must hold _inference_lock.
     """
-    global _turbo_active, _turbo_worker_task, _last_gpu_tenant
+    global _turbo_active, _turbo_worker_task, _turbo_remote_worker_task, _last_gpu_tenant
 
     if not _turbo_active:
         return  # idempotent
 
-    # Step 1: Cancel the second worker loop
-    if _turbo_worker_task is not None:
-        _turbo_worker_task.cancel()
-        try:
-            await _turbo_worker_task
-        except asyncio.CancelledError:
-            pass
-        _turbo_worker_task = None
+    # Step 1: Cancel the local-sidecar worker loop + the optional remote worker.
+    for task_attr in ("_turbo_worker_task", "_turbo_remote_worker_task"):
+        task = globals().get(task_attr)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            globals()[task_attr] = None
 
-    # Step 2: Tell the sidecar to free cuda:1 GPU memory
+    # Step 2: Best-effort HTTP /unload for BOTH sidecars first (allows them to
+    # free GPU memory gracefully before the systemctl-stop hammer lands). The
+    # remote /unload also reduces Modal credit burn.
+    for name, client in [("local", ltx_sidecar), ("remote", ltx_remote_sidecar)]:
+        if client is None:
+            continue
+        try:
+            await client.unload()
+            logger.info("Turbo exit: %s sidecar /unload ok", name)
+        except LtxSidecarError as exc:
+            logger.warning("Turbo exit: %s sidecar /unload failed — %s", name, exc)
+
+    # Step 3: Stop the local ltx-sidecar systemd unit. Frees its Python
+    # process + any lingering cuda:1 allocator blocks.
     try:
-        await ltx_sidecar.unload()
-        logger.info("Turbo exit: LTX sidecar unloaded from cuda:1")
-    except LtxSidecarError:
-        logger.warning("Turbo exit: LTX sidecar unload failed — continuing")
+        await _systemctl_unit("ltx-sidecar", "stop")
+        logger.info("Turbo exit: systemctl stop ltx-sidecar")
+    except RuntimeError as exc:
+        logger.warning("Turbo exit: ltx-sidecar stop: %s", exc)
     _last_gpu_tenant = "ltx"
 
-    # Step 3: Reload ACE on cuda:1
-    if config.LOAD_ACE:
-        try:
-            await _ace_systemctl("start")
-            logger.info("Turbo exit: ACE restarted via systemctl")
-        except Exception:
-            logger.warning("Turbo exit: ACE restart failed — will retry on next request")
-
-    # Step 4: Reload JoyAI on cuda:1
-    if config.LOAD_JOYAI:
-        try:
-            await joyai.load()
-            logger.info("Turbo exit: JoyAI reloaded on cuda:1")
-        except JoyAIError:
-            logger.warning("Turbo exit: JoyAI reload failed — non-critical")
+    # Step 4: Restore cuda:1 tenants (ACE/JoyAI/ERNIE) via systemctl — symmetric
+    # with _enter_turbo_mode's systemctl-stop. Services cold-boot in 5–15s;
+    # the first real request to each may pay a load penalty, but correctness
+    # is guaranteed.
+    await _restore_cuda1_tenants()
 
     _turbo_active = False
-    logger.info("TURBO MODE OFF: single-GPU swap restored, ACE+JoyAI reloading on cuda:1")
+    logger.info("TURBO MODE OFF: cuda:1 released, sidecar services restarting")
 
 
 class TurboRequest(BaseModel):

@@ -42,12 +42,20 @@ class LtxSidecarClient:
         *,
         generate_timeout: float = 600.0,
         mgmt_timeout: float = 60.0,
+        auth_token: str | None = None,
+        label: str = "local",
     ):
         self._base_url = base_url if base_url is not None else config.LTX_SIDECAR_URL
         self._generate_timeout = generate_timeout
         self._mgmt_timeout = mgmt_timeout
+        self._auth_token = auth_token or None
+        self.label = label  # used in logs to distinguish pool members
 
     # --- internal helpers ---
+
+    def _headers(self) -> dict:
+        """Authorization header if token configured, else empty dict."""
+        return {"Authorization": f"Bearer {self._auth_token}"} if self._auth_token else {}
 
     def _extract_error(self, resp: httpx.Response) -> str:
         """Pull the error message out of a sidecar error response."""
@@ -63,19 +71,19 @@ class LtxSidecarClient:
         t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self._mgmt_timeout) as client:
-                resp = await client.request(method, url)
+                resp = await client.request(method, url, headers=self._headers())
         except httpx.TimeoutException as exc:
-            logger.info("LTX sidecar %s %s TIMEOUT in %.2fs", method, path, time.perf_counter() - t0)
+            logger.info("LTX sidecar[%s] %s %s TIMEOUT in %.2fs", self.label, method, path, time.perf_counter() - t0)
             raise LtxSidecarError(f"sidecar_timeout: {exc}", 504) from exc
         except httpx.ConnectError as exc:
-            logger.info("LTX sidecar %s %s UNREACHABLE in %.2fs", method, path, time.perf_counter() - t0)
+            logger.info("LTX sidecar[%s] %s %s UNREACHABLE in %.2fs", self.label, method, path, time.perf_counter() - t0)
             raise LtxSidecarError(f"sidecar_unreachable: {exc}", 503) from exc
         except httpx.HTTPError as exc:
-            logger.info("LTX sidecar %s %s HTTP error in %.2fs", method, path, time.perf_counter() - t0)
+            logger.info("LTX sidecar[%s] %s %s HTTP error in %.2fs", self.label, method, path, time.perf_counter() - t0)
             raise LtxSidecarError(f"sidecar_http_error: {exc}", 502) from exc
 
         dt = time.perf_counter() - t0
-        logger.info("LTX sidecar %s %s → %d in %.2fs", method, path, resp.status_code, dt)
+        logger.info("LTX sidecar[%s] %s %s → %d in %.2fs", self.label, method, path, resp.status_code, dt)
         if resp.status_code >= 400:
             raise LtxSidecarError(self._extract_error(resp), resp.status_code)
         try:
@@ -162,20 +170,21 @@ class LtxSidecarClient:
         t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self._generate_timeout) as client:
-                resp = await client.post(url, json=payload)
+                resp = await client.post(url, json=payload, headers=self._headers())
         except httpx.TimeoutException as exc:
-            logger.info("LTX sidecar POST /generate TIMEOUT in %.2fs", time.perf_counter() - t0)
+            logger.info("LTX sidecar[%s] POST /generate TIMEOUT in %.2fs", self.label, time.perf_counter() - t0)
             raise LtxSidecarError(f"sidecar_timeout: {exc}", 504) from exc
         except httpx.ConnectError as exc:
-            logger.info("LTX sidecar POST /generate UNREACHABLE in %.2fs", time.perf_counter() - t0)
+            logger.info("LTX sidecar[%s] POST /generate UNREACHABLE in %.2fs", self.label, time.perf_counter() - t0)
             raise LtxSidecarError(f"sidecar_unreachable: {exc}", 503) from exc
         except httpx.HTTPError as exc:
-            logger.info("LTX sidecar POST /generate HTTP error in %.2fs", time.perf_counter() - t0)
+            logger.info("LTX sidecar[%s] POST /generate HTTP error in %.2fs", self.label, time.perf_counter() - t0)
             raise LtxSidecarError(f"sidecar_http_error: {exc}", 502) from exc
 
         dt = time.perf_counter() - t0
         logger.info(
-            "LTX sidecar POST /generate → %d in %.2fs (%d bytes)",
+            "LTX sidecar[%s] POST /generate → %d in %.2fs (%d bytes)",
+            self.label,
             resp.status_code,
             dt,
             len(resp.content),
@@ -190,5 +199,26 @@ class LtxSidecarClient:
         raise LtxSidecarError(msg, resp.status_code)
 
 
-# Module-level singleton. Consumers: `from ltx_sidecar_client import ltx_sidecar, LtxSidecarError`.
-ltx_sidecar = LtxSidecarClient()
+# Primary sidecar — local cuda:1 systemd ltx-sidecar (port 8093).
+# Consumers: `from ltx_sidecar_client import ltx_sidecar, LtxSidecarError`.
+ltx_sidecar = LtxSidecarClient(label="local")
+
+
+# Optional second sidecar in the turbo pool (e.g., Modal RTX Pro 6000).
+# Set `LTX_REMOTE_SIDECAR_URL` + `LTX_REMOTE_SIDECAR_TOKEN` in .env to enable.
+# When enabled, turbo mode spins up a THIRD concurrent video worker pointing
+# at this URL, stacking on top of main (cuda:0 in-process) + local cuda:1
+# sidecar. Jobs pull from the shared _job_queue round-robin-ish (whichever
+# worker is available first grabs next).
+ltx_remote_sidecar: LtxSidecarClient | None = (
+    LtxSidecarClient(
+        config.LTX_REMOTE_SIDECAR_URL,
+        auth_token=config.LTX_REMOTE_SIDECAR_TOKEN,
+        label="remote",
+        # Remote sidecars (Modal cold-start) can take ~60-90s for the first
+        # request on a cold container. Bump management timeout accordingly.
+        mgmt_timeout=120.0,
+    )
+    if config.LTX_REMOTE_SIDECAR_URL
+    else None
+)

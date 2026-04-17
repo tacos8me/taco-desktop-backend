@@ -2,6 +2,54 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.5 — 2026-04-17
+
+### Turbo-mode hardening: systemctl-stop replaces HTTP /unload for cuda:1 tenants
+
+Root cause (observed in production today): `_enter_turbo_mode` called `await joyai.unload()` and `await ernie.unload()` via HTTP. Those requests can succeed on the wire while the sidecar's Python process keeps tensors resident. The subsequent `ltx_sidecar.load()` then tries to allocate ~46 GB of LTX transformer on a cuda:1 that still has 44 GB of JoyAI resident → CUDA OOM, turbo-enter fails mid-sequence, ACE already stopped, leaving the system in a broken state.
+
+Fix (`server.py`):
+- New `_systemctl_unit(unit, action)` helper — runs `systemctl --user <action> <unit>` in a thread, raises `RuntimeError` with stderr on non-zero exit. Replaces per-service `_ace_systemctl` (kept as back-compat alias).
+- New `_stop_cuda1_tenants()` — stops `ace-step`, `joyai-sidecar`, `ernie-image-sidecar`, and any stale `ltx-sidecar` via systemctl. Best-effort; "already stopped" is not an error.
+- New `_restore_cuda1_tenants()` — inverse: systemctl-start each configured tenant (`LOAD_*=1`). Called at turbo exit AND on turbo-entry abort rollback.
+- New `_wait_cuda1_free(threshold_mib=2000, timeout_s=20.0)` — polls `nvidia-smi` until cuda:1 drops below the threshold. Returns False on timeout.
+- New `_list_cuda1_processes()` — enumerates compute-app PIDs on the cuda:1 bus for diagnostics.
+- `_enter_turbo_mode` rewritten: Flux unload → systemctl-stop all cuda:1 tenants → **wait for cuda:1 to drain (20 s deadline)** → abort with detailed error + tenant restore if not drained → systemctl-start ltx-sidecar → poll /health → /load → spawn workers. No more OOM on turbo entry.
+- `_exit_turbo_mode` rewritten: HTTP /unload both sidecars (graceful) → systemctl-stop ltx-sidecar → `_restore_cuda1_tenants()`.
+
+### LTX remote-sidecar pool (3-worker turbo)
+
+Turbo mode previously topped out at 2 concurrent video workers (main cuda:0 in-process + local cuda:1 sidecar). v1.5 adds an OPTIONAL third worker that dispatches to a remote HTTP sidecar — e.g., Modal RTX Pro 6000 for overflow capacity.
+
+- `config.py` — new env vars `LTX_REMOTE_SIDECAR_URL` + `LTX_REMOTE_SIDECAR_TOKEN`. When URL is empty (default), behavior is unchanged from v1.4. When set, turbo enter warms the remote via `/health` then spawns a third `worker_loop` dispatching via `_dispatch_job_turbo_remote`.
+- `ltx_sidecar_client.py` — `LtxSidecarClient` gained `auth_token` + `label` kwargs. `_headers()` injects `Authorization: Bearer <token>` when configured. Module now exposes two instances: `ltx_sidecar` (local, label="local") + `ltx_remote_sidecar` (label="remote", or None if not configured).
+- `server.py::_dispatch_job_turbo_remote` — routes to the remote client. **Unlike the local path, remote transport failures do NOT auto-exit turbo** — the remote is treated as optional extra capacity; jobs on that worker fail individually but main + local-sidecar workers keep serving.
+- `_exit_turbo_mode` also /unloads the remote (saves Modal credit burn if the backing host is scale-to-pay like Modal).
+
+Verified live: 3 concurrent fast t2v submissions → `processing: 3` in queue → 3 parallel workers → all completed in ~40 s wall-clock (vs ~90 s sequential).
+
+### Companion: Modal RTX Pro 6000 LTX sidecar deployment
+
+Scaffolded at `/mnt/nvme-1/servers/ltx-sidecar-modal/modal_app.py` (NOT in the taco-backend repo — ops tree). Includes:
+- Custom image: debian_slim + torch cu130 + transformers 5.3.0 (pinned — Gemma3TextConfig attr mismatch in older transformers) + local `/mnt/nvme-1/repos/LTX-2` editable install (user has uncommitted `getattr(rope_local_base_freq)` fallback that upstream master lacks).
+- `modal.Volume` at `/mnt/nvme-1/huggingface` pre-populated with 125 GB of LTX-2.3 checkpoints + Gemma 3 12B PT from HF.
+- `@app.cls` + `@modal.enter` eager-loads the model per container boot. Cold start: ~60–80 s. Warm: instant.
+- FastAPI app with Bearer-token middleware (secret `taco-sidecar-auth`).
+- Public URL: `https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run`
+
+Free Modal credit: $30/mo → ~10 hrs of RTX Pro 6000 ($3.03/hr). Scales to zero after 10 min idle (no burn when unused).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `server.py` | `_enter_turbo_mode` + `_exit_turbo_mode` rewritten; new systemctl + cuda:1 drain helpers; `_dispatch_job_turbo_remote`; remote-worker spawn logic |
+| `ltx_sidecar_client.py` | `auth_token` + `label` kwargs; module-level `ltx_remote_sidecar` instance |
+| `config.py` | `LTX_REMOTE_SIDECAR_URL` + `LTX_REMOTE_SIDECAR_TOKEN` env vars |
+| `CLAUDE.md` / `CHANGELOG.md` | version bump + docs |
+
+---
+
 ## v1.4.1 — 2026-04-16
 
 ### Hot-fix

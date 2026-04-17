@@ -60,6 +60,13 @@ LOAD_ERNIE = os.environ.get("LOAD_ERNIE", "").lower() in ("1", "true", "yes")
 # Managed via systemctl; taco-backend calls /load and /unload to control GPU memory.
 LTX_SIDECAR_URL = os.environ.get("LTX_SIDECAR_URL", "http://127.0.0.1:8093")
 
+# Optional SECOND LTX sidecar in the turbo pool (v1.5 — Modal RTX Pro 6000, etc.).
+# When set, turbo mode spins up an EXTRA concurrent worker dispatching to this
+# URL, giving 3 concurrent video workers total (main cuda:0 + local cuda:1 sidecar
+# + remote). Leave empty to disable. Token is the Bearer value — NOT an env-var name.
+LTX_REMOTE_SIDECAR_URL = os.environ.get("LTX_REMOTE_SIDECAR_URL", "").strip()
+LTX_REMOTE_SIDECAR_TOKEN = os.environ.get("LTX_REMOTE_SIDECAR_TOKEN", "").strip()
+
 # ACE-Step music generation sidecar on cuda:1 (v1.2).
 ACE_SIDECAR_URL = os.environ.get("ACE_SIDECAR_URL", "http://127.0.0.1:8001")
 LOAD_ACE = os.environ.get("LOAD_ACE", "").lower() in ("1", "true", "yes")
