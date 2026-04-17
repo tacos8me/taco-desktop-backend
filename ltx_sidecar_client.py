@@ -127,6 +127,12 @@ class LtxSidecarClient:
         start_time: float | None = None,
         duration: float | None = None,
         mode: str | None = None,
+        # v1.6.1: base64-encoded media bytes for remote sidecars that can't
+        # see the caller's filesystem (Modal). Caller SHOULD pass either
+        # *_path (local sidecar) OR *_b64 (remote sidecar), not both.
+        audio_b64: str | None = None,
+        image_b64: str | None = None,
+        video_b64: str | None = None,
     ) -> bytes:
         """POST /generate — returns raw MP4 bytes.
 
@@ -165,6 +171,13 @@ class LtxSidecarClient:
             payload["duration"] = duration
         if mode is not None:
             payload["mode"] = mode
+        # v1.6.1 media inline
+        if audio_b64 is not None:
+            payload["audio_b64"] = audio_b64
+        if image_b64 is not None:
+            payload["image_b64"] = image_b64
+        if video_b64 is not None:
+            payload["video_b64"] = video_b64
 
         url = f"{self._base_url}/generate"
         t0 = time.perf_counter()

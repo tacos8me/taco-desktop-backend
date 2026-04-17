@@ -1484,12 +1484,42 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
     NOT auto-exit turbo — the remote is treated as optional extra capacity.
     If it's broken, jobs on those workers fail; main + local-sidecar workers
     keep serving.
+
+    v1.6.1: media files (audio for a2v, image for i2v keyframes, video for
+    retake) get inlined as base64 in the request body — the remote sidecar
+    can't see our uploads/ directory, so we read + ship the bytes.
     """
     if job.type not in _VIDEO_JOB_TYPES:
         raise ValueError(f"Remote turbo worker cannot handle {job.type} — only video jobs supported")
     if ltx_remote_sidecar is None:
         raise RuntimeError("remote_sidecar_not_configured")
     p = job.params
+
+    import base64
+
+    def _read_b64(path: str | None) -> str | None:
+        if not path:
+            return None
+        try:
+            return base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        except FileNotFoundError:
+            raise ValueError(f"remote_dispatch: media file not found: {path}")
+
+    audio_b64 = _read_b64(p.get("audio_path"))
+    image_b64 = _read_b64(p.get("image_path"))
+    video_b64 = _read_b64(p.get("video_path"))
+
+    # Keyframes: list of {image_path, frame_index, strength}. Inline each image.
+    keyframes = p.get("keyframes")
+    remote_keyframes = None
+    if keyframes:
+        remote_keyframes = []
+        for kf in keyframes:
+            new_kf = dict(kf)
+            if new_kf.get("image_path"):
+                new_kf["image_b64"] = _read_b64(new_kf.pop("image_path"))
+            remote_keyframes.append(new_kf)
+
     return await ltx_remote_sidecar.generate(
         job_type=job.type,
         prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
@@ -1498,10 +1528,11 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
         seed=p["seed"], generate_audio=p.get("generate_audio", False),
         lora_path=p.get("lora_path"), lora_strength=p.get("lora_strength", 1.0),
         enhance_prompt=p.get("enhance_prompt", False),
-        keyframes=p.get("keyframes"),
-        audio_path=p.get("audio_path"),
-        image_path=p.get("image_path"),
-        video_path=p.get("video_path"),
+        keyframes=remote_keyframes,
+        # v1.6.1: drop local paths, send base64 bytes instead
+        audio_path=None, audio_b64=audio_b64,
+        image_path=None, image_b64=image_b64,
+        video_path=None, video_b64=video_b64,
         start_time=p.get("start_time"),
         duration=p.get("duration"),
         mode=p.get("mode"),

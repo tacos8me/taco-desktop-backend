@@ -2,6 +2,34 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.6.1 — 2026-04-17
+
+### Hot-fix: remote sidecar can't see taco-backend's `uploads/` filesystem
+
+Reported symptom (live): `generate_failed: [Errno 2] No such file or directory: '/mnt/nvme-1/servers/taco-backend/uploads/<uuid>'` on every `a2v` / `i2v` / `retake` dispatched to the Modal remote pool. Text-to-video worked because it has no source-media path fields.
+
+Root cause: `_dispatch_job_turbo_remote` was passing taco-backend's local absolute paths (`audio_path`, `image_path`, `video_path`, `keyframes[].image_path`) straight through to Modal's `/generate`. Modal's container has no mount of the local `uploads/` directory, so `av.open(path)` / `Path(p).read_bytes()` fail with `FileNotFoundError`.
+
+Fix: inline the media as base64 in the request body.
+
+- `ltx_sidecar_client.LtxSidecarClient.generate()` gained `audio_b64`, `image_b64`, `video_b64` kwargs. When set, they go into the JSON payload alongside (or instead of) the corresponding `*_path` fields.
+- `_dispatch_job_turbo_remote` in `server.py`: before calling the remote, reads each local media file (`Path(p).read_bytes()`), base64-encodes, and passes as `*_b64` with the path field set to `None`. Keyframe images get the same treatment per-entry. Raises `ValueError("remote_dispatch: media file not found: ...")` if a path doesn't exist (fail fast, not mid-call).
+- Modal `/generate` (in `/mnt/nvme-1/servers/ltx-sidecar-modal/modal_app.py`): `GenerateRequest` gains the three `*_b64` fields. On arrival, any present b64 is written to `tempfile.mkstemp(prefix="modal-sidecar-", suffix=".wav|.png|.mp4")`, and the resulting path is passed downstream to the pipeline. Staged files are removed in a `finally` block regardless of outcome.
+- Local sidecar (`_dispatch_job_turbo`) path is unchanged — it has direct filesystem access to `uploads/` so it keeps using the `*_path` fields directly.
+
+Payload size impact: base64 expands 4/3. Typical audio (3–10 s): 30–100 KB → 40–135 KB. Reference image: 500 KB–2 MB → 670 KB–2.7 MB. Retake source video (5–30 s at 1080p): 10–100 MB → 13–135 MB. All within reasonable HTTP body limits.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `ltx_sidecar_client.py` | `generate()` accepts `audio_b64` / `image_b64` / `video_b64`; payload includes them when set |
+| `server.py` | `_dispatch_job_turbo_remote` reads local media files and converts to base64 before calling remote |
+
+Companion (ops tree, not in this repo): `modal_app.py::GenerateRequest` gained the `*_b64` fields; `/generate` materializes b64 → `/tmp` and cleans up in `finally`.
+
+---
+
 ## v1.6 — 2026-04-17
 
 ### Remote-sidecar pool with dashboard controls (up to 4 Modal workers)
