@@ -2,6 +2,8 @@
 
 **Applies to:** taco-backend v1.7.0 (2026-04-17) and later. See [docs/API.md](./API.md) for the full canonical reference. Related: [outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
 
+**Public base URL:** `https://api.noodlefinger.io` (canonical, Cloudflare-proxied). For local dev, use `http://localhost:8090`. `taco.noodlefinger.io` was retired 2026-04-18.
+
 ## What it does
 
 Regenerate a section of an existing video. Pick a time window, choose what to replace (video, audio, or both), optionally change the prompt. Everything outside the window stays untouched.

@@ -2,6 +2,71 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.8.1 — 2026-04-18
+
+### Security hardening + canonical public URL + frontend service persistence
+
+**Public base URL is now `https://api.noodlefinger.io`.** `https://taco.noodlefinger.io` was retired at the same time — its DNS record was removed, so it no longer resolves. Hard cutover, not an alias overlap. If you see DNS failures on clients pointing at `taco.` that's the reason; repoint them at `api.` and they'll work unchanged (same Cloudflare Tunnel, same origin, same auth, same request shape).
+
+**SEC P0-1 — IDOR ownership gate on `/v2/jobs/*` and `/v2/batch/*`** (`server.py`). Before this release, any authenticated bearer could fetch / cancel any other tenant's job or batch by guessing the 128-bit ID (or via any ID leak through logs, SSE `?token=` query params, screenshots, etc.). Added a `_require_owner(owner_key, request, *, sse_token=None)` helper and injected it into 8 handlers: `GET /v2/jobs/{id}`, `/preview`, `/result`, `/stream`, `DELETE /v2/jobs/{id}`, `GET /v2/batch/{id}`, `/result/{index}`, `DELETE /v2/batch/{id}`. Cross-tenant requests now return `404 Not found` — same shape as an unknown ID (no existence oracle). Constant-time compare via `hmac.compare_digest`. Legacy jobs/batches with empty `api_key` remain accessible (backwards-compat); history + approved-images endpoints were already SQL-scoped by `api_key_hash` so they were unaffected.
+
+**SEC P1-1+P1-2 — Dashboard + GPU telemetry moved to a LAN-only admin companion** (`dashboard_server.py`, `taco-dashboard.service`). The previous `GET /dashboard` and `GET /v1/system/gpu` were in the public server's no-auth whitelist, exposing the ops SPA and live GPU state (model, memory, temperature, utilization, tenant info, gen_config) to the internet via `api.noodlefinger.io`. Both routes are now removed from the whitelist and 401 on the public host. A tiny FastAPI companion on `192.168.1.80:8099` (LAN-bound, not routed through Cloudflare Tunnel) serves `dashboard.html` and transparently proxies every other path to `127.0.0.1:8090` with the caller's `Authorization` header. SSE streams are passed through. Access from off-LAN requires an SSH tunnel (`ssh -L 8099:192.168.1.80:8099 ...`). `taco-dashboard.service` is systemd-user-managed, enabled for boot.
+
+**Ops: noodle-i / noodle-v / noodle-mv frontend services persisted via systemd.** After the box crash earlier today, three Vite/Express frontends (`i.noodlefinger.io`, `v.noodlefinger.io`, `mv.noodlefinger.io`) didn't auto-restart because they were running from manual `pnpm dev` invocations. Created `noodle-i.service`, `noodle-v.service`, `noodle-mv.service` with `Type=simple`, `KillMode=control-group`, `Restart=on-failure`, enabled for boot. The Cloudflare Tunnel ingress map is unchanged (`i → :5173`, `v → :5174`, `t → :5175`, `mv → :5176`, `taco → :8090`). `run-dashboard.sh` / `dashboard_server.py` sit on the new LAN-only port 8099.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `server.py` | New `_require_owner()` helper; 8 job/batch handlers gain `request: Request` + ownership check; middleware whitelist trimmed to `/health` + `/v1/approved-images/events` only; `/dashboard` route now 404 stub |
+| `dashboard_server.py` *(new, ~125 LOC)* | FastAPI on `192.168.1.80:8099`: serves `dashboard.html` + transparent proxy of `/v1`, `/v2`, `/health` etc. to `127.0.0.1:8090` with `Authorization` forwarded. SSE passthrough. Not in OpenAPI |
+| `README.md`, `docs/API.md`, `docs/QUICKSTART.md` | Base URL set to `api.noodlefinger.io` + retirement notice for `taco.noodlefinger.io` |
+| `~/.config/systemd/user/{noodle-i,noodle-v,noodle-mv,taco-dashboard}.service` *(new)* | systemd user units for the three frontend apps and the new admin dashboard. All `Type=simple` + `KillMode=control-group`, all enabled for boot |
+
+### Migration notes for clients
+
+- **Required**: repoint from `taco.noodlefinger.io` to `api.noodlefinger.io`. The old DNS is gone — clients still pointed at `taco.` get NXDOMAIN and fail immediately.
+- If you hit 404 on a job that used to work cross-key — that's the IDOR fix. Use the same bearer that submitted the job.
+- If you hit 401 on `GET /dashboard` or `GET /v1/system/gpu` — intentional; use the LAN admin server on 8099 (SSH tunnel off-LAN).
+
+---
+
+## v1.8.0 — 2026-04-18
+
+### Flux 2 Klein identity preservation on `/v2/image-edit`
+
+Adds three optional fields to `ImageEditRequest` for subject-identity-preserving edits on Klein, ported from [`capitan01R/ComfyUI-Flux2Klein-Enhancer`](https://github.com/capitan01R/ComfyUI-Flux2Klein-Enhancer#identity-preservation-nodes) (MIT). Fully additive — default behaviour is unchanged.
+
+- **`preserve_identity: bool = false`** — master switch. `false` is a zero-cost no-op path. `true` is rejected with `422 preserve_identity_klein_only` for any `model` other than `flux2-klein` (hooks target the Klein KV transformer specifically).
+- **`identity_strength: float = 0.5`** — overall dial ∈ [0, 1]. Scales both internal hooks proportionally. `0.5` reproduces the upstream plugin's recommended defaults; `1.0` is maximum. `0.0` is treated as a no-op even if `preserve_identity=true`.
+- **`identity_mode: "balanced" | "faithful" | "loose"` = "balanced"`** — three curated presets. Each pairs one `IdentityGuidance` mode (latent-space pull) with one `IdentityFeatureTransfer` mode (attention-output steering):
+  - `balanced` = `adaptive` + `cosine_pull` (plugin default)
+  - `faithful` = `direct` + `topk_replace` (stronger lock)
+  - `loose` = `channel_match` + `mean_transfer` (palette/lighting fidelity, flexible geometry)
+
+Under the hood:
+- **IdentityGuidance** runs in `callback_on_step_end`, pulls the denoised latent toward the VAE-encoded first reference inside the sampling window `[0, 0.5]`. Three modes implemented: `direct`, `adaptive` (cosine-weighted), `channel_match`.
+- **IdentityFeatureTransfer** uses `torch.nn.Module.register_forward_hook` on `Flux2Attention` within the middle-plus 25–88% of the 8 double-stream blocks (`transformer_blocks[2..6]` on the current Klein 9B). Three modes implemented: `cosine_pull`, `topk_replace`, `mean_transfer`. Because Klein KV caches reference K/V after step 0 (ref tokens not in subsequent attention sequences), the hook is self-gating: it observes `T_img > expected_gen_tokens` before blending.
+- Both hooks share the same per-request `reference_latent` derived from resizing `image_uris[0]` to target `(width, height)` then VAE-encoding once.
+- Hook install + teardown lives in `flux_identity.identity_session()` — a strict `contextmanager` with `try/finally` hook removal, important because `FluxManager._pipe` is long-lived across requests; any leaked state would corrupt subsequent non-identity edits.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `flux_identity.py` *(new, ~340 LOC)* | `IdentityGuidance` + `IdentityFeatureTransfer` + `_resolve_identity_preset` + `identity_session` context manager |
+| `server.py` | `ImageEditRequest` gains 3 fields; `image_edit` (v1) + `v2_image_edit` (v2) validate Klein-only + forward new params through the dispatch params dict |
+| `flux_manager.py` | `_edit()` accepts + forwards the 3 kwargs; when active, prepares reference latent via `pipe.vae.encode(resized first image)` and wraps the pipeline call in `identity_session` |
+| `docs/API.md` | New "Identity preservation" subsection under `POST /v1/image-edit` documenting preset table, known limits, and timing delta |
+
+### Client guidance
+
+- Existing clients are unaffected — all three fields default to zero-cost off.
+- For best results: portrait-style first reference, `balanced` preset, `identity_strength=0.5–0.7`. Bump to `faithful` when the edit prompt is radically different from the reference (e.g., "now as a statue"). Use `loose` for pose / scene changes where strict pixel lock would fight the prompt.
+- No new endpoint — this continues to ship through `POST /v2/image-edit` (async) and `POST /v1/image-edit` (sync).
+
+---
+
 ## v1.7.0 — 2026-04-17
 
 ### IC-LoRA video outpaint — new `/v2/video-outpaint` endpoint

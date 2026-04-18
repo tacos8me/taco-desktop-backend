@@ -610,7 +610,10 @@ app.add_middleware(
 async def check_api_key(request: Request, call_next):
     if not config.API_KEYS:
         return await call_next(request)
-    if request.url.path in ("/health", "/v1/approved-images/events", "/dashboard", "/v1/system/gpu"):
+    # /health only — the others (dashboard, GPU telemetry) were moved to the
+    # LAN-only admin port (see dashboard_server.py). Internet-exposed paths
+    # all require Bearer auth now (SEC P1-1 / P1-2, v1.8.1).
+    if request.url.path in ("/health", "/v1/approved-images/events"):
         return await call_next(request)
     # SSE job streams: EventSource can't set custom headers, so these endpoints
     # accept a `?token=` query param and do their own auth inside the handler.
@@ -764,6 +767,10 @@ class ImageEditRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     seed: int | None = None
     lora: LoRAInput | None = None
+    # v1.8.0 — identity preservation (Klein-only, see docs/API.md#preserve-identity)
+    preserve_identity: bool = False
+    identity_strength: float = Field(default=0.5, ge=0.0, le=1.0)
+    identity_mode: Literal["balanced", "faithful", "loose"] = "balanced"
 
 
 class ChatMessage(BaseModel):
@@ -1103,14 +1110,12 @@ def _error(status: int, msg: str) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+# v1.8.1 / SEC P1-1+P1-2: dashboard moved to the LAN-only admin server on
+# port 8099 (dashboard_server.py). Keeping a stub route that 404s avoids
+# misleading crawlers / cached links into thinking they hit something real.
 @app.get("/dashboard", include_in_schema=False)
-async def dashboard():
-    """Serve the GPU management dashboard (static HTML SPA)."""
-    from fastapi.responses import HTMLResponse
-    dash_path = Path(__file__).parent / "dashboard.html"
-    if not dash_path.exists():
-        return _error(404, "dashboard.html not found")
-    return HTMLResponse(content=dash_path.read_text(), media_type="text/html")
+async def dashboard_moved():
+    return _error(404, "Not found")
 
 
 _gpu_cache: dict | None = None
@@ -2340,6 +2345,11 @@ async def image_edit(body: ImageEditRequest) -> Response:
     if isinstance(flux_lora_result, JSONResponse):
         return flux_lora_result
     lora_path, lora_strength = flux_lora_result
+    # v1.8.0: preserve_identity is Klein-only (hooks target Flux2KleinKVPipeline)
+    if body.preserve_identity and body.model != "flux2-klein":
+        return _error(422, "preserve_identity_klein_only")
+    # Zero-strength is just a no-op — downgrade quietly so the hook path is skipped.
+    effective_preserve = body.preserve_identity and body.identity_strength > 0.0
     try:
         image_paths = [str(uploads.resolve(uri)) for uri in body.image_uris]
         width = (body.width // 16) * 16
@@ -2360,6 +2370,9 @@ async def image_edit(body: ImageEditRequest) -> Response:
                 model=body.model,
                 lora_path=lora_path,
                 lora_strength=lora_strength,
+                preserve_identity=effective_preserve,
+                identity_strength=body.identity_strength,
+                identity_mode=body.identity_mode,
             )
         return Response(content=image_bytes, media_type="image/webp")
     except FluxLoraError as exc:
@@ -2752,6 +2765,10 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
     if isinstance(flux_lora_result, JSONResponse):
         return flux_lora_result
     lora_path, lora_strength = flux_lora_result
+    # v1.8.0: preserve_identity is Klein-only (hooks target Flux2KleinKVPipeline)
+    if body.preserve_identity and body.model != "flux2-klein":
+        return _error(422, "preserve_identity_klein_only")
+    effective_preserve = body.preserve_identity and body.identity_strength > 0.0
     image_paths = [str(uploads.resolve(uri)) for uri in body.image_uris]
     width = (body.width // 16) * 16
     height = (body.height // 16) * 16
@@ -2760,7 +2777,10 @@ async def v2_image_edit(body: ImageEditRequest, request: Request) -> JSONRespons
                   num_inference_steps=body.num_inference_steps,
                   guidance_scale=body.guidance_scale, seed=seed,
                   model=body.model,
-                  lora_path=lora_path, lora_strength=lora_strength)
+                  lora_path=lora_path, lora_strength=lora_strength,
+                  preserve_identity=effective_preserve,
+                  identity_strength=body.identity_strength,
+                  identity_mode=body.identity_mode)
     return _submit_job(JobType.IMAGE_EDIT, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -2815,10 +2835,13 @@ async def v2_music(body: MusicGenerationRequest, request: Request) -> JSONRespon
 
 
 @app.get("/v2/jobs/{job_id}")
-async def v2_job_status(job_id: str) -> JSONResponse:
+async def v2_job_status(job_id: str, request: Request) -> JSONResponse:
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
+    deny = _require_owner(job.api_key, request)
+    if deny is not None:
+        return deny
     return JSONResponse(content={
         "job_id": job.id,
         "status": job.status,
@@ -2834,7 +2857,7 @@ async def v2_job_status(job_id: str) -> JSONResponse:
 
 
 @app.get("/v2/jobs/{job_id}/preview")
-async def v2_job_preview(job_id: str) -> Response:
+async def v2_job_preview(job_id: str, request: Request) -> Response:
     """Return a low-res preview JPEG for a job in progress or completed.
 
     Four paths:
@@ -2854,6 +2877,9 @@ async def v2_job_preview(job_id: str) -> Response:
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
+    deny = _require_owner(job.api_key, request)
+    if deny is not None:
+        return deny
 
     # Path 1: cached preview in RAM (Flux step-end, or worker backfill)
     if job.preview_bytes:
@@ -2901,10 +2927,13 @@ async def v2_job_preview(job_id: str) -> Response:
 
 
 @app.get("/v2/jobs/{job_id}/result")
-async def v2_job_result(job_id: str) -> Response:
+async def v2_job_result(job_id: str, request: Request) -> Response:
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
+    deny = _require_owner(job.api_key, request)
+    if deny is not None:
+        return deny
     if job.status != JobStatus.COMPLETED or not job.result_uri:
         return _error(409, "Job result not ready")
     try:
@@ -2921,10 +2950,13 @@ async def v2_job_result(job_id: str) -> Response:
 
 
 @app.delete("/v2/jobs/{job_id}")
-async def v2_cancel_job(job_id: str) -> JSONResponse:
+async def v2_cancel_job(job_id: str, request: Request) -> JSONResponse:
     job = job_store.get(job_id)
     if job is None:
         return _error(404, "Job not found")
+    deny = _require_owner(job.api_key, request)
+    if deny is not None:
+        return deny
     if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
         return _error(409, "Cannot cancel a finished job")
     job.status = JobStatus.CANCELLED
@@ -2956,6 +2988,7 @@ async def v2_job_stream(
     # Match the middleware's "no keys configured = auth disabled" mode, since
     # this endpoint bypasses the middleware to allow `?token=` query-param auth
     # (EventSource can't set headers).
+    api_key: str | None = None
     if config.API_KEYS:
         api_key = _resolve_sse_token(token) or _extract_api_key(request)
         if not api_key:
@@ -2963,6 +2996,11 @@ async def v2_job_stream(
 
     job = job_store.get(job_id)
     if job is None:
+        return _error(404, "Job not found")
+    # SEC P0-1: ownership gate. Reuse the api_key we already resolved above
+    # rather than re-resolving via _require_owner. Constant-time compare;
+    # 404 on mismatch (same shape as job-missing, no existence oracle).
+    if config.API_KEYS and job.api_key and api_key and not _secrets.compare_digest(job.api_key, api_key):
         return _error(404, "Job not found")
 
     import json as _json
@@ -3425,6 +3463,40 @@ def _extract_api_key(request: Request) -> str | None:
     return None
 
 
+def _require_owner(
+    owner_key: str, request: Request, *, sse_token: str | None = None,
+) -> JSONResponse | None:
+    """Ownership gate for in-memory job/batch endpoints. SEC P0-1 (v1.8.2).
+
+    Returns a 404 JSONResponse when the caller's Bearer (or SSE ``?token=``)
+    does not match the resource's ``api_key``. Returns ``None`` — caller may
+    proceed — when:
+
+      - ``owner_key`` is empty/falsy (legacy resources or auth-disabled-mode
+        submissions — preserves backwards-compat so pre-fix jobs keep working)
+      - ``config.API_KEYS`` is empty (auth globally disabled — parity with the
+        middleware's bypass)
+      - the caller's key equals ``owner_key`` via constant-time compare
+
+    Returns 404 (not 403) on mismatch to avoid an existence oracle: an attacker
+    probing random job IDs sees the same 404 shape whether the ID is unknown or
+    belongs to another tenant.
+
+    Job/batch endpoints that previously returned 404 for "not found" still do;
+    this helper only ADDS a tenancy filter on top.
+    """
+    if not owner_key or not config.API_KEYS:
+        return None
+    caller: str | None = None
+    if sse_token:
+        caller = _resolve_sse_token(sse_token)
+    if not caller:
+        caller = _extract_api_key(request)
+    if not caller or not _secrets.compare_digest(owner_key, caller):
+        return _error(404, "Not found")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Batch Endpoints — Phase 3
 # ---------------------------------------------------------------------------
@@ -3496,11 +3568,14 @@ async def v2_batch_submit(body: BatchRequest, request: Request) -> JSONResponse:
 
 
 @app.get("/v2/batch/{batch_id}")
-async def v2_batch_status(batch_id: str) -> JSONResponse:
+async def v2_batch_status(batch_id: str, request: Request) -> JSONResponse:
     """Poll batch status + partial results."""
     batch = batch_store.get(batch_id)
     if batch is None:
         return _error(404, "Batch not found")
+    deny = _require_owner(batch.api_key, request)
+    if deny is not None:
+        return deny
     return JSONResponse(content={
         "batch_id": batch.id,
         "status": batch.status,
@@ -3529,11 +3604,14 @@ async def v2_batch_status(batch_id: str) -> JSONResponse:
 
 
 @app.get("/v2/batch/{batch_id}/result/{index}")
-async def v2_batch_item_result(batch_id: str, index: int) -> Response:
+async def v2_batch_item_result(batch_id: str, index: int, request: Request) -> Response:
     """Download the result file for a completed batch item."""
     batch = batch_store.get(batch_id)
     if batch is None:
         return _error(404, "Batch not found")
+    deny = _require_owner(batch.api_key, request)
+    if deny is not None:
+        return deny
     for r in batch.results:
         if r.index == index and r.status == "completed" and r.result_uri:
             try:
@@ -3551,11 +3629,14 @@ async def v2_batch_item_result(batch_id: str, index: int) -> Response:
 
 
 @app.delete("/v2/batch/{batch_id}")
-async def v2_batch_cancel(batch_id: str) -> JSONResponse:
+async def v2_batch_cancel(batch_id: str, request: Request) -> JSONResponse:
     """Cancel remaining items in a batch."""
     batch = batch_store.get(batch_id)
     if batch is None:
         return _error(404, "Batch not found")
+    deny = _require_owner(batch.api_key, request)
+    if deny is not None:
+        return deny
     if batch.status in (BatchStatus.COMPLETED, BatchStatus.FAILED, BatchStatus.CANCELLED):
         return JSONResponse(status_code=409, content={
             "error": "batch_already_finished",

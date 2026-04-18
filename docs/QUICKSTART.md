@@ -12,10 +12,13 @@ Everything you need to ship a working client in 5 minutes. For everything else �
 ## The 60-second version
 
 ```
-Base URL: http://<host>:8090
-Auth:     Authorization: Bearer <api-key>    (required on every request)
-Pattern:  POST /v2/<op>  →  SSE /v2/jobs/<id>/stream  →  GET /v2/jobs/<id>/result
+Public base URL: https://api.noodlefinger.io        (canonical, Cloudflare-proxied)
+LAN / dev URL:   http://<host>:8090                 (uvicorn direct, no CF)
+Auth:            Authorization: Bearer <api-key>    (required on every request)
+Pattern:         POST /v2/<op>  →  SSE /v2/jobs/<id>/stream  →  GET /v2/jobs/<id>/result
 ```
+
+> `taco.noodlefinger.io` was retired 2026-04-18 and no longer resolves.
 
 ## The golden path
 
@@ -30,6 +33,8 @@ For any generation (video or image):
 ## Full browser example (image generation with phase UI)
 
 ```js
+// In prod, use the public base:   const API = "https://api.noodlefinger.io";
+// For local dev against uvicorn:
 const API = "http://localhost:8090";
 const KEY = "your-api-key";
 

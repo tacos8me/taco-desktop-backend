@@ -2,7 +2,8 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.7.0 (2026-04-17)
+**Version**: v1.8.1 (2026-04-18)
+**Public API base URL**: `https://api.noodlefinger.io` *(Cloudflare-proxied — `taco.noodlefinger.io` was retired 2026-04-18, DNS no longer resolves)*
 
 ## Features
 
@@ -10,6 +11,7 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 - **Video outpaint** *(v1.7.0)* -- IC-LoRA expands a source video's canvas to a larger target resolution; LoRA fills the black padding with temporally-consistent content. 9 placement positions, optional stage-2 skip for fast previews
 - **CFG++ sampler** -- ported from ComfyUI's `euler_ancestral_cfg_pp`, default ON, togglable via `/v1/system/sampler` and dashboard
 - **Image generation** -- Flux 2 Dev and Klein KV for text-to-image, image-to-image, and multi-reference editing
+- **Identity preservation** *(v1.8.0)* -- optional `preserve_identity` flag on Klein image-edits; pulls denoised latents + attention features toward the first reference for subject/facial consistency under heavy prompt deviation. 3 presets (`balanced`, `faithful`, `loose`) + strength dial
 - **Image editing** -- JoyAI instruction-based single-image editing via sidecar on cuda:1
 - **ERNIE-Image** -- baidu/ERNIE-Image 8B DiT text-to-image via sidecar on cuda:1, ~11 s at turbo steps
 - **Music generation** -- ACE Step xl-base+LM for text-to-music, covers, repainting, and stem extraction

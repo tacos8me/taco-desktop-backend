@@ -1,7 +1,10 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.7.0 (2026-04-17)
-**Base URL:** `http://<host>:8090`
+**Server version:** v1.8.1 (2026-04-18)
+**Public base URL:** `https://api.noodlefinger.io` *(canonical; Cloudflare-proxied via the shared `noodle` tunnel)*
+**LAN / dev base URL:** `http://<host>:8090` (uvicorn direct)
+
+> **Deprecation note (v1.8.1):** `https://taco.noodlefinger.io` was retired as of 2026-04-18 — DNS no longer resolves. All traffic must use `api.noodlefinger.io`.
 **Source of truth:** `/mnt/nvme-1/servers/taco-backend/server.py`. This document is the client contract — any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes, auth) MUST update this file in the same commit.
 
 > **New to the API?** Start with [docs/QUICKSTART.md](./QUICKSTART.md). This doc is the exhaustive spec.
@@ -57,7 +60,9 @@ Authorization: Bearer <api-key>
 - Keys live in `.api_keys` on the server (one per line). Empty file ⇒ auth disabled process-wide.
 - Constant-time compare (`secrets.compare_digest`) against every configured key.
 - Middleware rejects with `401 {"error": "Invalid or missing API key", "message": "...", "detail": "..."}` on any mismatch.
-- **No-auth endpoints:** `GET /health`, `GET /dashboard`, `GET /v1/system/gpu`, `GET /v1/approved-images/events`, `GET /v2/jobs/{id}/stream`. The two streaming endpoints accept either a bearer header (programmatic clients) or `?token=<sse-token>` query param (browsers, since `EventSource` cannot set custom headers).
+- **No-auth endpoints (public):** `GET /health`, `GET /v1/approved-images/events` (SSE, server-filtered by api_key_hash), `GET /v2/jobs/{id}/stream` (SSE, via bearer header or `?token=<sse-token>` query param — browsers use the query param since `EventSource` cannot set custom headers).
+- **Removed from public surface (v1.8.1):** `GET /dashboard` and `GET /v1/system/gpu` now require a bearer token and are ONLY served by the LAN-only admin companion on port 8099 (see `dashboard_server.py`). On the public host they respond with 401.
+- **Tenancy (v1.8.1 / SEC P0-1):** every `/v2/jobs/{id}` and `/v2/batch/{id}` endpoint enforces that the caller's bearer matches the resource's owner key. Cross-tenant access returns `404 Not found` with the same shape as an unknown ID (no existence oracle). Jobs and batches created before tenancy was enforced — or under auth-disabled mode — have an empty `api_key` and remain accessible to everyone (backwards-compat). History endpoints have always been tenancy-scoped via SQL `api_key_hash` filters.
 
 ### Error shape
 
@@ -710,6 +715,9 @@ All v1 generation endpoints can return:
 | `guidance_scale` | float | `4.0` | Klein ignores. JoyAI respects. |
 | `seed` | int \| null | `null` | |
 | `lora` | [`LoRAInput`](#lorainput) \| null | `null` | Flux only; **NOT supported for `joyai-edit` (422)** |
+| `preserve_identity` *(v1.8.0)* | bool | `false` | **Klein-only.** Enables identity-preservation hooks. `422 preserve_identity_klein_only` if true with any other `model`. |
+| `identity_strength` *(v1.8.0)* | float | `0.5` | `0.0 ≤ x ≤ 1.0`. Ignored when `preserve_identity=false`. `0.0` is treated as a no-op even if `preserve_identity=true`. |
+| `identity_mode` *(v1.8.0)* | enum | `"balanced"` | `"balanced"` \| `"faithful"` \| `"loose"`. See preset table below. |
 
 **Response:** `200 image/webp`.
 
@@ -719,6 +727,31 @@ All v1 generation endpoints can return:
 - Returns `503 "JoyAI not enabled (LOAD_JOYAI=0)"` if `LOAD_JOYAI` is unset.
 - Returns `503 "sidecar_unreachable"` if the joyai-sidecar process is down. Clients should fall back to `flux2-klein`.
 - Auto-exits turbo mode if active (blocks ~15 s).
+
+<a id="preserve-identity"></a>
+
+**Identity preservation (v1.8.0, Klein-only):**
+
+When `preserve_identity=true` and `model="flux2-klein"`, two training-free hooks are applied on top of Klein's standard reference-conditioned edit to hold subject/facial identity under heavier prompt deviation (ported from [capitan01R/ComfyUI-Flux2Klein-Enhancer](https://github.com/capitan01R/ComfyUI-Flux2Klein-Enhancer#identity-preservation-nodes)):
+
+- **IdentityGuidance** pulls the denoised latent toward the VAE-encoded first reference inside the sampling window `[0.0, 0.5]`.
+- **IdentityFeatureTransfer** registers forward hooks on the middle 25%–88% of the double-stream transformer blocks' self-attention, blending generation tokens toward reference tokens in the attention output.
+
+`identity_mode` presets:
+
+| Preset | Guidance mode | Transfer mode | When to use |
+|---|---|---|---|
+| `"balanced"` *(default)* | `adaptive` (cosine-weighted pull) | `cosine_pull` | General portraits + edits; per-region smart blending |
+| `"faithful"` | `direct` (unconditional blend) | `topk_replace` (top 50%) | Keeping facial structure under strong edit prompts; may fight creative prompts |
+| `"loose"` | `channel_match` (stats match) | `mean_transfer` (distribution shift) | "Same character, new pose / scene" — preserves palette and lighting, lets geometry flex |
+
+`identity_strength` scales both hooks proportionally: `guidance = strength`, `transfer = strength × 0.3` (preserves the upstream plugin's 0.50:0.15 default ratio at `strength=0.5`). `strength=0.0` collapses to the unmodified edit path.
+
+**Known limits:**
+- The first `image_uri` is used as the identity anchor. Put the identity-defining reference first if you pass multiple.
+- Klein KV runs attention over reference tokens only on step 0 (K/V are cached thereafter). IdentityFeatureTransfer therefore takes effect on step 0 only; IdentityGuidance maintains identity pressure on remaining steps via latent-space correction.
+- Timing delta vs. a plain Klein edit: +50–100 ms typical at 4 steps on Blackwell (dominated by VAE-encoding the reference once + cosine similarity passes).
+- Identity strength > 0.8 can over-constrain the edit prompt, producing near-copies of the reference. Start at 0.5 and tune up.
 
 ### `POST /v1/music`
 

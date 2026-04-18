@@ -423,6 +423,10 @@ class FluxManager:
         lora_path: str | None = None, lora_strength: float = 1.0,
         callback_on_step_end: object = None,
         phase_sink: Callable | None = None,
+        # v1.8.0 — identity preservation (Klein-only)
+        preserve_identity: bool = False,
+        identity_strength: float = 0.5,
+        identity_mode: str = "balanced",
     ) -> bytes:
         """Multi-reference image editing via Dev or Klein."""
         self.ensure_model(model, user_lora_path=lora_path)
@@ -438,16 +442,66 @@ class FluxManager:
         # Klein KV pipeline is distilled and doesn't accept guidance_scale.
         if model != "flux2-klein":
             kwargs["guidance_scale"] = guidance_scale
-        if callback_on_step_end is not None:
-            kwargs["callback_on_step_end"] = callback_on_step_end
+
+        # Identity preservation is Klein-only (server handler already
+        # gates on model=="flux2-klein"; double-check defensively here).
+        use_identity = (
+            preserve_identity
+            and model == "flux2-klein"
+            and identity_strength > 0.0
+        )
+
+        if callback_on_step_end is not None or use_identity:
             kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
-        try:
-            result = self._pipe(**kwargs)
-        except (torch.cuda.OutOfMemoryError, RuntimeError):
-            logger.exception("Flux edit OOM, unloading pipeline")
-            self.unload()
-            raise
+        if use_identity:
+            from flux_identity import identity_session
+            # Prepare the identity reference by running Klein's OWN
+            # encode-path so the latent ends up in the same normalized
+            # + patchified space the denoise loop operates in. Skipping
+            # the BN step or the 2x2 patchify produces off-distribution
+            # latents that the guidance modes then drive into garbage
+            # after VAE decode.
+            ref_pil = images[0].resize((width, height), Image.LANCZOS)
+            ref_pixel = self._pipe.image_processor.preprocess(ref_pil).to(
+                device=self._device, dtype=self._pipe.vae.dtype,
+            )
+            # _encode_vae_image applies: vae.encode → argmax sample →
+            # _patchify_latents (2x2 pack, 16ch→64ch) → BN normalize.
+            # Output shape: [1, 64, H/16, W/16] for Klein on 1024x1024.
+            ref_latent_4d = self._pipe._encode_vae_image(ref_pixel, generator)
+            # _pack_latents converts [B, C, H/2, W/2] → [B, H*W/4, C],
+            # matching the in-denoise callback latent shape exactly.
+            ref_latent_packed = self._pipe._pack_latents(ref_latent_4d)
+            # Klein attention sequence packs at 16-pixel granularity (VAE
+            # 8× + 2×2 pack). Empirically verified via forward-hook shape
+            # trace: a 1024×1024 edit has 4096 gen tokens.
+            expected_gen_tokens = (height // 16) * (width // 16)
+            try:
+                with identity_session(
+                    self._pipe,
+                    reference_latent=ref_latent_packed,
+                    mode_preset=identity_mode,
+                    strength=identity_strength,
+                    num_inference_steps=num_inference_steps,
+                    expected_gen_tokens=expected_gen_tokens,
+                    base_callback=callback_on_step_end,
+                ) as ic_callback:
+                    kwargs["callback_on_step_end"] = ic_callback
+                    result = self._pipe(**kwargs)
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                logger.exception("Flux edit OOM (identity), unloading pipeline")
+                self.unload()
+                raise
+        else:
+            if callback_on_step_end is not None:
+                kwargs["callback_on_step_end"] = callback_on_step_end
+            try:
+                result = self._pipe(**kwargs)
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                logger.exception("Flux edit OOM, unloading pipeline")
+                self.unload()
+                raise
 
         gc.collect()
         torch.cuda.empty_cache()

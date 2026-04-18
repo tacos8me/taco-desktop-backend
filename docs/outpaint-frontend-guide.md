@@ -2,6 +2,8 @@
 
 **Applies to:** taco-backend v1.7.0 (2026-04-17) and later. Canonical reference: [docs/API.md](./API.md). Related: [retake-frontend-guide.md](./retake-frontend-guide.md), [QUICKSTART.md](./QUICKSTART.md).
 
+**Public base URL:** `https://api.noodlefinger.io` (canonical, Cloudflare-proxied). For local dev, use `http://localhost:8090`. `taco.noodlefinger.io` was retired 2026-04-18.
+
 ## What it does
 
 Expands a source video's canvas to a larger `target_resolution` by scaling the source proportionally, letterboxing it with pure-black padding at the chosen `position`, and using an IC-LoRA (`oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint`) to fill those black regions with temporally coherent generated content driven by your `prompt`. The result is a single video at `target_resolution` where the original footage is preserved pixel-perfect in place and the surrounding canvas becomes an AI-generated extension of the scene.
