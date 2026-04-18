@@ -2,6 +2,24 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.8.2 — 2026-04-18
+
+### Non-server hardening
+
+- **SEC P2-2 — /dev/shm size guard on MP4 tmpfile** (`split_model_manager.py`). Concurrent turbo encodes (2 local + up to 4 Modal workers) could each land several hundred MB of intermediate MP4 on `/dev/shm`, and when the tmpfs ceiling was hit we saw the ltx-sidecar freeze on `kmalloc`. Added `_pick_tmp_dir(estimated_bytes)` which queries `shutil.disk_usage(config.MP4_TMPDIR)` and falls back to `/tmp` (NVMe) with a WARN log when free bytes drop below `max(estimated * 3, 2 GB)`. Every `_run_*` call site now passes an estimate derived from `num_frames × width × height × 3 × 1.2`. `_video_to_bytes`'s legacy signature still works — `estimated_bytes` is an optional kwarg defaulting to a conservative 500 MB.
+- **SEC P2-5 + P2-6 — History blob caps + WAL checkpoint cadence** (`history_store.py`). `params_json` is now capped at 100 KB and `gen_config_json` at 50 KB; over-limit blobs are replaced with a `{"__truncated__": true, "original_bytes": N, "preview": "..."}` sentinel (first 4 KB of the original). Prevents a single rogue request from inflating the history row to multi-MB. Added a write counter + automatic `PRAGMA wal_checkpoint(TRUNCATE)` every 500 rows via new `checkpoint_wal(mode="TRUNCATE")` method; logs at INFO if the WAL file was >1 GB immediately before the checkpoint.
+- **SEC P2-11 — Bounded retry on `IdentityFeatureTransfer` blend failures** (`flux_identity.py`). The blend-exception path silently swallowed every failure and returned the raw attention output unmodified. A shape-mismatch regression could silently produce an identity-free image across all 6 hooks × N steps, leaving the client no signal. Added `self._consec_failures` on `IdentityFeatureTransfer`: first failure logs WARN with shape info, 5 consecutive failures re-raises so `identity_session`'s `try/finally` tears down the forward hooks and the job aborts cleanly.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `split_model_manager.py` | Added `_pick_tmp_dir()` + `_estimate_mp4_bytes()` module-level helpers, `_SHM_MIN_FREE_BYTES` + `_DEFAULT_ENCODE_ESTIMATE_BYTES` constants, and optional `estimated_bytes` kwarg on `_video_to_bytes`. All 7 call sites (`_run_t2v`, `_run_t2v_hq`, `_run_i2v`, `_run_a2v`, `_run_retake`, `_run_outpaint` ×2) pass an estimate |
+| `history_store.py` | New `_truncate_json_blob()` helper + `_HISTORY_PARAMS_MAX_BYTES` / `_HISTORY_GEN_CONFIG_MAX_BYTES` / `_HISTORY_TRUNCATED_PREVIEW_BYTES` / `_HISTORY_WAL_CHECKPOINT_EVERY` / `_HISTORY_WAL_WARN_BYTES` constants; `HistoryStore.save()` truncates before INSERT and bumps `_write_count`; new `checkpoint_wal(mode)` method |
+| `flux_identity.py` | `_MAX_BLEND_FAILURES` constant; `IdentityFeatureTransfer._consec_failures` counter; `_hook_fn` logs WARN on first failure, re-raises after 5 consecutive |
+
+---
+
 ## v1.8.1 — 2026-04-18
 
 ### Security hardening + canonical public URL + frontend service persistence

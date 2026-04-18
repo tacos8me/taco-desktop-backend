@@ -13,6 +13,7 @@ import asyncio
 import gc
 import logging
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -657,13 +658,70 @@ def _decode_video_fp32(latent: torch.Tensor, decoder, tiling, generator) -> Iter
     yield from decoder.decode_video(latent, tiling, generator)
 
 
-def _video_to_bytes(video: Iterator[torch.Tensor], fps: float, audio: Audio, num_frames: int, *, include_audio: bool = True) -> bytes:
+# Concurrent turbo encodes (2 local + up to 4 Modal) can each write 100s of MB
+# of intermediate MP4 to /dev/shm. Without a guard they race the host into tmpfs
+# exhaustion, which kernel-panics some kmalloc paths and freezes ltx-sidecar. The
+# guard falls back to /tmp (NVMe) when the tmpfs ceiling is too tight.
+_SHM_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB floor below which we fall back
+_DEFAULT_ENCODE_ESTIMATE_BYTES = 500 * 1024 * 1024  # 500 MB when caller can't estimate
+
+
+def _estimate_mp4_bytes(num_frames: int, width: int, height: int) -> int:
+    """Rough upper bound for the on-disk MP4 intermediate.
+
+    Real x264 output at CRF 18 is far smaller, but the PyAV encoder's working
+    set plus muxer headroom can spike higher than final file size. Caller
+    wants the result to be *an overestimate* so the guard fails safe.
+    """
+    return int(num_frames * width * height * 3 * 1.2)
+
+
+def _pick_tmp_dir(estimated_bytes: int) -> Path:
+    """Choose tmp dir for the MP4 intermediate.
+
+    Returns ``config.MP4_TMPDIR`` (tmpfs) when it has at least
+    ``max(estimated_bytes * 3, _SHM_MIN_FREE_BYTES)`` free. Otherwise falls
+    back to ``/tmp`` and warns. Never raises — disk_usage failures log and
+    default to tmpfs so the caller's existing error path handles it.
+    """
+    target = Path(config.MP4_TMPDIR)
+    required = max(int(estimated_bytes) * 3, _SHM_MIN_FREE_BYTES)
+    try:
+        usage = shutil.disk_usage(str(target))
+    except OSError:
+        logger.warning("disk_usage(%s) failed; using tmpfs anyway", target, exc_info=True)
+        return target
+    if usage.free < required:
+        logger.warning(
+            "tmpfs %s has %.1f MiB free < required %.1f MiB (est=%.1f MiB × 3, floor %.1f MiB); "
+            "falling back to /tmp",
+            target,
+            usage.free / (1024 * 1024),
+            required / (1024 * 1024),
+            estimated_bytes / (1024 * 1024),
+            _SHM_MIN_FREE_BYTES / (1024 * 1024),
+        )
+        return Path("/tmp")
+    return target
+
+
+def _video_to_bytes(
+    video: Iterator[torch.Tensor],
+    fps: float,
+    audio: Audio,
+    num_frames: int,
+    *,
+    include_audio: bool = True,
+    estimated_bytes: int | None = None,
+) -> bytes:
     # Can't use BytesIO here: encode_video calls av.open(path, mode="w") without
     # format= kwarg, so PyAV can't infer the container format from a file-like object.
     # dir=config.MP4_TMPDIR puts the intermediate on tmpfs (RAM) instead of /tmp (NVMe),
     # skipping the encode-write + read-back roundtrip through the filesystem.
     video_chunks_number = get_video_chunks_number(num_frames, _get_decode_tiling(num_frames))
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=str(config.MP4_TMPDIR)) as tmp:
+    estimate = estimated_bytes if estimated_bytes is not None else _DEFAULT_ENCODE_ESTIMATE_BYTES
+    tmp_dir = _pick_tmp_dir(estimate)
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=str(tmp_dir)) as tmp:
         tmp_path = tmp.name
     try:
         encode_video(
@@ -1211,7 +1269,11 @@ class SplitModelManager:
             decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         _emit_phase(on_progress, 0.95, "encoding")
         with _timed(f"video_decode+encode job=t2v"):
-            return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+            return _video_to_bytes(
+                decoded_video, fps, decoded_audio, num_frames,
+                include_audio=generate_audio,
+                estimated_bytes=_estimate_mp4_bytes(num_frames, width, height),
+            )
 
     @_with_oom_recovery
     @torch.inference_mode()
@@ -1340,7 +1402,11 @@ class SplitModelManager:
             decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         _emit_phase(on_progress, 0.95, "encoding")
         with _timed("video_decode+encode job=t2v_hq"):
-            return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+            return _video_to_bytes(
+                decoded_video, fps, decoded_audio, num_frames,
+                include_audio=generate_audio,
+                estimated_bytes=_estimate_mp4_bytes(num_frames, width, height),
+            )
 
     @_with_oom_recovery
     @torch.inference_mode()
@@ -1500,7 +1566,11 @@ class SplitModelManager:
             decoded_audio = vae_decode_audio(audio_latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         _emit_phase(on_progress, 0.95, "encoding")
         with _timed("video_decode+encode job=i2v"):
-            return _video_to_bytes(decoded_video, fps, decoded_audio, num_frames, include_audio=generate_audio)
+            return _video_to_bytes(
+                decoded_video, fps, decoded_audio, num_frames,
+                include_audio=generate_audio,
+                estimated_bytes=_estimate_mp4_bytes(num_frames, width, height),
+            )
 
     @_with_oom_recovery
     @torch.inference_mode()
@@ -1679,7 +1749,10 @@ class SplitModelManager:
         original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
         _emit_phase(on_progress, 0.95, "encoding")
         with _timed("video_decode+encode job=a2v"):
-            return _video_to_bytes(decoded_video, fps, original_audio, num_frames)
+            return _video_to_bytes(
+                decoded_video, fps, original_audio, num_frames,
+                estimated_bytes=_estimate_mp4_bytes(num_frames, width, height),
+            )
 
     @_with_oom_recovery
     @torch.inference_mode()
@@ -1820,7 +1893,10 @@ class SplitModelManager:
             decoded_audio = vae_decode_audio(audio_state.latent, worker.ledger.audio_decoder(), worker.ledger.vocoder())
         _emit_phase(on_progress, 0.95, "encoding")
         with _timed("video_decode+encode job=retake"):
-            return _video_to_bytes(decoded_video, fps_vid, decoded_audio, num_frames)
+            return _video_to_bytes(
+                decoded_video, fps_vid, decoded_audio, num_frames,
+                estimated_bytes=_estimate_mp4_bytes(num_frames, vid_width, vid_height),
+            )
 
     @_with_oom_recovery
     @torch.inference_mode()
@@ -1966,7 +2042,11 @@ class SplitModelManager:
             )
             _emit_phase(on_progress, 0.95, "encoding")
             with _timed("video_decode+encode job=outpaint skip_s2=1"):
-                return _video_to_bytes(decoded_video, fps, None, num_frames, include_audio=False)
+                return _video_to_bytes(
+                    decoded_video, fps, None, num_frames,
+                    include_audio=False,
+                    estimated_bytes=_estimate_mp4_bytes(num_frames, target_width, target_height),
+                )
 
         # Stage 2 — upsample 2x + refine at full target res
         upscaled = upsample_video(
@@ -2035,7 +2115,11 @@ class SplitModelManager:
         )
         _emit_phase(on_progress, 0.95, "encoding")
         with _timed("video_decode+encode job=outpaint"):
-            return _video_to_bytes(decoded_video, fps, None, num_frames, include_audio=False)
+            return _video_to_bytes(
+                decoded_video, fps, None, num_frames,
+                include_audio=False,
+                estimated_bytes=_estimate_mp4_bytes(num_frames, target_width, target_height),
+            )
 
     # --- Async API (matches PipelineManager interface) ---
 

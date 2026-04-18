@@ -67,6 +67,13 @@ _BLOCK_END_FRAC = 0.88
 # to preserve the plugin's 0.50:0.15 guidance:transfer ratio at dial=0.5.
 _TRANSFER_STRENGTH_RATIO = 0.3
 
+# If the blend op raises this many times in a row, re-raise and let the
+# pipeline abort. Silently passing the raw attention output through on every
+# step would produce a plausible-looking but identity-free image, which is
+# worse than a hard failure — the user would have no signal that the request
+# didn't do what was asked.
+_MAX_BLEND_FAILURES = 5
+
 
 @dataclass
 class GuidanceConfig:
@@ -214,6 +221,7 @@ class IdentityFeatureTransfer:
         self.expected_gen_tokens = expected_gen_tokens
         self._handles: list = []
         self._ref_token_count_seen: int = 0  # diagnostic
+        self._consec_failures: int = 0
 
     def _blend(self, ref: torch.Tensor, gen: torch.Tensor) -> torch.Tensor:
         cfg = self.config
@@ -284,9 +292,23 @@ class IdentityFeatureTransfer:
         gen_toks = attn_output[:, ref_count:, :]
         try:
             gen_modified = self._blend(ref_toks, gen_toks)
-        except Exception:
-            logger.exception("IdentityFeatureTransfer blend failed; passing through")
+        except Exception as exc:
+            self._consec_failures += 1
+            if self._consec_failures == 1:
+                logger.warning(
+                    "IdentityFeatureTransfer blend failed (ref=%s gen=%s): %s",
+                    tuple(ref_toks.shape), tuple(gen_toks.shape), exc,
+                )
+            if self._consec_failures >= _MAX_BLEND_FAILURES:
+                logger.error(
+                    "IdentityFeatureTransfer: %d consecutive blend failures — "
+                    "re-raising so identity_session tears down cleanly",
+                    self._consec_failures,
+                )
+                raise
             return output
+        else:
+            self._consec_failures = 0
         if gen_modified is gen_toks:
             return output
         new_attn = torch.cat([ref_toks, gen_modified], dim=1)

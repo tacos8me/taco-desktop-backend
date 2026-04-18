@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 
 CURRENT_SCHEMA_VERSION = 2
 
+# Blob caps — a single rogue request can easily serialize multi-MB payloads
+# (LoRA paths list, keyframe images-as-bytes if a caller mis-uses the field,
+# gen_config dumps with giant sigma tables). Left uncapped, the history DB
+# inflates until WAL sync pressure starves /v2/history reads.
+_HISTORY_PARAMS_MAX_BYTES = 100_000  # 100 KB
+_HISTORY_GEN_CONFIG_MAX_BYTES = 50_000  # 50 KB
+# Truncation sentinel includes up to this many bytes of the original payload
+# so the client still has *something* meaningful to display.
+_HISTORY_TRUNCATED_PREVIEW_BYTES = 4096
+
+# WAL checkpoint cadence. Without this, .db-wal grows unbounded between the
+# nightly sqlite VACUUM cron; we've observed it past 4 GB on noisy days.
+_HISTORY_WAL_CHECKPOINT_EVERY = 500
+_HISTORY_WAL_WARN_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS generations (
     id TEXT PRIMARY KEY,
@@ -189,9 +204,32 @@ def _make_thumbnail(media_bytes: bytes, upload_id: str) -> str | None:
         return None
 
 
+def _truncate_json_blob(raw: str, max_bytes: int, job_id: str, label: str) -> str:
+    """Return ``raw`` unchanged if it fits; otherwise return a sentinel.
+
+    The sentinel is itself valid JSON — clients parsing ``params_json`` /
+    ``gen_config_json`` can branch on the ``__truncated__`` key instead of
+    failing to decode.
+    """
+    if len(raw) <= max_bytes:
+        return raw
+    preview = raw[:_HISTORY_TRUNCATED_PREVIEW_BYTES]
+    logger.info(
+        "history %s blob truncated for job=%s: %d > %d bytes",
+        label, job_id, len(raw), max_bytes,
+    )
+    return json.dumps({
+        "__truncated__": True,
+        "original_bytes": len(raw),
+        "preview": preview,
+    })
+
+
 class HistoryStore:
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path = str(db_path or config.HISTORY_DB)
+        self._wal_path = Path(self._db_path + "-wal")
+        self._write_count = 0
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
@@ -278,6 +316,14 @@ class HistoryStore:
         gen_config_json = (
             json.dumps(gen_config_snapshot) if gen_config_snapshot is not None else None
         )
+        if params_json is not None:
+            params_json = _truncate_json_blob(
+                params_json, _HISTORY_PARAMS_MAX_BYTES, job_id, "params_json",
+            )
+        if gen_config_json is not None:
+            gen_config_json = _truncate_json_blob(
+                gen_config_json, _HISTORY_GEN_CONFIG_MAX_BYTES, job_id, "gen_config_json",
+            )
 
         self._conn.execute(
             """INSERT OR REPLACE INTO generations
@@ -306,6 +352,33 @@ class HistoryStore:
                 enhanced_prompt,
             ),
         )
+        self._conn.commit()
+        self._write_count += 1
+        if self._write_count % _HISTORY_WAL_CHECKPOINT_EVERY == 0:
+            try:
+                self.checkpoint_wal()
+            except Exception:
+                logger.warning("history WAL checkpoint failed", exc_info=True)
+
+    def checkpoint_wal(self, mode: str = "TRUNCATE") -> None:
+        """Run ``PRAGMA wal_checkpoint(<mode>)``.
+
+        Call sites: the write counter in :py:meth:`save` triggers this every
+        ``_HISTORY_WAL_CHECKPOINT_EVERY`` rows; external cron / admin hooks
+        may call it manually for a forced flush. Logs at INFO when the WAL
+        file was over the warn threshold so operators can see when the
+        checkpoint actually mattered.
+        """
+        try:
+            wal_bytes = self._wal_path.stat().st_size
+        except OSError:
+            wal_bytes = 0
+        if wal_bytes > _HISTORY_WAL_WARN_BYTES:
+            logger.info(
+                "history WAL size %.1f MiB before checkpoint (mode=%s)",
+                wal_bytes / (1024 * 1024), mode,
+            )
+        self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
         self._conn.commit()
 
     def list(
