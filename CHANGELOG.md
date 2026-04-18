@@ -4,6 +4,29 @@ All notable changes to taco-backend. Format loosely follows [Keep a Changelog](h
 
 ## v1.8.2 — 2026-04-18
 
+### server.py security sweep — admin gate, quotas, validation, timing hardening
+
+Eight SEC findings from the v1.8.1 audit, all landing in `server.py`. No new dependencies. No endpoint URLs change. The one behavioural change that matters to clients is the admin gate on 12 mutation endpoints — see migration note below.
+
+- **SEC P0-2 — Admin gate on 12 mutation endpoints.** `POST /v1/system/{pause,resume,turbo,config,config/reset,flux-config,flux-config/reset,sampler,pool/remote-workers}` and `POST /v1/{flux,ltx}/{unload,reload}` now require the caller's bearer to appear in a new `.admin_keys` file (or `TACO_ADMIN_KEY` env var). On mismatch: `403 admin_required`. Read endpoints (`GET /v1/system/{pool,config,flux-config,sampler}`) stay user-level. **Backwards-compat bridge**: when `.admin_keys` is empty, every entry in `.api_keys` is treated as admin (preserves pre-v1.8.2 behaviour), and a WARN is logged at boot so ops notices the degraded posture. When `.api_keys` is also empty, auth is globally off and the gate is a no-op.
+- **SEC P1-3 — Per-API-key queue caps.** New `PER_KEY_QUEUE_CAP` (default 3), `PER_KEY_MUSIC_CAP` (2), `PER_KEY_BATCH_CAP` (2). Enforced BEFORE the global `MAX_QUEUE_DEPTH` / `MAX_MUSIC_PENDING` / `MAX_BATCH_QUEUE_DEPTH` caps, so one bearer can't claim the whole queue. Breach returns `429 per_key_queue_full` + `Retry-After: 30`. Counters keyed by `sha256(api_key)` — raw bearers never land in the map. Decremented from `worker_loop`'s `finally` (via new `on_complete` callback on `job_queue.py::worker_loop`), from `_run_music_job`'s `finally`, and from `batch_worker` completion.
+- **SEC P1-5 — CharRankResponse validation.** `/v2/char/rank` previously parsed whatever JSON the vision model emitted and echoed it to the client. Now validates against a new `CharRankResponse` Pydantic model (`score` 0–10, `analysis.{face_match,eyes,proportions,overall_likeness}` 1–10, `edits.{add,remove,modify}`). Failures return `502 char_rank_schema_violation` with the Pydantic detail truncated to ≤500 chars.
+- **SEC P2-1 — Constant-time bearer compare.** Middleware `any(compare_digest(...) for key in API_KEYS)` short-circuited on first match, leaking set membership via wall-clock timing. Replaced with full-iteration compare at both the middleware and inside `_require_admin`.
+- **SEC P2-3 — Per-key upload byte quota.** New `PER_KEY_UPLOAD_BYTES_PER_DAY` (default 10 GiB). Rolling 24h window keyed by `sha256(api_key)`. Applied in `PUT /uploads/put/{id}` (early peek via `Content-Length`, final check after body read) and `POST /v1/loras`. Breach returns `429 per_key_upload_quota_exceeded` + `Retry-After: 3600`.
+- **SEC P2-4 — Per-key active-LoRA count.** New `PER_KEY_LORA_COUNT` (default 20). Breach returns `429 per_key_lora_count_exceeded`. Decremented on `DELETE /v1/loras/{id}`.
+- **SEC P2-7 — Magic-byte upload Content-Type check.** `PUT /uploads/put/{id}` now peeks the first 16 bytes of the body and rejects with `422 content_type_mismatch` when the declared `Content-Type` doesn't match the file's magic (JPEG `FF D8`, PNG `89 50 4E 47`, WebP `RIFF..WEBP`, MP4 `ftyp` at offset 4, MP3 `ID3` / `FF FB`, WAV `RIFF..WAVE`, FLAC `fLaC`, Ogg `OggS`). Lenient on `application/octet-stream` and unrecognized/missing content-types — those pass through unchanged.
+- **SEC P2-8 — Dedup auto-exit-turbo.** When the Modal sidecar flaps, every failed remote-turbo job previously spawned its own `_auto_exit_turbo_on_sidecar_failure` task. Added a module-level `_exit_turbo_scheduled` flag + `_schedule_auto_exit_turbo()` wrapper: one exit task max in flight, subsequent failures log a WARN and return.
+- **SEC P2-10 — Manifest type guard.** All three `approved-images/manifest.json` load paths now verify `isinstance(manifest, list)` after parsing and reset to `[]` on mismatch (with a WARN).
+
+### Migration notes for clients
+
+- **Admin gate** is the one user-visible change. If you've been using a single bearer for both generation AND system operations, either:
+  1. Create `/mnt/nvme-1/servers/taco-backend/.admin_keys` with the operator bearer(s), one per line — recommended.
+  2. Do nothing. The backwards-compat bridge keeps every `API_KEYS` entry admin. A `logger.warning` at boot (`admin auth disabled: .admin_keys is empty`) tells you the gate is degraded.
+- **Per-key quota 429s** are new error codes. Clients that already handle `queue_full` can treat `per_key_queue_full` identically (same `Retry-After: 30`). Bulk-upload clients should expect `per_key_upload_quota_exceeded` with `Retry-After: 3600` once a bearer crosses 10 GiB in a 24h window.
+- **`422 content_type_mismatch`** on uploads means the declared `Content-Type` header doesn't match the file's magic bytes. Either correct the header or send `application/octet-stream` (explicitly exempt).
+- **`502 char_rank_schema_violation`** replaces `500 "Failed to parse vision model response"` when the vision model emits malformed JSON.
+
 ### Non-server hardening
 
 - **SEC P2-2 — /dev/shm size guard on MP4 tmpfile** (`split_model_manager.py`). Concurrent turbo encodes (2 local + up to 4 Modal workers) could each land several hundred MB of intermediate MP4 on `/dev/shm`, and when the tmpfs ceiling was hit we saw the ltx-sidecar freeze on `kmalloc`. Added `_pick_tmp_dir(estimated_bytes)` which queries `shutil.disk_usage(config.MP4_TMPDIR)` and falls back to `/tmp` (NVMe) with a WARN log when free bytes drop below `max(estimated * 3, 2 GB)`. Every `_run_*` call site now passes an estimate derived from `num_frames × width × height × 3 × 1.2`. `_video_to_bytes`'s legacy signature still works — `estimated_bytes` is an optional kwarg defaulting to a conservative 500 MB.
@@ -14,9 +37,13 @@ All notable changes to taco-backend. Format loosely follows [Keep a Changelog](h
 
 | File | Change |
 |------|--------|
+| `server.py` | 11 new helpers (`_require_admin`, `_constant_time_match`, `_sha256_key`, per-key counter helpers, upload-window helpers, `_content_type_matches_magic`, `_schedule_auto_exit_turbo`, `_decr_queue_on_complete`); 12 admin-gated handlers gain `request: Request` + gate check; middleware compare fixed; `CharRankResponse` / `CharRankAnalysis` / `CharRankEdits` Pydantic models + `/v2/char/rank` validation; three manifest type guards; per-key increment+decrement wired in `_submit_job` / `v2_music` / `v2_batch_submit` / `_run_music_job` / `batch_worker`; startup-time admin-posture log |
+| `config.py` | `ADMIN_KEYS` loader (from `.admin_keys` / `TACO_ADMIN_KEY`); `PER_KEY_QUEUE_CAP` / `PER_KEY_MUSIC_CAP` / `PER_KEY_BATCH_CAP` / `PER_KEY_UPLOAD_BYTES_PER_DAY` / `PER_KEY_LORA_COUNT` with env-var overrides |
+| `job_queue.py` | `worker_loop(..., on_complete=None)` — optional terminal-state callback invoked from the `finally` block; exceptions inside the callback logged but don't crash the worker |
 | `split_model_manager.py` | Added `_pick_tmp_dir()` + `_estimate_mp4_bytes()` module-level helpers, `_SHM_MIN_FREE_BYTES` + `_DEFAULT_ENCODE_ESTIMATE_BYTES` constants, and optional `estimated_bytes` kwarg on `_video_to_bytes`. All 7 call sites (`_run_t2v`, `_run_t2v_hq`, `_run_i2v`, `_run_a2v`, `_run_retake`, `_run_outpaint` ×2) pass an estimate |
 | `history_store.py` | New `_truncate_json_blob()` helper + `_HISTORY_PARAMS_MAX_BYTES` / `_HISTORY_GEN_CONFIG_MAX_BYTES` / `_HISTORY_TRUNCATED_PREVIEW_BYTES` / `_HISTORY_WAL_CHECKPOINT_EVERY` / `_HISTORY_WAL_WARN_BYTES` constants; `HistoryStore.save()` truncates before INSERT and bumps `_write_count`; new `checkpoint_wal(mode)` method |
 | `flux_identity.py` | `_MAX_BLEND_FAILURES` constant; `IdentityFeatureTransfer._consec_failures` counter; `_hook_fn` logs WARN on first failure, re-raises after 5 consecutive |
+| `docs/API.md` | Admin gate noted under affected endpoints; Error taxonomy additions (`admin_required`, `per_key_queue_full`, `per_key_upload_quota_exceeded`, `per_key_lora_count_exceeded`, `content_type_mismatch`, `char_rank_schema_violation`) |
 
 ---
 

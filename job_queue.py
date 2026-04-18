@@ -230,6 +230,7 @@ async def worker_loop(
     uploads: UploadStore,
     history: "HistoryStore | None" = None,
     turbo_check: Callable[[Job], bool] | Callable[[], bool] | None = None,
+    on_complete: Callable[[Job], None] | None = None,
 ) -> None:
     """Background worker that processes jobs from the queue.
 
@@ -354,6 +355,14 @@ async def worker_loop(
                         logger.warning("Failed to save job %s to history", jid, exc_info=True)
 
                 asyncio.create_task(_save_and_populate())
+            # v1.8.2 / SEC P1-3: notify the caller so it can decrement
+            # per-API-key queue counters. Kept out of the try/except so an
+            # exception inside the callback doesn't crash the worker loop.
+            if on_complete is not None:
+                try:
+                    on_complete(job)
+                except Exception:
+                    logger.warning("worker_loop on_complete callback raised", exc_info=True)
             queue.task_done()
 
 

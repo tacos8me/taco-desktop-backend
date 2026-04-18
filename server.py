@@ -296,6 +296,8 @@ async def _run_music_job(job: Job) -> None:
             except OSError:
                 pass
         job.completed_at = time.monotonic()
+        # v1.8.2 / SEC P1-3: release music quota slot.
+        _decr_key_count(_per_key_music_counts, job.api_key or "")
         if history and job.api_key and result_bytes is not None:
             _params = job.params or {}
             _captured = dict(
@@ -551,7 +553,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
-                    turbo_check=lambda job: _turbo_active and job.type in _VIDEO_JOB_TYPES),
+                    turbo_check=lambda job: _turbo_active and job.type in _VIDEO_JOB_TYPES,
+                    on_complete=_decr_queue_on_complete),
         name="queue-worker",
     )
     cleanup_task = asyncio.create_task(
@@ -577,7 +580,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             _turbo_active = True  # bypass _inference_lock, route 2nd worker to sidecar
             dual_worker_task = asyncio.create_task(
                 worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo,
-                            uploads, history, turbo_check=lambda job: True),
+                            uploads, history, turbo_check=lambda job: True,
+                            on_complete=_decr_queue_on_complete),
                 name="queue-worker-gpu1",
             )
             logger.info("Dual-GPU LTX: sidecar on cuda:1, 2 concurrent video workers active")
@@ -585,6 +589,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             logger.warning("Dual-GPU LTX: sidecar load failed — running single-GPU", exc_info=True)
 
     logger.info("Job queue + batch worker started.")
+
+    # v1.8.2 / SEC P0-2: surface admin-auth posture at boot so operators
+    # notice degraded mode before a real incident hits.
+    if not config.API_KEYS:
+        logger.warning("Auth is globally disabled (.api_keys empty) — admin gate is a no-op")
+    elif not config.ADMIN_KEYS:
+        logger.warning(
+            "admin auth disabled: .admin_keys is empty. All API_KEYS entries are treated "
+            "as admin as a backwards-compat bridge. Create .admin_keys to lock the 12 "
+            "mutation endpoints down to a narrower operator bearer set."
+        )
+    else:
+        logger.info("Admin gate active: %d admin key(s) loaded", len(config.ADMIN_KEYS))
 
     yield
 
@@ -623,9 +640,13 @@ async def check_api_key(request: Request, call_next):
     auth = request.headers.get("Authorization", "")
     token = auth[7:] if auth.startswith("Bearer ") else ""
 
-    if not token or not any(
-        _secrets.compare_digest(token, key) for key in config.API_KEYS
-    ):
+    # SEC P2-1 (v1.8.2): full-iteration compare instead of any(...) to avoid
+    # leaking bearer-set membership via short-circuit timing.
+    matched = False
+    for key in config.API_KEYS:
+        if _secrets.compare_digest(token, key):
+            matched = True
+    if not token or not matched:
         return _error(401, "Invalid or missing API key")
 
     return await call_next(request)
@@ -789,6 +810,29 @@ class CharRankRequest(BaseModel):
     rank_image_uri: str
     generated_image_uri: str
     prompt: str = Field(max_length=10000)
+
+
+class CharRankAnalysis(BaseModel):
+    face_match: int = Field(ge=1, le=10)
+    eyes: int = Field(ge=1, le=10)
+    proportions: int = Field(ge=1, le=10)
+    overall_likeness: int = Field(ge=1, le=10)
+
+
+class CharRankEdits(BaseModel):
+    add: list[str] = Field(default_factory=list, max_length=20)
+    remove: list[str] = Field(default_factory=list, max_length=20)
+    modify: dict[str, str] = Field(default_factory=dict)
+
+
+class CharRankResponse(BaseModel):
+    """SEC P1-5 (v1.8.2): schema the vision model's JSON output is
+    validated against before the server echoes it to the client. Rejects
+    prompt-injected fields, type confusion, out-of-range scores, and
+    malformed edits."""
+    score: float = Field(ge=0, le=10)
+    analysis: CharRankAnalysis
+    edits: CharRankEdits
 
 
 class MusicGenerationRequest(BaseModel):
@@ -1213,8 +1257,11 @@ async def health() -> dict:
 
 
 @app.post("/v1/system/pause")
-async def system_pause() -> dict:
+async def system_pause(request: Request):
     """Evict all models from GPU to free VRAM for training."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _paused, _last_gpu_tenant
     if _paused:
         return {"status": "already_paused"}
@@ -1265,8 +1312,11 @@ async def system_pause() -> dict:
 
 
 @app.post("/v1/system/resume")
-async def system_resume() -> dict:
+async def system_resume(request: Request):
     """Reload all models after training."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _paused, _last_gpu_tenant
     if not _paused:
         return {"status": "already_running"}
@@ -1285,8 +1335,11 @@ async def system_resume() -> dict:
 
 
 @app.post("/v1/flux/unload")
-async def flux_unload() -> dict:
+async def flux_unload(request: Request):
     """Unload Flux model from the Flux device to free VRAM for training / vision models."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _last_gpu_tenant
     if not flux.is_ready:
         return {"status": "already_unloaded"}
@@ -1302,7 +1355,7 @@ async def flux_unload() -> dict:
 
 
 @app.post("/v1/ltx/unload")
-async def ltx_unload() -> dict:
+async def ltx_unload(request: Request):
     """Unload LTX from the LTX device to free VRAM (e.g. for a training run).
 
     Unlike /v1/system/pause this touches ONLY LTX — the Flux pipeline stays
@@ -1310,6 +1363,9 @@ async def ltx_unload() -> dict:
     FLUX_DEVICE), this also makes room on the GPU for a subsequent Flux
     forward pass; the next video request will auto-swap LTX back in.
     """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _last_gpu_tenant
     if not manager.is_ready:
         return {"status": "already_unloaded"}
@@ -1325,8 +1381,11 @@ async def ltx_unload() -> dict:
 
 
 @app.post("/v1/ltx/reload")
-async def ltx_reload() -> dict:
+async def ltx_reload(request: Request):
     """Reload LTX to the LTX device."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _last_gpu_tenant
     if manager.is_ready:
         return {"status": "already_loaded"}
@@ -1342,8 +1401,11 @@ async def ltx_reload() -> dict:
 
 
 @app.post("/v1/flux/reload")
-async def flux_reload() -> dict:
+async def flux_reload(request: Request):
     """Reload Flux model to the Flux device."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _last_gpu_tenant
     if flux.is_ready:
         return {"status": "already_loaded"}
@@ -1643,6 +1705,7 @@ async def _scale_remote_pool() -> None:
                         # scales > 0 while _turbo_active is True, and turbo
                         # mode routes only video jobs to the queue.
                         turbo_check=lambda job: True,
+                        on_complete=_decr_queue_on_complete,
                     ),
                     name=f"remote-worker-{i}",
                 )
@@ -1710,7 +1773,8 @@ async def _dispatch_job_turbo(job: Job) -> bytes:
             tag in str(exc).lower() for tag in ("unreachable", "timeout", "http_error")
         ):
             logger.error("Turbo dispatch: sidecar transport failure (%s) — scheduling auto-exit", exc)
-            asyncio.create_task(_auto_exit_turbo_on_sidecar_failure())
+            # SEC P2-8 (v1.8.2): dedup — no-op if an exit is already scheduled.
+            _schedule_auto_exit_turbo()
         raise
 
 
@@ -1782,7 +1846,8 @@ async def _enter_turbo_mode() -> None:
     _turbo_active = True
     _turbo_worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo, uploads, history,
-                    turbo_check=lambda job: _turbo_active),
+                    turbo_check=lambda job: _turbo_active,
+                    on_complete=_decr_queue_on_complete),
         name="turbo-worker",
     )
 
@@ -1855,8 +1920,11 @@ class TurboRequest(BaseModel):
 
 
 @app.post("/v1/system/turbo")
-async def system_turbo(body: TurboRequest) -> JSONResponse:
+async def system_turbo(body: TurboRequest, request: Request) -> JSONResponse:
     """Toggle turbo mode (claim/release cuda:1 for dual-GPU inference)."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     if _paused:
         return JSONResponse(
             status_code=503,
@@ -1920,12 +1988,15 @@ async def get_pool_state() -> JSONResponse:
 
 
 @app.post("/v1/system/pool/remote-workers")
-async def set_pool_remote_workers(body: PoolCountRequest) -> JSONResponse:
+async def set_pool_remote_workers(body: PoolCountRequest, request: Request) -> JSONResponse:
     """Set the target remote-sidecar worker count (0..MAX).
 
     Takes effect immediately if turbo is active (scales the live pool).
     If turbo is inactive, the target is stored and applied at next turbo-on.
     """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _remote_worker_target
     if ltx_remote_sidecar is None:
         return _error(400, "remote_sidecar_not_configured: set LTX_REMOTE_SIDECAR_URL in .env")
@@ -1956,6 +2027,9 @@ async def get_gen_config() -> JSONResponse:
 @app.post("/v1/system/config")
 async def set_gen_config(request: Request) -> JSONResponse:
     """Update generation configuration. Merges body into current config."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _gpu_cache
     import split_model_manager
     body = await request.json()
@@ -1968,8 +2042,11 @@ async def set_gen_config(request: Request) -> JSONResponse:
 
 
 @app.post("/v1/system/config/reset")
-async def reset_gen_config() -> JSONResponse:
+async def reset_gen_config(request: Request) -> JSONResponse:
     """Reset generation config to defaults."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _gpu_cache
     import split_model_manager, copy
     split_model_manager._gen_config.update(copy.deepcopy(split_model_manager._DEFAULT_GEN_CONFIG))
@@ -1987,6 +2064,9 @@ async def get_flux_config() -> JSONResponse:
 @app.post("/v1/system/flux-config")
 async def set_flux_config(request: Request) -> JSONResponse:
     """Update Flux generation configuration. Merges body into current config."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _gpu_cache
     body = await request.json()
     for key, value in body.items():
@@ -1998,8 +2078,11 @@ async def set_flux_config(request: Request) -> JSONResponse:
 
 
 @app.post("/v1/system/flux-config/reset")
-async def reset_flux_config() -> JSONResponse:
+async def reset_flux_config(request: Request) -> JSONResponse:
     """Reset Flux generation config to defaults."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     global _gpu_cache
     _flux_config.update(_copy.deepcopy(_DEFAULT_FLUX_CONFIG))
     _gpu_cache = None
@@ -2022,6 +2105,9 @@ async def get_sampler_config() -> JSONResponse:
 @app.post("/v1/system/sampler")
 async def set_sampler_config(request: Request) -> JSONResponse:
     """Toggle sampler between Euler and CFG++ (alias — writes to gen_config)."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
     import split_model_manager
     body = await request.json()
     sampler = body.get("sampler", "euler")
@@ -2469,10 +2555,37 @@ async def upload_put(upload_id: str, request: Request) -> Response:
     content_length = request.headers.get("content-length")
     if content_length and int(content_length) > MAX_UPLOAD_BYTES:
         return _error(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
+    # v1.8.2 / SEC P2-3: early quota peek using Content-Length so we reject
+    # BEFORE reading the whole body into memory.
+    api_key = _extract_api_key(request) or ""
+    if content_length:
+        try:
+            proposed = int(content_length)
+        except ValueError:
+            proposed = 0
+        quota = _upload_quota_error(api_key, proposed)
+        if quota is not None:
+            return quota
     data = await request.body()
     if len(data) > MAX_UPLOAD_BYTES:
         return _error(413, f"Upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
+    # SEC P2-3 final check after read (in case Content-Length was absent).
+    quota = _upload_quota_error(api_key, len(data))
+    if quota is not None:
+        return quota
+    # SEC P2-7 (v1.8.2): magic-byte check against declared Content-Type.
+    declared = request.headers.get("content-type", "")
+    if not _content_type_matches_magic(declared, data[:16]):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "content_type_mismatch",
+                "message": "body does not match declared Content-Type",
+                "detail": f"declared={declared or '(none)'}",
+            },
+        )
     uploads.save(upload_id, data)
+    _record_upload_bytes(api_key, len(data))
     return Response(status_code=201)
 
 
@@ -2504,6 +2617,22 @@ async def upload_lora(request: Request) -> Response:
     if "multipart/form-data" not in content_type:
         return _error(400, "Expected multipart/form-data")
 
+    api_key = _extract_api_key(request) or ""
+
+    # v1.8.2 / SEC P2-4: total-active-LoRA cap per key. Stored per-key count
+    # is derived from the in-memory counter map populated on successful
+    # registry.add (+decrement on delete_lora). Unlike upload bytes (rolling
+    # 24h), LoRAs stick — each add occupies a slot until the user deletes it.
+    if api_key and config.API_KEYS and _get_key_count(_per_key_lora_counts, api_key) >= config.PER_KEY_LORA_COUNT:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "per_key_lora_count_exceeded",
+                "message": f"LoRA limit of {config.PER_KEY_LORA_COUNT} per key reached — delete some first.",
+            },
+            headers={"Retry-After": "3600"},
+        )
+
     form = await request.form(max_part_size=config.MAX_LORA_SIZE_BYTES)
     file = form.get("file")
     name = form.get("name")
@@ -2527,11 +2656,20 @@ async def upload_lora(request: Request) -> Response:
     if len(data) > config.MAX_LORA_SIZE_BYTES:
         return _error(413, f"File exceeds {config.MAX_LORA_SIZE_BYTES // (1024*1024)}MB limit")
 
+    # v1.8.2 / SEC P2-3: LoRA upload bytes count toward the 24h rolling
+    # byte quota too — they're just user-provided bytes on disk.
+    quota = _upload_quota_error(api_key, len(data))
+    if quota is not None:
+        return quota
+
     try:
         info = lora_registry.add(name=str(name), filename=filename, data=data, description=description,
                                 base_model=base_model, trigger_word=trigger_word, strategy=strategy)
     except ValueError as exc:
         return _error(400, str(exc))
+
+    _record_upload_bytes(api_key, len(data))
+    _incr_key_count(_per_key_lora_counts, api_key)
 
     return JSONResponse(
         status_code=201,
@@ -2543,9 +2681,17 @@ async def upload_lora(request: Request) -> Response:
 
 
 @app.delete("/v1/loras/{lora_id}")
-async def delete_lora(lora_id: str) -> JSONResponse:
+async def delete_lora(lora_id: str, request: Request) -> JSONResponse:
     if not lora_registry.delete(lora_id):
         return _error(404, f"LoRA not found: {lora_id}")
+    # SEC P2-4: free a slot for the caller. The registry doesn't record
+    # ownership today, so we decrement the caller's counter regardless of
+    # who originally uploaded. Worst case: a heavy user deletes someone
+    # else's LoRA and claws back a slot for themselves. Acceptable because
+    # the caller still had to auth and get here; MAX_LORA_SIZE_BYTES and
+    # PER_KEY_UPLOAD_BYTES_PER_DAY still rate-limit the downstream add.
+    api_key = _extract_api_key(request) or ""
+    _decr_key_count(_per_key_lora_counts, api_key)
     return JSONResponse(content={"deleted": True, "id": lora_id})
 
 
@@ -2579,6 +2725,15 @@ async def rescan_flux_loras() -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _decr_queue_on_complete(job: Job) -> None:
+    """v1.8.2 / SEC P1-3: worker_loop callback — decrement the per-key
+    queue counter when a submitted-via-_submit_job job reaches a terminal
+    state. Music and batch items decrement themselves (they don't go
+    through worker_loop).
+    """
+    _decr_key_count(_per_key_queue_counts, job.api_key or "")
+
+
 def _submit_job(job_type: JobType, params: dict, request: Request, raw: dict | None = None) -> JSONResponse:
     """Create a job, enqueue it, return 202.
 
@@ -2593,6 +2748,22 @@ def _submit_job(job_type: JobType, params: dict, request: Request, raw: dict | N
             content={"error": "system_paused", "message": "System is paused for maintenance."},
             headers={"Retry-After": "300"},
         )
+
+    auth = request.headers.get("Authorization", "")
+    api_key = auth[7:] if auth.startswith("Bearer ") else ""
+
+    # v1.8.2 / SEC P1-3: per-key cap enforced BEFORE the global depth check
+    # so one bearer can't claim the whole queue.
+    if api_key and config.API_KEYS and _get_key_count(_per_key_queue_counts, api_key) >= config.PER_KEY_QUEUE_CAP:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "per_key_queue_full",
+                "message": f"You have {config.PER_KEY_QUEUE_CAP} jobs in flight; wait for one to finish.",
+            },
+            headers={"Retry-After": "30"},
+        )
+
     if job_store.pending_count() >= config.MAX_QUEUE_DEPTH:
         return JSONResponse(
             status_code=429,
@@ -2600,11 +2771,9 @@ def _submit_job(job_type: JobType, params: dict, request: Request, raw: dict | N
             headers={"Retry-After": "30"},
         )
 
-    auth = request.headers.get("Authorization", "")
-    api_key = auth[7:] if auth.startswith("Bearer ") else ""
-
     job = Job(id=make_job_id(), type=job_type, params=params, api_key=api_key)
     job.raw_request = raw
+    _incr_key_count(_per_key_queue_counts, api_key)
     job_store.add(job)
     _job_queue.put_nowait(job.id)
 
@@ -2801,6 +2970,18 @@ async def v2_music(body: MusicGenerationRequest, request: Request) -> JSONRespon
         return _error(422, f"task_type '{body.task_type}' requires source_audio_uri")
     if body.task_type in ("extract", "lego", "complete") and not body.track_name:
         return _error(422, f"task_type '{body.task_type}' requires track_name")
+    auth = request.headers.get("Authorization", "")
+    api_key_check = auth[7:] if auth.startswith("Bearer ") else ""
+    # v1.8.2 / SEC P1-3: per-key music cap BEFORE global cap.
+    if api_key_check and config.API_KEYS and _get_key_count(_per_key_music_counts, api_key_check) >= config.PER_KEY_MUSIC_CAP:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "per_key_queue_full",
+                "message": f"You have {config.PER_KEY_MUSIC_CAP} music jobs in flight.",
+            },
+            headers={"Retry-After": "30"},
+        )
     # Queue depth check for music
     music_pending = sum(
         1 for j in job_store._jobs.values()
@@ -2822,9 +3003,9 @@ async def v2_music(body: MusicGenerationRequest, request: Request) -> JSONRespon
             return _error(404, "reference_audio_uri not found")
     params.pop("source_audio_uri", None)
     params.pop("reference_audio_uri", None)
-    auth = request.headers.get("Authorization", "")
-    api_key = auth[7:] if auth.startswith("Bearer ") else ""
+    api_key = api_key_check
     job = Job(id=make_job_id(), type=JobType.MUSIC_GENERATION, params=params, api_key=api_key)
+    _incr_key_count(_per_key_music_counts, api_key)
     job_store.add(job)
     asyncio.create_task(_run_music_job(job))
     return JSONResponse(status_code=202, content={
@@ -3125,6 +3306,12 @@ async def approve_image(request: Request) -> JSONResponse:
     manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
     raw = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
     manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+    # v1.8.2 / SEC P2-10: defensive type guard. A truncated / corrupted /
+    # adversarial manifest could deserialize to a string, number, etc. —
+    # insert()/iteration downstream would then raise. Reset to empty list.
+    if not isinstance(manifest, list):
+        logger.warning("approved-images manifest.json was not a list, resetting to empty")
+        manifest = []
 
     entry = {
         "id": hashlib.sha256(f"{image_uri}{_time.time()}".encode()).hexdigest()[:16],
@@ -3156,6 +3343,9 @@ async def list_approved_images(request: Request, limit: int = 50, offset: int = 
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     raw = json.loads(manifest_path.read_text())
     manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+    if not isinstance(manifest, list):
+        logger.warning("approved-images manifest.json was not a list, resetting to empty")
+        manifest = []
     filtered = [e for e in manifest if e.get("api_key_hash") == key_hash]
     page = filtered[offset : offset + limit]
 
@@ -3194,6 +3384,8 @@ async def approved_images_events(request: Request, token: str | None = None) -> 
                         last_mtime = mtime
                         raw = json.loads(manifest_path.read_text())
                         manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+                        if not isinstance(manifest, list):
+                            manifest = []
                         filtered = [e for e in manifest if e.get("api_key_hash") == key_hash]
 
                         for entry in filtered:
@@ -3225,6 +3417,8 @@ async def get_approved_image_file(image_id: str, request: Request) -> Response:
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
     raw = json.loads(manifest_path.read_text())
     manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+    if not isinstance(manifest, list):
+        manifest = []
     entry = next((e for e in manifest if e["id"] == image_id and e.get("api_key_hash") == key_hash), None)
     if not entry:
         return _error(404, "Not found")
@@ -3310,19 +3504,33 @@ async def v2_char_rank(body: CharRankRequest, request: Request) -> JSONResponse:
             model=config.CHAR_VISION_MODEL,
         )
 
-        import json as _json, re as _re
+        import re as _re
         text = result["choices"][0]["message"]["content"]
         json_match = _re.search(r'\{[\s\S]*\}', text)
         if not json_match:
             return _error(500, "Vision model did not return valid JSON")
 
-        ranking = _json.loads(json_match.group())
-        return JSONResponse(content=ranking)
+        # v1.8.2 / SEC P1-5: validate the LLM's structured output against
+        # the documented schema before handing to the client. Guards against
+        # prompt-injection that alters fields, missing keys, wrong types,
+        # score-out-of-range, etc.
+        from pydantic import ValidationError as _VErr
+        try:
+            ranking = CharRankResponse.model_validate_json(json_match.group())
+        except _VErr as exc:
+            detail = str(exc)[:500]
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "char_rank_schema_violation",
+                    "message": "Vision model output failed schema validation",
+                    "detail": detail,
+                },
+            )
+        return JSONResponse(content=ranking.model_dump())
 
     except FileNotFoundError as exc:
         return _error(404, str(exc))
-    except ValueError:
-        return _error(500, "Failed to parse vision model response")
     except Exception as exc:
         logger.exception("char/rank failed")
         return _error(500, str(exc))
@@ -3463,6 +3671,213 @@ def _extract_api_key(request: Request) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# v1.8.2 security helpers — admin gate, per-key quotas, magic-byte upload
+# check. Placed here (after _extract_api_key) because every handler lower in
+# the file already forward-references helpers defined in this zone.
+# ---------------------------------------------------------------------------
+
+
+def _sha256_key(api_key: str) -> str:
+    import hashlib
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def _constant_time_match(token: str, keyset: set[str]) -> bool:
+    """Full-iteration bearer compare. SEC P2-1 (v1.8.2).
+
+    ``any(compare_digest ...)`` short-circuits on the first match, which
+    leaks set membership via wall-clock timing (caller observes ~N*t for a
+    miss, ~k*t for a hit where k ≤ N is the match position). Iterating the
+    entire set eliminates the side channel.
+    """
+    if not token:
+        return False
+    matched = False
+    for key in keyset:
+        if _secrets.compare_digest(token, key):
+            matched = True
+    return matched
+
+
+def _require_admin(request: Request) -> JSONResponse | None:
+    """Admin gate. SEC P0-2 (v1.8.2).
+
+    Enforcement matrix:
+      - ``config.API_KEYS`` empty → auth globally off, allow through (parity
+        with middleware bypass)
+      - ``config.ADMIN_KEYS`` empty → backwards-compat bridge: allow iff the
+        caller's bearer is in ``API_KEYS``. A WARN is logged once at startup
+        so operators know admin auth is degraded until they create
+        ``.admin_keys``.
+      - Otherwise → caller's bearer must be in ``ADMIN_KEYS`` via full-
+        iteration ``compare_digest``. 403 on mismatch (not 404: admin
+        endpoints are known-existent, no existence oracle to protect).
+    """
+    if not config.API_KEYS:
+        return None
+    token = _extract_api_key(request) or ""
+    if not config.ADMIN_KEYS:
+        if _constant_time_match(token, config.API_KEYS):
+            return None
+        return _error(401, "Invalid or missing API key")
+    if _constant_time_match(token, config.ADMIN_KEYS):
+        return None
+    return _error(403, "admin_required")
+
+
+# v1.8.2 / SEC P1-3 — in-memory per-key queue counters. Keyed by
+# sha256(api_key) so raw bearers never land in the map (debuggers, heap
+# dumps, thread-local inspection). Decremented from job_queue.worker_loop
+# via the on_complete callback and from _run_music_job's finally block.
+_per_key_queue_counts: dict[str, int] = {}
+_per_key_music_counts: dict[str, int] = {}
+_per_key_batch_counts: dict[str, int] = {}
+
+# SEC P2-4: total active LoRAs per key. Best-effort counter — restarts
+# reset it to 0 (until v1.8.3 we don't stamp the registry with api_key).
+# After restart, a heavy user can briefly burst up to PER_KEY_LORA_COUNT
+# more LoRAs; this is acceptable because MAX_LORA_SIZE_BYTES still caps
+# single-file size and PER_KEY_UPLOAD_BYTES_PER_DAY caps aggregate bytes.
+_per_key_lora_counts: dict[str, int] = {}
+
+
+def _incr_key_count(bucket: dict[str, int], api_key: str) -> None:
+    if not api_key:
+        return
+    h = _sha256_key(api_key)
+    bucket[h] = bucket.get(h, 0) + 1
+
+
+def _decr_key_count(bucket: dict[str, int], api_key: str) -> None:
+    if not api_key:
+        return
+    h = _sha256_key(api_key)
+    cur = bucket.get(h, 0) - 1
+    if cur <= 0:
+        bucket.pop(h, None)
+    else:
+        bucket[h] = cur
+
+
+def _get_key_count(bucket: dict[str, int], api_key: str) -> int:
+    if not api_key:
+        return 0
+    return bucket.get(_sha256_key(api_key), 0)
+
+
+# v1.8.2 / SEC P2-3 — rolling 24h upload byte counter. Each bucket is
+# sha256(api_key) → list of (epoch_seconds, bytes) tuples pruned on access.
+_per_key_upload_bytes: dict[str, list[tuple[float, int]]] = {}
+
+
+def _upload_window_total(api_key: str) -> int:
+    if not api_key:
+        return 0
+    h = _sha256_key(api_key)
+    window = _per_key_upload_bytes.get(h)
+    if not window:
+        return 0
+    cutoff = time.time() - 86400
+    pruned = [(t, n) for (t, n) in window if t >= cutoff]
+    if pruned:
+        _per_key_upload_bytes[h] = pruned
+    else:
+        _per_key_upload_bytes.pop(h, None)
+    return sum(n for _, n in pruned)
+
+
+def _record_upload_bytes(api_key: str, n_bytes: int) -> None:
+    if not api_key or n_bytes <= 0:
+        return
+    h = _sha256_key(api_key)
+    _per_key_upload_bytes.setdefault(h, []).append((time.time(), n_bytes))
+
+
+def _upload_quota_error(api_key: str, proposed_bytes: int) -> JSONResponse | None:
+    """SEC P2-3. Return 429 JSONResponse if adding ``proposed_bytes`` would
+    exceed PER_KEY_UPLOAD_BYTES_PER_DAY in the 24h rolling window. None =
+    allowed. No-op when auth is off or caller is anonymous (api_key='').
+    """
+    if not api_key or not config.API_KEYS:
+        return None
+    cap = config.PER_KEY_UPLOAD_BYTES_PER_DAY
+    if cap <= 0:
+        return None
+    current = _upload_window_total(api_key)
+    if current + max(0, proposed_bytes) > cap:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "per_key_upload_quota_exceeded",
+                "message": f"24h upload quota of {cap // (1024*1024)} MiB reached",
+                "detail": f"used={current}, requested={proposed_bytes}, cap={cap}",
+            },
+            headers={"Retry-After": "3600"},
+        )
+    return None
+
+
+# v1.8.2 / SEC P2-7 — Content-Type magic-byte verification. Only applied
+# when the client declared a content-type we recognize; octet-stream and
+# unknown types are passed through unchanged.
+def _content_type_matches_magic(declared: str, first_bytes: bytes) -> bool:
+    """Return True if ``first_bytes`` (≥ 16 bytes recommended) matches the
+    declared content-type's magic signature. Lenient on unrecognized /
+    missing / application/octet-stream — those return True.
+    """
+    declared = (declared or "").lower().split(";")[0].strip()
+    if not declared or declared == "application/octet-stream":
+        return True
+    b = first_bytes or b""
+    if declared == "image/jpeg":
+        return b.startswith(b"\xff\xd8")
+    if declared == "image/png":
+        return b.startswith(b"\x89PNG")
+    if declared == "image/webp":
+        return len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP"
+    if declared == "video/mp4":
+        return len(b) >= 8 and b[4:8] == b"ftyp"
+    if declared == "audio/mpeg":
+        return b.startswith(b"ID3") or b.startswith(b"\xff\xfb") or b.startswith(b"\xff\xf3")
+    if declared == "audio/wav" or declared == "audio/x-wav":
+        return len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE"
+    if declared == "audio/flac":
+        return b.startswith(b"fLaC")
+    if declared == "audio/ogg":
+        return b.startswith(b"OggS")
+    return True
+
+
+# v1.8.2 / SEC P2-8 — dedup concurrent _auto_exit_turbo_on_sidecar_failure
+# invocations. If the Modal sidecar is flapping, every failed job would
+# schedule its own exit task; we only need one.
+_exit_turbo_scheduled: bool = False
+
+
+def _schedule_auto_exit_turbo() -> None:
+    """Idempotent scheduler: creates at most one exit task at a time.
+
+    Subsequent sidecar failures while an exit is pending log a WARN and
+    return without creating another task. The flag is cleared in the task's
+    finally so a future flap can schedule a fresh exit.
+    """
+    global _exit_turbo_scheduled
+    if _exit_turbo_scheduled:
+        logger.warning("Turbo auto-exit already scheduled; suppressing duplicate trigger")
+        return
+    _exit_turbo_scheduled = True
+
+    async def _run_once() -> None:
+        global _exit_turbo_scheduled
+        try:
+            await _auto_exit_turbo_on_sidecar_failure()
+        finally:
+            _exit_turbo_scheduled = False
+
+    asyncio.create_task(_run_once())
+
+
 def _require_owner(
     owner_key: str, request: Request, *, sse_token: str | None = None,
 ) -> JSONResponse | None:
@@ -3511,6 +3926,20 @@ async def v2_batch_submit(body: BatchRequest, request: Request) -> JSONResponse:
             content={"error": "system_paused", "message": "System is paused for maintenance."},
             headers={"Retry-After": "300"},
         )
+
+    auth = request.headers.get("Authorization", "")
+    api_key = auth[7:] if auth.startswith("Bearer ") else ""
+    # v1.8.2 / SEC P1-3: per-key batch cap BEFORE global cap.
+    if api_key and config.API_KEYS and _get_key_count(_per_key_batch_counts, api_key) >= config.PER_KEY_BATCH_CAP:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "per_key_queue_full",
+                "message": f"You have {config.PER_KEY_BATCH_CAP} batches in flight.",
+            },
+            headers={"Retry-After": "30"},
+        )
+
     if batch_store.active_count() >= config.MAX_BATCH_QUEUE_DEPTH:
         return JSONResponse(
             status_code=429,
@@ -3534,9 +3963,6 @@ async def v2_batch_submit(body: BatchRequest, request: Request) -> JSONResponse:
                 content={"error": f"Validation failed at item {i} ({item.type}): {exc}"},
             )
 
-    auth = request.headers.get("Authorization", "")
-    api_key = auth[7:] if auth.startswith("Bearer ") else ""
-
     # Swap optimization: sort all images before all videos, group by model within images
     image_items = [it for it in body.items if _is_image_type(it.type)]
     video_items = [it for it in body.items if not _is_image_type(it.type)]
@@ -3553,6 +3979,7 @@ async def v2_batch_submit(body: BatchRequest, request: Request) -> JSONResponse:
         priority=body.priority,
         callback_url=body.callback_url,
     )
+    _incr_key_count(_per_key_batch_counts, api_key)
     batch_store.add(batch)
     _batch_queue.put_nowait(batch.id)
 
@@ -3771,6 +4198,10 @@ async def batch_worker() -> None:
         batch_id = await _batch_queue.get()
         batch = batch_store.get(batch_id)
         if batch is None or batch.status == BatchStatus.CANCELLED:
+            # v1.8.2 / SEC P1-3: release per-key slot even on pre-dequeue
+            # cancel (e.g. via /v1/system/pause).
+            if batch is not None:
+                _decr_key_count(_per_key_batch_counts, batch.api_key or "")
             _batch_queue.task_done()
             continue
 
@@ -3847,6 +4278,9 @@ async def batch_worker() -> None:
 
         if batch.callback_url:
             asyncio.create_task(_fire_batch_webhook(batch))
+
+        # v1.8.2 / SEC P1-3: release per-key batch quota slot.
+        _decr_key_count(_per_key_batch_counts, batch.api_key or "")
 
         _batch_queue.task_done()
 

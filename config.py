@@ -17,7 +17,30 @@ def _load_api_keys() -> set[str]:
     return keys
 
 
+def _load_admin_keys() -> set[str]:
+    """Load admin keys from .admin_keys file and/or TACO_ADMIN_KEY env var.
+
+    v1.8.2 / SEC P0-2: admin-gated endpoints (system pause/resume/turbo,
+    config mutation, un/reload, pool scaling) check this set. Empty → admin
+    auth is in the "backwards-compat bridge" state: every entry in
+    ``API_KEYS`` is treated as admin. Populate ``.admin_keys`` with the
+    actual operator bearer(s) to lock the 12 mutation endpoints down.
+    """
+    keys: set[str] = set()
+    keys_file = Path(__file__).parent / ".admin_keys"
+    if keys_file.exists():
+        for line in keys_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                keys.add(line)
+    env_key = os.environ.get("TACO_ADMIN_KEY", "").strip()
+    if env_key:
+        keys.add(env_key)
+    return keys
+
+
 API_KEYS: set[str] = _load_api_keys()
+ADMIN_KEYS: set[str] = _load_admin_keys()
 
 # Checkpoint paths
 CHECKPOINTS_DIR = Path("/mnt/nvme-1/huggingface/ltx-2.3-checkpoints")
@@ -133,6 +156,22 @@ FLUX_LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/flux_loras")
 # Job queue
 MAX_QUEUE_DEPTH = 10
 JOB_RESULT_TTL_SECONDS = 600  # 10 minutes
+
+# v1.8.2 / SEC P1-3: per-API-key queue caps. These apply BEFORE the global
+# MAX_QUEUE_DEPTH / MAX_MUSIC_PENDING / MAX_BATCH_QUEUE_DEPTH caps, so one
+# bearer can't single-tenant the whole queue. 429 with per_key_queue_full
+# on breach. Override via env.
+PER_KEY_QUEUE_CAP = int(os.environ.get("PER_KEY_QUEUE_CAP", "3"))
+PER_KEY_MUSIC_CAP = int(os.environ.get("PER_KEY_MUSIC_CAP", "2"))
+PER_KEY_BATCH_CAP = int(os.environ.get("PER_KEY_BATCH_CAP", "2"))
+
+# v1.8.2 / SEC P2-3+P2-4: per-API-key upload + LoRA quotas. The upload cap
+# is a rolling 24h byte counter keyed by sha256(api_key); the LoRA cap is
+# total active LoRAs in the registry owned by this key.
+PER_KEY_UPLOAD_BYTES_PER_DAY = int(
+    os.environ.get("PER_KEY_UPLOAD_BYTES_PER_DAY", str(10 * 1024 * 1024 * 1024))
+)
+PER_KEY_LORA_COUNT = int(os.environ.get("PER_KEY_LORA_COUNT", "20"))
 
 # Turbo mode — dual-GPU inference
 AUTO_TURBO_IDLE_MINUTES = int(os.environ.get("AUTO_TURBO_IDLE_MINUTES", "15"))

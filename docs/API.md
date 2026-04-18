@@ -63,6 +63,7 @@ Authorization: Bearer <api-key>
 - **No-auth endpoints (public):** `GET /health`, `GET /v1/approved-images/events` (SSE, server-filtered by api_key_hash), `GET /v2/jobs/{id}/stream` (SSE, via bearer header or `?token=<sse-token>` query param — browsers use the query param since `EventSource` cannot set custom headers).
 - **Removed from public surface (v1.8.1):** `GET /dashboard` and `GET /v1/system/gpu` now require a bearer token and are ONLY served by the LAN-only admin companion on port 8099 (see `dashboard_server.py`). On the public host they respond with 401.
 - **Tenancy (v1.8.1 / SEC P0-1):** every `/v2/jobs/{id}` and `/v2/batch/{id}` endpoint enforces that the caller's bearer matches the resource's owner key. Cross-tenant access returns `404 Not found` with the same shape as an unknown ID (no existence oracle). Jobs and batches created before tenancy was enforced — or under auth-disabled mode — have an empty `api_key` and remain accessible to everyone (backwards-compat). History endpoints have always been tenancy-scoped via SQL `api_key_hash` filters.
+- **Admin gate (v1.8.2 / SEC P0-2):** 12 mutation endpoints — `POST /v1/system/{pause,resume,turbo,config,config/reset,flux-config,flux-config/reset,sampler,pool/remote-workers}` and `POST /v1/{flux,ltx}/{unload,reload}` — additionally require the caller's bearer to appear in `.admin_keys` (or `TACO_ADMIN_KEY`). Mismatch returns `403 admin_required`. If `.admin_keys` is empty, the server falls back to the backwards-compat bridge: every `.api_keys` entry is treated as admin and a WARN is logged at boot. Read endpoints (`GET /v1/system/{pool,config,flux-config,sampler}`) remain user-level (any valid bearer).
 
 ### Error shape
 
@@ -1405,6 +1406,7 @@ All error responses follow the shape described in [Error shape](#error-shape) (`
 | Status | Error string | When |
 |---|---|---|
 | `401` | `"Invalid or missing API key"` | Bearer missing or doesn't match any `.api_keys` line |
+| `403` | `"admin_required"` | v1.8.2 — caller's bearer isn't in `.admin_keys` on one of the 12 admin-gated endpoints |
 
 ### System state
 
@@ -1439,6 +1441,9 @@ All error responses follow the shape described in [Error shape](#error-shape) (`
 | `429` | `"queue_full"` | `job_store.pending_count() >= MAX_QUEUE_DEPTH (10)` | `Retry-After: 30` |
 | `429` | `"music_queue_full"` | Music-specific depth ≥ `MAX_MUSIC_PENDING (5)` | `Retry-After: 30` |
 | `429` | `"batch_queue_full"` | `batch_store.active_count() >= MAX_BATCH_QUEUE_DEPTH (5)` | `Retry-After: 30` |
+| `429` | `"per_key_queue_full"` | v1.8.2 — single bearer has `PER_KEY_QUEUE_CAP` (3) / `PER_KEY_MUSIC_CAP` (2) / `PER_KEY_BATCH_CAP` (2) jobs, music jobs, or batches already in flight | `Retry-After: 30` |
+| `429` | `"per_key_upload_quota_exceeded"` | v1.8.2 — single bearer has uploaded `PER_KEY_UPLOAD_BYTES_PER_DAY` (default 10 GiB) within the last 24h rolling window | `Retry-After: 3600` |
+| `429` | `"per_key_lora_count_exceeded"` | v1.8.2 — single bearer has `PER_KEY_LORA_COUNT` (default 20) active LoRAs; DELETE some first | `Retry-After: 3600` |
 
 ### Uploads
 
@@ -1446,6 +1451,7 @@ All error responses follow the shape described in [Error shape](#error-shape) (`
 |---|---|---|
 | `413` | `"Upload exceeds 1024MB limit"` | `PUT /uploads/put/{id}` body > `MAX_UPLOAD_BYTES` |
 | `413` | `"File exceeds 1024MB limit"` | `POST /v1/loras` file > `MAX_LORA_SIZE_BYTES` |
+| `422` | `"content_type_mismatch"` | v1.8.2 — `PUT /uploads/put/{id}` body's magic bytes don't match the declared `Content-Type` header. Lenient on `application/octet-stream` and unrecognized types (those pass) |
 | `400` | `"Expected multipart/form-data"` | `POST /v1/loras` content-type mismatch |
 | `400` | `"Missing 'file' field"` | `POST /v1/loras` no file |
 | `400` | `"File must be a .safetensors file"` | `POST /v1/loras` wrong extension |
@@ -1528,7 +1534,7 @@ On failure, `GET /v2/jobs/{id}` returns an `error: {code, message}` block. Codes
 | Status | Error string | When |
 |---|---|---|
 | `500` | `"Vision model did not return valid JSON"` | No JSON regex match in model output |
-| `500` | `"Failed to parse vision model response"` | JSON parse error in extracted block |
+| `502` | `"char_rank_schema_violation"` | v1.8.2 — model's JSON output failed Pydantic validation against `CharRankResponse` (missing keys, wrong types, `score` or `analysis.*` out of range). `detail` carries the pydantic ValidationError (≤500 chars) |
 
 ### Dashboard
 
