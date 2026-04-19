@@ -15,8 +15,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
+from datetime import datetime, timezone
+from email.utils import formatdate, parsedate_to_datetime
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -640,12 +644,60 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(lifespan=lifespan)
 
+# v1.9.7: gzip JSON + text responses above 1 KB. History list is ~26 KB JSON
+# that compresses to ~5 KB (5× reduction). Already-compressed media types
+# (image/*, video/*, audio/*) are passed through unchanged by the middleware
+# — it respects the response's `Content-Encoding` header and mime type.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https?://(localhost|192\.168\.\d+\.\d+)(:\d+)?$",
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+# v1.9.7: bounded concurrency for the lazy PyAV preview-extract fallback in
+# GET /v2/jobs/{id}/preview. 100+ MB reads + PyAV first-frame decode run
+# inside the event-loop's default thread pool; without a cap a burst of
+# preview polls on malformed videos could starve every other thread-pool
+# task (history.save, sidecar subprocesses, etc.).
+_PREVIEW_EXTRACT_SEMAPHORE = asyncio.Semaphore(2)
+
+
+# v1.9.7: approved-images manifest cache. The manifest.json file was parsed
+# fresh on every GET /v1/approved-images + every SSE poll — small file but
+# hit every few seconds per tab. Cache keyed by (mtime_ns, size) so any
+# out-of-band write (or `write_text` from our own handlers) naturally
+# invalidates. Returns the parsed + type-guarded list.
+_approved_manifest_cache: tuple[tuple[int, int], list] | None = None
+
+
+def _load_approved_manifest() -> list:
+    """Return the parsed approved-images manifest (cached, mtime-validated).
+
+    Empty list when the file doesn't exist or isn't a list after parsing
+    (SEC P2-10 type guard). Zero locking — GIL protects the tuple assign,
+    and a brief double-read under contention just parses twice (idempotent).
+    """
+    global _approved_manifest_cache
+    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
+    try:
+        stat = manifest_path.stat()
+    except FileNotFoundError:
+        _approved_manifest_cache = None
+        return []
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _approved_manifest_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    raw = _json_mod.loads(manifest_path.read_text())
+    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
+    if not isinstance(manifest, list):
+        logger.warning("approved-images manifest.json was not a list, resetting to empty")
+        manifest = []
+    _approved_manifest_cache = (key, manifest)
+    return manifest
 
 
 @app.middleware("http")
@@ -1176,6 +1228,65 @@ def _error(status: int, msg: str) -> JSONResponse:
     if "/mnt/" in text or "/home/" in text or "/tmp/" in text:
         text = "Internal server error"
     return JSONResponse(status_code=status, content={"error": text, "message": text, "detail": text})
+
+
+def _serve_with_http_cache(
+    path: "Path", media_type: str, request: Request, max_age: int, *, immutable: bool = False,
+) -> Response:
+    """Serve a static file with HTTP caching headers + conditional-GET (304).
+
+    v1.9.7. FastAPI ``FileResponse`` sets ``ETag`` + ``Last-Modified`` from file
+    mtime/size but does NOT honor ``If-None-Match`` or ``If-Modified-Since``
+    — it always returns 200 with the full body. This wrapper adds:
+      - ``Cache-Control: public, max-age=N[, immutable]``
+      - Manual conditional-GET check using Starlette's ETag formula so
+        client-cached ETags from a prior FileResponse match our 304 path
+      - On miss, falls back to ``FileResponse`` with sendfile (zero-copy)
+
+    Call sites: ``/v2/history/{id}/thumbnail``, ``/v2/history/{id}/image``.
+    """
+    import hashlib as _hashlib
+    stat = path.stat()
+    # Mirror starlette.responses.FileResponse.set_stat_headers exactly so
+    # an ETag cached from a prior FileResponse request matches on 304:
+    #   md5(f"{st_mtime}-{st_size}").hexdigest()
+    _etag_base = f"{stat.st_mtime}-{stat.st_size}"
+    etag = '"' + _hashlib.md5(_etag_base.encode(), usedforsecurity=False).hexdigest() + '"'
+    last_mod = formatdate(stat.st_mtime, usegmt=True)
+    cc = f"public, max-age={max_age}" + (", immutable" if immutable else "")
+
+    inm = request.headers.get("if-none-match", "")
+    not_modified = False
+    if inm:
+        # Handle comma-separated ETag lists + weak-prefix `W/`.
+        for tag in inm.split(","):
+            t = tag.strip().removeprefix("W/")
+            if t == etag:
+                not_modified = True
+                break
+
+    if not not_modified:
+        ims = request.headers.get("if-modified-since")
+        if ims:
+            try:
+                client_time = parsedate_to_datetime(ims)
+                file_time = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).replace(microsecond=0)
+                if file_time <= client_time:
+                    not_modified = True
+            except (ValueError, TypeError):
+                pass  # malformed If-Modified-Since → fall through to full response
+
+    if not_modified:
+        return Response(status_code=304, headers={
+            "ETag": etag,
+            "Cache-Control": cc,
+            "Last-Modified": last_mod,
+        })
+
+    return FileResponse(
+        path=str(path), media_type=media_type,
+        headers={"Cache-Control": cc},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3229,7 +3340,8 @@ async def v2_job_preview(job_id: str, request: Request) -> Response:
 
     # Path 3: fallback lazy extraction for completed video jobs without an
     # on-disk thumbnail. Offloaded to a thread so the 100+ MB read + PyAV
-    # decode don't block the event loop.
+    # decode don't block the event loop. v1.9.7: bounded concurrency +
+    # timeout so a malformed MP4 can't starve the thread pool.
     if (
         job.status == JobStatus.COMPLETED
         and job.result_uri
@@ -3250,7 +3362,17 @@ async def v2_job_preview(job_id: str, request: Request) -> Response:
                     frame.convert("RGB").save(buf, format="JPEG", quality=80)
                     return buf.getvalue()
 
-                preview = await asyncio.to_thread(_extract)
+                async with _PREVIEW_EXTRACT_SEMAPHORE:
+                    try:
+                        preview = await asyncio.wait_for(
+                            asyncio.to_thread(_extract), timeout=8.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Preview extract timed out for job %s — likely malformed MP4",
+                            job_id,
+                        )
+                        preview = None
                 if preview is not None:
                     job.preview_bytes = preview  # cache for subsequent polls
                     return Response(content=preview, media_type="image/jpeg")
@@ -3458,14 +3580,9 @@ async def approve_image(request: Request) -> JSONResponse:
     import json, hashlib, time as _time
     config.APPROVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
-    raw = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
-    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
-    # v1.8.2 / SEC P2-10: defensive type guard. A truncated / corrupted /
-    # adversarial manifest could deserialize to a string, number, etc. —
-    # insert()/iteration downstream would then raise. Reset to empty list.
-    if not isinstance(manifest, list):
-        logger.warning("approved-images manifest.json was not a list, resetting to empty")
-        manifest = []
+    # v1.9.7: cached load; write below invalidates via mtime change.
+    # The cache handles SEC P2-10 type guard internally.
+    manifest = list(_load_approved_manifest())  # copy before mutation
 
     entry = {
         "id": hashlib.sha256(f"{image_uri}{_time.time()}".encode()).hexdigest()[:16],
@@ -3489,17 +3606,13 @@ async def list_approved_images(request: Request, limit: int = 50, offset: int = 
     if not api_key:
         return _error(401, "Missing API key")
 
-    import json, hashlib
-    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
-    if not manifest_path.exists():
+    import hashlib
+    # v1.9.7: cached load, mtime-invalidated. Empty list when no file.
+    manifest = _load_approved_manifest()
+    if not manifest:
         return JSONResponse(content=[])
 
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-    raw = json.loads(manifest_path.read_text())
-    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
-    if not isinstance(manifest, list):
-        logger.warning("approved-images manifest.json was not a list, resetting to empty")
-        manifest = []
     filtered = [e for e in manifest if e.get("api_key_hash") == key_hash]
     page = filtered[offset : offset + limit]
 
@@ -3563,16 +3676,12 @@ async def get_approved_image_file(image_id: str, request: Request) -> Response:
     if not api_key:
         return _error(401, "Missing API key")
 
-    import json, hashlib
-    manifest_path = config.APPROVED_IMAGES_DIR / "manifest.json"
-    if not manifest_path.exists():
+    import hashlib
+    # v1.9.7: cached manifest, mtime-invalidated.
+    manifest = _load_approved_manifest()
+    if not manifest:
         return _error(404, "Not found")
-
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-    raw = json.loads(manifest_path.read_text())
-    manifest = raw.get("images", raw) if isinstance(raw, dict) else raw
-    if not isinstance(manifest, list):
-        manifest = []
     entry = next((e for e in manifest if e["id"] == image_id and e.get("api_key_hash") == key_hash), None)
     if not entry:
         return _error(404, "Not found")
@@ -3580,7 +3689,10 @@ async def get_approved_image_file(image_id: str, request: Request) -> Response:
     path = uploads.resolve(entry["image_uri"])
     if not path.exists():
         return _error(404, "Image file not found")
-    return FileResponse(path=str(path), media_type="image/webp")
+    # Approved images are also immutable once approved — cache for 30 days.
+    return _serve_with_http_cache(
+        path, "image/webp", request, max_age=2_592_000, immutable=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3734,7 +3846,12 @@ async def v2_history_image(generation_id: str, request: Request) -> Response:
     if not path.exists():
         return _error(404, "Result file not found")
     media_type = "video/mp4" if "video" in item.get("job_type", "") else "image/webp"
-    return FileResponse(path=str(path), media_type=media_type)
+    # v1.9.7: result files are immutable for their 30-day retention window.
+    # `immutable` is truthful here — once a job completes, its result bytes
+    # never change.
+    return _serve_with_http_cache(
+        path, media_type, request, max_age=2_592_000, immutable=True,
+    )
 
 
 @app.get("/v2/history/{generation_id}/thumbnail")
@@ -3748,8 +3865,12 @@ async def v2_history_thumbnail(generation_id: str, request: Request) -> Response
     thumb_id = item["thumbnail_uri"].removeprefix("thumb://")
     path = config.THUMBNAIL_DIR / thumb_id
     if not path.exists():
-        return _error(404, "Thumbnail not found")
-    return FileResponse(path=str(path), media_type="image/jpeg")
+        return _error(404, "Thumbnail file not found")
+    # v1.9.7: thumb_id is content-addressed (sha/derived). 1-year max-age +
+    # immutable is truthful — a new thumbnail gets a new id.
+    return _serve_with_http_cache(
+        path, "image/jpeg", request, max_age=31_536_000, immutable=True,
+    )
 
 
 @app.delete("/v2/history/{generation_id}")

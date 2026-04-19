@@ -20,4 +20,4 @@ if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
-exec uv run --no-sync uvicorn server:app --host 0.0.0.0 --port 8090
+exec uv run --no-sync uvicorn server:app --host 0.0.0.0 --port 8090 --no-access-log

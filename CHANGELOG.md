@@ -2,6 +2,23 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.7 — 2026-04-19
+
+### Performance pass — HTTP cache headers, conditional GETs, gzip, preview hygiene
+
+Bundled perf wins from a 5-agent audit. All additive, no API shape change, zero new infra (explicitly not Redis — see plan notes).
+
+- **`Cache-Control: public, max-age=<long>, immutable` + manual 304 Not Modified** on `/v2/history/{id}/thumbnail`, `/v2/history/{id}/image`, and `/v1/approved-images/{id}/file`. FastAPI's `FileResponse` sets `ETag` + `Last-Modified` but does NOT honor `If-None-Match` / `If-Modified-Since` — always returns 200 with full body. New `_serve_with_http_cache(path, media_type, request, max_age, immutable=)` helper mirrors Starlette's ETag formula so clients that cached an ETag from a prior FileResponse get 304 hits. Thumbnails → 1-year `immutable` (content-addressed by `thumb_id`); result files + approved images → 30-day `immutable` (30-day retention window). Paired with Cloudflare's default behavior: `public` unlocks edge caching for authenticated requests (CF refuses by default on `Authorization:` headers without `public`).
+- **`GZipMiddleware(minimum_size=1024)`**. `GET /v2/history?limit=50` is 26,243 B JSON; gzipped 4,969 B (5.3× reduction). Zero effect on image/video/audio responses (middleware respects mime type). One middleware line.
+- **Lazy PyAV preview extract — timeout + semaphore**. `GET /v2/jobs/{id}/preview`'s fallback path for missing video thumbnails used to run PyAV decode on a 100+ MB video inside the default thread pool with no timeout. A malformed MP4 could tie up a slot indefinitely. Now: `asyncio.wait_for(..., timeout=8.0)` + process-wide `asyncio.Semaphore(2)` cap on concurrent lazy extracts. Timeout → `204` (same "keep polling" signal the endpoint already uses).
+- **In-memory `approved-images/manifest.json` cache**. `_load_approved_manifest()` caches the parsed list keyed by `(mtime_ns, size)` — any write (including our own `manifest.write_text(...)`) naturally invalidates. Drops a `read_text()` + `json.loads()` off every `GET /v1/approved-images`, `GET /v1/approved-images/{id}/file`, and `POST /v1/approved-images`.
+- **Uvicorn access-log off**. `run.sh` now passes `--no-access-log` — our per-route logger covers the interesting cases; uvicorn's default line-per-request was pure journalctl noise. ~30% log-line reduction during normal workload.
+
+Deferred (documented in `/home/ian/.claude/plans/melodic-sniffing-beacon.md`):
+- **Capability URL `/v2/thumb/{thumb_id}`** (unauth'd, CF Cache Rule) — phase 2, gated on v1.9.7 measurement.
+- **WebP thumbnails** — bundle with phase 2 when we need magic-byte Content-Type sniffing anyway.
+- **Redis** — not for thumbnails. Targeted shared-state move when we go multi-instance (rate-limit counters, SSE tokens, pool-scaling targets). See plan for the precise inventory.
+
 ## v1.9.6 — 2026-04-19
 
 ### Audio-seam fix + turbo dispatch fix
