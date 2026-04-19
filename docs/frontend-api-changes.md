@@ -78,6 +78,7 @@ The request bodies are **identical** between v1 and v2. Only the response change
 | `POST` | `/v1/chat/completions` | Synchronous. Fast (~1s). |
 | `POST` | `/v1/upload` | Synchronous. Returns `upload_url` + `storage_uri`. |
 | `PUT` | `/uploads/put/{id}` | Synchronous. File upload. |
+| `GET` | `/uploads/get/{id}` | Synchronous. Read back an upload (v1.9.1). Content-Type inferred from magic bytes. |
 
 ### New job management endpoints
 

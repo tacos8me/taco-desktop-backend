@@ -143,7 +143,7 @@ Fall back to `GET /v2/jobs/{id}` every 1-2 s only if EventSource isn't available
 | 5 s @ 1440p, full 2-stage | ~55-75 s |
 | 5 s @ 4K, full 2-stage | ~2-3 min |
 
-Turbo mode (`POST /v1/system/turbo`) doubles throughput but does not reduce per-job latency. The Modal remote pool (v1.6, up to 4 extra workers) adds concurrency, not speed.
+Turbo mode (`POST /v1/system/turbo`) doubles throughput but does not reduce per-job latency. The multi-provider remote pool (v1.6 Modal up to 4 workers, v1.9.0 RunPod up to 2) adds concurrency, not speed.
 
 ## Known limitations
 
@@ -257,7 +257,7 @@ Pass `lora` to override the default. The LoRA must be registered with `strategy:
 - `strength` range: `[0.0, 2.0]` (registry-validated).
 - If the id isn't in the registry: `404 "LoRA not found"`.
 - If it's registered with a non-outpaint strategy: server returns `422` (not yet implemented — currently any registered LoRA path works, but future versions may enforce strategy match).
-- Custom LoRAs currently fall back to single-machine dispatch over the Modal remote pool; only the pre-staged default LoRA runs on Modal containers for v1.7.0.
+- Custom LoRAs currently fall back to single-machine dispatch over remote providers; only the pre-staged default LoRA runs on Modal and RunPod containers. Path rewrite uses `config.LTX_PROVIDER_LORAS_MOUNT[provider]` — Modal `/mnt/nvme-1/huggingface/loras/`, RunPod `/runpod-volume/loras/`.
 
 ## See also
 

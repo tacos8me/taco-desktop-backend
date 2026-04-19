@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.7.0 (2026-04-17). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6. See [CHANGELOG](../CHANGELOG.md).
+**Current version:** v1.9.1 (2026-04-19). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. See [CHANGELOG](../CHANGELOG.md).
 
 ## Dual-GPU Layout
 
@@ -69,7 +69,7 @@ Prior to v1.1.4, `DenoiserWorker` held strong refs to source model builders that
 
 ## Turbo Mode (v1.2, hardened v1.5)
 
-Turbo mode temporarily claims **both** GPUs for LTX, enabling 2 concurrent local denoiser workers. Combined with the optional remote-sidecar pool (v1.6) it scales up to **6 concurrent video workers** (2 local + 4 Modal remote).
+Turbo mode temporarily claims **both** GPUs for LTX, enabling 2 concurrent local denoiser workers. Combined with the optional multi-provider remote-sidecar pool (v1.6 Modal, v1.9 RunPod) it scales up to **8 concurrent video workers** (2 local + 4 Modal + 2 RunPod).
 
 Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 
@@ -79,7 +79,7 @@ Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 3. Wait for cuda:1 to drain below 2 GB (20 s deadline) via `nvidia-smi` polling. Abort and restore tenants if not drained.
 4. `systemctl --user start ltx-sidecar`, poll `/health`, call `/load`
 5. Spawn second in-process `worker_loop` pulling from `_job_queue`
-6. If `LTX_REMOTE_SIDECAR_URL` is configured and `_remote_worker_target > 0`, `_scale_remote_pool()` warms up the Modal containers and spawns N additional worker loops (up to `LTX_REMOTE_SIDECAR_MAX_WORKERS`, default 4).
+6. For every configured provider in `ltx_remote_sidecars` (keyed by `"modal"`, `"runpod"`, …) with `_remote_worker_targets[p] > 0`, `_scale_remote_pool()` warms the provider's endpoint and spawns N additional worker loops bound to that provider via `functools.partial` (up to each provider's `MAX_WORKERS`).
 
 ### Active
 - **2+ video jobs process concurrently** via dedicated worker loops (one per local GPU + one per remote container)
@@ -93,16 +93,24 @@ Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 3. `systemctl --user stop ltx-sidecar` on cuda:1
 4. `_restore_cuda1_tenants()` — `systemctl --user start` each configured tenant (`LOAD_ACE` / `LOAD_JOYAI` / `LOAD_ERNIE`)
 
-### Remote-Sidecar Pool (v1.5, scaled v1.6)
+### Remote-Sidecar Pool (v1.5 single-provider → v1.9 multi-provider)
 
-Optional third+ worker dispatches to HTTP sidecars running on remote hardware (Modal RTX Pro 6000 is the canonical deployment).
+Optional extra workers dispatch to HTTP sidecars on remote hardware. v1.9.0 supports multiple providers side-by-side: Modal (RTX Pro 6000, $3.03/hr) and RunPod Load-Balancing Serverless (RTX PRO 6000 Blackwell, ~$2.66/hr). Each provider has its own URL, token, and max-worker cap; operators scale them independently via the dashboard or API.
 
-- Config: `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_TOKEN`, `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4) in `.env`.
-- Scale 0..MAX via `POST /v1/system/pool/remote-workers {"count": N}` or the dashboard "Remote Pool" button grid.
-- Pool is turbo-scoped: workers only run while turbo is active, so non-video jobs queued outside turbo aren't stolen by remote workers that can only serve video.
-- Remote transport failures do NOT auto-exit turbo — a remote is treated as optional extra capacity; jobs on that worker fail individually but main + local-sidecar workers keep serving.
-- State query: `GET /v1/system/pool` returns `{turbo_active, remote_sidecar_configured, remote_sidecar_url, remote_worker_target, remote_worker_active, remote_worker_max}`.
-- `v1.6.1` hot-fix: `_dispatch_job_turbo_remote` base64-encodes local media (`image_path`, `audio_path`, `video_path`, keyframes) into the request body, since the Modal container has no mount of `uploads/`. v1.7.0 outpaint follows the same pattern for `video_path`.
+- **Config per provider** in `.env` (all optional):
+  - Modal: `LTX_MODAL_SIDECAR_URL`, `LTX_MODAL_SIDECAR_TOKEN`, `LTX_MODAL_MAX_WORKERS` (default 4). Falls back to the legacy `LTX_REMOTE_SIDECAR_*` env vars if unset.
+  - RunPod: `LTX_RUNPOD_SIDECAR_URL`, `LTX_RUNPOD_SIDECAR_TOKEN`, `LTX_RUNPOD_MAX_WORKERS` (default 2).
+- **Scaling**:
+  - Legacy `POST /v1/system/pool/remote-workers {"count": N}` — scales **modal only** (backwards compat).
+  - Per-provider body `{"modal": N, "runpod": M}`.
+  - RESTful `POST /v1/system/pool/remote-workers/{provider} {"count": N}` (v1.9.0).
+  - Dashboard: two rows — Modal and RunPod — each with 0..MAX buttons.
+- **Turbo-scoped**: workers only run while turbo is active, so non-video jobs queued outside turbo aren't stolen by remote workers that can only serve video.
+- **Failure isolation**: remote transport failures do NOT auto-exit turbo — any remote is optional extra capacity; jobs on that provider fail individually but main + local-sidecar + other-provider workers keep serving.
+- **State query**: `GET /v1/system/pool` returns `{turbo_active, providers: {modal: {configured, url, target, active, max}, runpod: {...}}, remote_*: <legacy aliases to modal>}`.
+- **Media inlining**: `_dispatch_job_turbo_remote(job, *, provider)` base64-encodes local media (`image_path`, `audio_path`, `video_path`, keyframes) into the request body — neither Modal nor RunPod can see the host's `uploads/` filesystem (`v1.6.1`). v1.7.0 outpaint follows the same pattern for `video_path`.
+- **Per-provider LoRA paths**: `config.LTX_PROVIDER_LORAS_MOUNT` maps `"modal" → /mnt/nvme-1/huggingface/loras/`, `"runpod" → /runpod-volume/loras/`. The outpaint dispatch path rewrites the local `LORAS_DIR` prefix to the provider's mount before sending.
+- **RunPod sidecar repo**: `/mnt/nvme-1/servers/ltx-sidecar-runpod/` — Dockerfile, `runpod_app.py` (FastAPI + `/ping` health probe), `download_weights.py`, `endpoint.yaml`. Mirrors `ltx-sidecar-modal/` shape.
 
 ## cuda:1 Tenants
 

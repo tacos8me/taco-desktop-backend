@@ -2,12 +2,14 @@
 
 Everything you need to ship a working client in 5 minutes. For everything else → [docs/API.md](./API.md).
 
-## What's new in v1.7.0 (2026-04-17)
+## What's new in v1.9.1 (2026-04-19)
 
-- **Video outpaint** — new `POST /v2/video-outpaint`. Expands a source video's canvas to a larger `target_resolution` and fills the pure-black letterbox with an IC-LoRA-generated extension. 9 positions (center + edges + corners). See [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
-- **Remote-sidecar pool scaling** (v1.6 precursor): `POST /v1/system/pool/remote-workers {"count": N}` and `GET /v1/system/pool`. Up to 4 Modal RTX Pro 6000 containers on top of the 2 local workers in turbo mode, for 6 concurrent video jobs.
-- **Turbo hardening** (v1.5): `systemctl`-based eviction of cuda:1 tenants on entry, 20 s drain deadline with automatic rollback on failure. No more half-transitioned states.
-- Additive — no existing endpoints, request shapes, or response semantics changed.
+- **`GET /uploads/get/{upload_id}`** (v1.9.1) — read back a previously-uploaded file. Use this to hydrate media players on page reload (e.g. MusicVideo tab `<audio src>`). Content-Type is inferred from magic bytes (`image/*`, `audio/*`, `video/mp4`). Auth via bearer; the 128-bit `uuid4` ID is the capability.
+- **Composition audio overlay** (v1.9.0) — `POST /v2/compositions/{id}/export` accepts optional `{"audio_uri": "storage://<id>"}`. FFmpeg muxes the audio onto the stitched video (AAC @ 192 kbps, `-shortest`). Video-only export (empty/no body) unchanged.
+- **Multi-provider remote pool** (v1.9.0) — `GET /v1/system/pool` now returns `providers: {modal, runpod}` with per-provider target/active/max; legacy flat `remote_*` fields preserved as modal aliases. Scale via `POST /v1/system/pool/remote-workers {"modal": N, "runpod": M}` or `POST /v1/system/pool/remote-workers/{provider}`. Up to 2 local + 4 Modal + 2 RunPod = **8 concurrent video jobs** at peak.
+- **Video outpaint** (v1.7.0) — `POST /v2/video-outpaint`. 9 positions. See [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
+- **Turbo hardening** (v1.5) — `systemctl`-based cuda:1 tenant eviction on entry, 20 s drain deadline with automatic rollback on failure.
+- All changes additive. Legacy env vars (`LTX_REMOTE_SIDECAR_URL`), legacy pool body shape (`{"count": N}`), and the video-only export call keep working unchanged.
 
 ## The 60-second version
 

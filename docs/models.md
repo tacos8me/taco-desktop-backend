@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.7.0 (2026-04-17). See [CHANGELOG](../CHANGELOG.md) for full release notes.
+**Current version:** v1.9.1 (2026-04-19). See [CHANGELOG](../CHANGELOG.md) for full release notes.
 
 ## LTX Video Models (cuda:0)
 

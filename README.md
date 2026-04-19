@@ -61,7 +61,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 
 ## Endpoints overview
 
-71 endpoints total. Key routes:
+73 endpoints total. Key routes:
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -80,7 +80,9 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | GET | `/v2/jobs/{id}/stream` | SSE live progress (preferred over polling) |
 | GET | `/v2/jobs/{id}/result` | Download result (MP4/WEBP/audio) |
 | POST | `/v1/system/turbo` | Toggle dual-GPU turbo mode |
-| GET/POST | `/v1/system/pool` | Get state + scale remote Modal worker pool *(v1.6)* |
+| GET/POST | `/v1/system/pool` | Get state + scale multi-provider remote pool *(v1.6 modal, v1.9 runpod)* |
+| POST | `/v1/system/pool/remote-workers/{provider}` | Scale one provider (modal\|runpod) *(v1.9.0)* |
+| GET | `/uploads/get/{upload_id}` | Read back an upload *(v1.9.1)* |
 | GET/POST | `/v1/system/sampler` | Get/toggle CFG++ vs Euler sampler |
 | GET/POST | `/v1/system/config` | Get/update all generation parameters |
 | POST | `/v1/system/pause` | Evict all models, free VRAM |
