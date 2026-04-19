@@ -1417,6 +1417,19 @@ When `audio_uri` is a valid `storage://` URI pointing at an audio file, the expo
 - Single-clip + audio works — the single clip is piped through a null video filter and muxed with the audio track.
 - Audio longer than the video is trimmed (`-shortest`). Audio shorter than the video will truncate the output video to the audio length.
 
+**Per-clip audio segmentation (v1.9.3, MusicVideo mode):** when every clip in the stored composition carries a numeric `audioStart` field (seconds into the source song where that clip's audio window begins), the exporter slices the song via `atrim` per clip and concatenates the slices 1:1 with the video — so audio stays beat-aligned even across LTX's `8k+1` frame-count quantization. Trigger requires: `audio_uri` set, **every** clip has `audioStart: <number>` (bools rejected), and the composition has no xfade transitions. Falls back to the legacy full-song overlay otherwise (no behavior change for timeline-mode compositions).
+
+Clip shape (stored in `POST /v2/compositions` body, read back at export time):
+```json
+{
+  "historyId": "h_abc",
+  "sequenceIndex": 0,
+  "duration": 2.04,
+  "audioStart": 0.0
+}
+```
+The clip's `duration` is used verbatim as the `atrim duration=` — keeping it in sync with the video concat eliminates drift. `audioStart` is unvalidated (numeric range is the frontend's contract); negative values or values past the song length will fail ffmpeg with a normal filter-graph error.
+
 **Errors** (surfaced as the job's terminal `error` field):
 - `"Audio not found: storage://..."` — the URI doesn't resolve to a file on disk (UploadStore raises `FileNotFoundError`)
 - `"Invalid storage URI: <...>"` — URI doesn't start with `storage://`

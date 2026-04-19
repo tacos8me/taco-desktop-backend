@@ -2,6 +2,17 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.3 — 2026-04-19
+
+### Composition export: per-clip audio segmentation + AAC encoder flag
+
+Two changes in `export_handler.py`, both additive — no breaking changes.
+
+- **Per-clip audio segmentation** (MusicVideo mode). When every clip carries a numeric `audioStart` field (seconds into the source song where that clip's audio window begins), the song is sliced per clip via `atrim=start=X:duration=Y,asetpts=N/SR/TB` and concatenated 1:1 with the video concat (`concat=n=N:v=0:a=1[aout]`). Audio and video stay exactly aligned even across LTX's `8k+1` frame-count quantization — atrim `duration=` uses the same `clip_durations[i]` the video concat uses. Drops `-shortest` on this path (audio length equals video length by construction).
+- **Fallback to legacy full-song overlay** when any clip lacks `audioStart` (timeline-mode compositions pre-dating the field), when xfade transitions are present (audio-crossfade alignment is a separate design), or when no audio is attached (video-only export, unchanged since v1.7). Bit-identical output on these paths vs v1.9.2 — verified via md5sum.
+- **`-strict -2` on the AAC encoder flag**. Enables the native AAC encoder on ffmpeg builds where it's flagged experimental (symptom: `avcodec_open2(aac) EINVAL` from the subprocess, distinct from the v1.9.2 PyAV race). No-op on builds where AAC is already stable (e.g. this box's ffmpeg 6.1.1).
+- Defensive guards: `audioStart` must be `int|float` and NOT `bool` (Python's `isinstance(True, int)` gotcha); empty `clips` list can't trigger beat-synced path; composition JSON round-trip through `composition_store` preserves `audioStart` verbatim (no Pydantic coercion).
+
 ## v1.9.2 — 2026-04-19
 
 ### Fix: concurrent PyAV encode race on `avcodec_open2(aac)`

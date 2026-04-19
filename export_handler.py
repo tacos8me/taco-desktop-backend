@@ -47,7 +47,15 @@ def export_composition(
     audio_uri: optional `storage://<upload_id>` pointing at an audio file
     (wav/mp3/etc.) to overlay as the output audio track. When set, the audio is
     fed as an extra ffmpeg input, mapped to the output, and truncated to the
-    video length via `-shortest`.
+    video length via ``-shortest``.
+
+    v1.9.3 per-clip segmentation (MusicVideo mode): when every clip carries a
+    numeric ``audioStart`` field (seconds into the source song where that
+    clip's audio window begins), the song is sliced per-clip via ``atrim`` and
+    concatenated 1:1 with the video concat — so audio stays beat-aligned even
+    with LTX's 8k+1 frame quantization drift. Fallback to the legacy full-song
+    overlay when any clip lacks ``audioStart`` (timeline-mode compositions
+    pre-dating the field) or xfade transitions are in play.
     """
     clip_paths: list[Path] = []
     clip_durations: list[float] = []
@@ -126,14 +134,65 @@ def export_composition(
 
         filter_complex = ";".join(filter_parts)
 
+    # v1.9.3: per-clip audio segmentation trigger. When every clip carries a
+    # numeric audioStart (bools rejected — isinstance(True, int) is True in
+    # Python), slice the song via atrim per clip and concat-align with video.
+    # Falls back to the legacy full-song overlay otherwise.
+    #
+    # xfade mode intentionally stays on the legacy path — crossfading video
+    # while slicing audio needs its own alignment design; deferred. Frontend
+    # doesn't allow xfade in MusicVideo mode anyway.
+    clip_audio_starts = [c.get("audioStart") for c in clips]
+    beat_synced = (
+        audio_path is not None
+        and not has_xfade
+        and bool(clip_paths)
+        and all(
+            isinstance(s, (int, float)) and not isinstance(s, bool)
+            for s in clip_audio_starts
+        )
+    )
+
+    if beat_synced:
+        audio_idx = len(clip_paths)  # song is the last -i input
+        audio_parts: list[str] = []
+        audio_labels: list[str] = []
+        for i, (start, dur) in enumerate(zip(clip_audio_starts, clip_durations)):
+            label = f"[a{i:02d}]"
+            # asetpts=N/SR/TB resets timestamps so concat doesn't choke on
+            # non-monotonic PTS across the sliced segments.
+            audio_parts.append(
+                f"[{audio_idx}:a]atrim=start={start}:duration={dur},asetpts=N/SR/TB{label}"
+            )
+            audio_labels.append(label)
+        audio_concat = (
+            f"{''.join(audio_labels)}concat=n={len(clip_paths)}:v=0:a=1[aout]"
+        )
+        filter_complex = ";".join([filter_complex, *audio_parts, audio_concat])
+        audio_map = ["-map", "[aout]"]
+        # No -shortest needed: audio is exactly the same length as video by
+        # construction (atrim duration per clip == video clip duration).
+        audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", "192k"]
+    elif audio_path is not None:
+        # Legacy full-song overlay — unchanged behavior for pre-audioStart
+        # comps (timeline mode) or xfade compositions.
+        audio_map = ["-map", f"{len(clip_paths)}:a:0"]
+        # -strict -2 enables native AAC on ffmpeg builds where it's flagged
+        # experimental (avcodec_open2(aac) EINVAL). No-op on builds where
+        # AAC is already stable (e.g. this box's ffmpeg 6.1.1).
+        audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    else:
+        audio_map = []
+        audio_codec = []
+
     cmd = [
         "ffmpeg", "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
-        *(["-map", f"{len(clip_paths)}:a:0"] if audio_path else []),
+        *audio_map,
         "-c:v", "libopenh264",
-        *(["-c:a", "aac", "-b:a", "192k", "-shortest"] if audio_path else []),
+        *audio_codec,
         str(output_path),
     ]
 
