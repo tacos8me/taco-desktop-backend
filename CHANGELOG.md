@@ -2,6 +2,19 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.5 — 2026-04-19
+
+### MusicVideo contract fixes — three bugs from frontend's 5-agent audit
+
+All three are one-way contract breaks (frontend was doing the right thing; backend silently dropped fields on persist). Additive, no breaking changes.
+
+- **`audio_uri` dropped on composition save/update** (`server.py:4488`, `:4527`). The persisted `data` dict was hardcoded `{"clips": ..., "transitions": ...}`, silently stripping every other top-level body field. Result: MusicVideo compositions persisted without audio metadata → reload → re-export → silent MP4. Fix: new `_composition_data_from_body(body)` helper copies the full body minus `name`, defaults `clips`/`transitions` to empty lists. Future frontend additions no longer need server changes.
+- **Per-clip `audioStart` round-trip fragile** (same root cause as #1). Since clips is a flat list passthrough it was already surviving the JSON round-trip, but the pattern of rebuilding `data` manually would break any future per-composition field. Now fixed by the passthrough.
+- **`AudioToVideoRequest` missing `image_strength`** (`server.py:728`). Pydantic's default `extra="ignore"` silently stripped the field. `_submit_job` has always accepted `image_strength` (pops it at line 1031 with default 0.85), so a2v runs always used 0.85 regardless of client request. Added `image_strength: float = Field(default=0.85, ge=0.0, le=1.0)` to the Pydantic model. Matches `ImageToVideoRequest` exactly.
+- **Export route precedence** — `POST /v2/compositions/{id}/export` now falls back to `comp["data"]["audio_uri"]` when the request body omits `audio_uri`. Request body still wins for ad-hoc overrides. Combined with the save-preserve fix, MusicVideo's save → reload → export path produces the same MP4 as the original export.
+
+Verified live: `POST /v2/compositions` with `audio_uri` + `audioStart` on clips → `GET` returns them intact; `PUT` update preserves them too; `POST /export` with empty body queues a job with the stored `audio_uri`; `image_strength=0.42` passes Pydantic validation on a2v.
+
 ## v1.9.4 — 2026-04-19
 
 ### Fix: real root cause of `avcodec_open2(aac)` EINVAL was 192 kHz input

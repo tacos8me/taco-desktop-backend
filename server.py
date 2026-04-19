@@ -729,6 +729,10 @@ class AudioToVideoRequest(BaseModel):
     prompt: str = Field(max_length=10000)
     audio_uri: str
     image_uri: str | None = None
+    # v1.9.5: was silently stripped by Pydantic (extra="ignore"). Used as the
+    # first-keyframe strength when `image_uri` is set. Matches the field on
+    # ImageToVideoRequest so clients can tune a2v's intro frame intensity.
+    image_strength: float = Field(default=0.85, ge=0.0, le=1.0)
     model: ModelName
     resolution: Resolution
     duration: float = Field(default=6.0, gt=0, le=30)
@@ -4485,14 +4489,31 @@ from composition_store import CompositionStore
 compositions = CompositionStore()
 
 
+def _composition_data_from_body(body: dict) -> dict:
+    """Split a composition-save body into persisted ``data`` (without ``name``).
+
+    v1.9.5: previously we hardcoded ``{"clips", "transitions"}`` which silently
+    dropped any other top-level field (notably ``audio_uri`` for MusicVideo
+    mode — reload → re-export → silent MP4). Now pass the whole body through
+    minus ``name`` so future frontend additions don't require server changes.
+    ``clips`` / ``transitions`` default to empty lists when absent.
+    """
+    data = {k: v for k, v in body.items() if k != "name"}
+    data.setdefault("clips", [])
+    data.setdefault("transitions", [])
+    return data
+
+
 @app.post("/v2/compositions")
 async def v2_compositions_create(request: Request) -> JSONResponse:
     api_key = _extract_api_key(request)
     if not api_key:
         return _error(401, "Missing API key")
     body = await request.json()
+    if not isinstance(body, dict):
+        return _error(400, "body_must_be_object")
     name = body.get("name", "Untitled")
-    data = {"clips": body.get("clips", []), "transitions": body.get("transitions", [])}
+    data = _composition_data_from_body(body)
     result = compositions.create(api_key, name, data)
     return JSONResponse(content=result, status_code=201)
 
@@ -4523,8 +4544,10 @@ async def v2_compositions_update(comp_id: str, request: Request) -> JSONResponse
     if not api_key:
         return _error(401, "Missing API key")
     body = await request.json()
+    if not isinstance(body, dict):
+        return _error(400, "body_must_be_object")
     name = body.get("name", "Untitled")
-    data = {"clips": body.get("clips", []), "transitions": body.get("transitions", [])}
+    data = _composition_data_from_body(body)
     updated = compositions.update(comp_id, api_key, name, data)
     if not updated:
         return _error(404, "Composition not found")
@@ -4552,6 +4575,10 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
         return _error(404, "Composition not found")
     # Optional body: {"audio_uri": "storage://<id>"} to overlay audio on export.
     # Body is optional for backwards compat with existing clients that POST empty.
+    # Precedence (v1.9.5): request body > stored comp["data"]["audio_uri"].
+    # Falling back to the stored value means a reload-then-export produces the
+    # same MP4 as the original export (MusicVideo comps persist audio_uri via
+    # v1.9.5's _composition_data_from_body).
     audio_uri: str | None = None
     try:
         body = await request.json()
@@ -4560,7 +4587,11 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
             if isinstance(raw, str) and raw:
                 audio_uri = raw
     except Exception:
-        pass  # no body / invalid JSON → proceed without audio
+        pass  # no body / invalid JSON → fall through to stored lookup
+    if audio_uri is None:
+        stored = comp["data"].get("audio_uri")
+        if isinstance(stored, str) and stored:
+            audio_uri = stored
     params = {
         "composition_id": comp_id,
         "clips": comp["data"].get("clips", []),

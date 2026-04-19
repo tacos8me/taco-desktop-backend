@@ -674,6 +674,7 @@ All v1 generation endpoints can return:
 | `prompt` | string | required | ≤ 10 000 chars |
 | `audio_uri` | string | required | `storage://<uuid>` |
 | `image_uri` | string \| null | `null` | Optional conditioning image |
+| `image_strength` | float | `0.85` | `0.0 ≤ x ≤ 1.0`. First-keyframe strength when `image_uri` is set. Pre-v1.9.5 this field was silently stripped and the pipeline default was always used. |
 | `model` | [`ModelName`](#modelname-ltx-video) | required | |
 | `resolution` | [`Resolution`](#resolution) | required | |
 | `duration` | float | `6.0` | `0 < x ≤ 30` |
@@ -1376,12 +1377,15 @@ Multi-clip composition timelines (noodle-v export pipeline). Shape is owned by `
 {
   "name": "My Cut",
   "clips": [...],
-  "transitions": [...]
+  "transitions": [...],
+  "audio_uri": "storage://<upload_id>"
 }
 ```
 
 **Response:** the created row.
-**Errors:** `401 "Missing API key"`.
+**Errors:** `401 "Missing API key"`; `400 "body_must_be_object"`.
+
+**Persisted shape (v1.9.5):** every top-level body field except `name` is stored verbatim under `data`. `audio_uri` (MusicVideo mode) survives save → load → export. `clips` / `transitions` default to `[]` when absent. Future frontend-added fields do not require server changes.
 
 ### `GET /v2/compositions`
 
@@ -1411,7 +1415,9 @@ Enqueues a `JobType.EXPORT_COMPOSITION` job; returns the same `202` envelope as 
 
 **Body (optional, v1.9.0):** `{"audio_uri": "storage://<upload_id>"}`
 
-When `audio_uri` is a valid `storage://` URI pointing at an audio file, the exporter adds it as an extra ffmpeg input, maps it as the output audio track, and truncates to the video length via `-shortest`. Leave empty / omit body for video-only export (pre-v1.9.0 behavior, unchanged).
+**Precedence (v1.9.5):** request body `audio_uri` > stored composition `audio_uri`. The export route falls back to the stored value when the body omits it, so reloading a MusicVideo composition and hitting export with no body produces the same MP4 as the original export. Pass a body `audio_uri` to override ad-hoc.
+
+When `audio_uri` is a valid `storage://` URI pointing at an audio file, the exporter adds it as an extra ffmpeg input, maps it as the output audio track, and truncates to the video length via `-shortest`. Leave empty / omit body and the composition has no stored `audio_uri` for video-only export (pre-v1.9.0 behavior, unchanged).
 
 - The audio file must already exist as a user upload (`PUT /uploads/put/{id}` then reference via `storage://<id>`). Any format ffmpeg supports (WAV, MP3, AAC, FLAC, OGG) works.
 - Single-clip + audio works — the single clip is piped through a null video filter and muxed with the audio track.
