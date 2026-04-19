@@ -706,22 +706,43 @@ def _pick_tmp_dir(estimated_bytes: int) -> Path:
     return target
 
 
-# v1.9.2: process-wide lock around PyAV `encode_video` calls.
-#
-# Context: under turbo (2 local workers) concurrent MP4 encodes that ran
-# through PyAV's libx264 + AAC muxer occasionally failed with
-# `av.error.ValueError: [Errno 22] Invalid argument: 'avcodec_open2(aac)'`
-# at `container.mux()` / `start_encoding()`. FFmpeg's muxer initialization
-# (`avcodec_open2` for each output stream's codec context) isn't fully
-# thread-safe across concurrent output containers from the same process —
-# the AAC encoder init racing with libx264 init is the reliable symptom.
-#
-# Reproduced: single-worker encode of the exact failing payload succeeds
-# byte-for-byte; failure only appears when two a2v jobs' encodes overlap.
-# Fix: serialize the PyAV encode phase. Denoising still runs in parallel
-# (the expensive part — 10-60s per job); only the final ~1-2s encode tail
-# serializes. Turbo throughput impact ≤ 5% for typical video lengths.
+# v1.9.2: process-wide lock around PyAV `encode_video` calls. Kept as
+# defensive hygiene against concurrent-encode issues; the actual root cause
+# of the avcodec_open2(aac) EINVAL was fixed in v1.9.4 (see below).
 _ENCODE_LOCK = threading.Lock()
+
+
+# v1.9.4: the native AAC encoder only supports this specific rate set. User
+# uploads can come in at 192 kHz PCM (e.g. ffmpeg's default WAV capture from
+# some DAWs); passing those through to `_prepare_audio_stream("aac", rate=192000)`
+# makes `avcodec_open2(aac)` return EINVAL. Resample to 48 kHz (widely compatible
+# target) when the source rate isn't in this list. 48 kHz is also what every
+# modern browser / player expects for video-muxed AAC.
+_AAC_SAMPLE_RATES = frozenset(
+    (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350)
+)
+_AAC_DEFAULT_TARGET_RATE = 48000
+
+
+def _normalize_audio_for_aac(audio: Audio) -> Audio:
+    """Resample audio to an AAC-supported rate if needed.
+
+    AAC can't encode outside ``_AAC_SAMPLE_RATES``. When the source rate isn't
+    supported (e.g. 192000 Hz), downsample to 48 kHz via torchaudio and return
+    a new Audio. No-op on already-supported rates.
+    """
+    rate = int(audio.sampling_rate)
+    if rate in _AAC_SAMPLE_RATES:
+        return audio
+    import torchaudio
+    resampled = torchaudio.functional.resample(
+        audio.waveform, orig_freq=rate, new_freq=_AAC_DEFAULT_TARGET_RATE
+    )
+    logger.info(
+        "audio resampled from %d Hz to %d Hz for AAC muxer compatibility",
+        rate, _AAC_DEFAULT_TARGET_RATE,
+    )
+    return _replace(audio, waveform=resampled, sampling_rate=_AAC_DEFAULT_TARGET_RATE)
 
 
 def _video_to_bytes(
@@ -742,12 +763,16 @@ def _video_to_bytes(
     tmp_dir = _pick_tmp_dir(estimate)
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=str(tmp_dir)) as tmp:
         tmp_path = tmp.name
+    # v1.9.4: guard against unsupported sample rates (e.g. 192 kHz PCM uploads)
+    # that would make AAC's avcodec_open2 return EINVAL. No-op when the source
+    # rate is already AAC-compatible.
+    effective_audio = _normalize_audio_for_aac(audio) if (audio is not None and include_audio) else (audio if include_audio else None)
     try:
         with _ENCODE_LOCK:
             encode_video(
                 video=video,
                 fps=int(fps),
-                audio=audio if include_audio else None,
+                audio=effective_audio,
                 output_path=tmp_path,
                 video_chunks_number=video_chunks_number,
             )

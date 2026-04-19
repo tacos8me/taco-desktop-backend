@@ -2,6 +2,20 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.4 — 2026-04-19
+
+### Fix: real root cause of `avcodec_open2(aac)` EINVAL was 192 kHz input
+
+v1.9.2's thread-lock was defensive hygiene but not the actual bug. Post-deploy logs showed the error still firing on a2v jobs after the lock was in place. Investigation: recent uploads were PCM WAV at **192,000 Hz** sample rate. AAC supports only {96, 88.2, 64, 48, 44.1, 32, 24, 22.05, 16, 12, 11.025, 8, 7.35} kHz — 192 kHz is **not on that list**. The pipeline passed `audio_sample_rate=192000` straight into `_prepare_audio_stream("aac", rate=192000)`, and ffmpeg's AAC encoder init returned EINVAL.
+
+Fix in `split_model_manager.py`:
+- `_AAC_SAMPLE_RATES` constant + `_normalize_audio_for_aac(audio)` helper that resamples to 48 kHz via `torchaudio.functional.resample` when the source rate isn't in the supported set. No-op on already-compatible rates.
+- Called inside `_video_to_bytes` before handing audio to `encode_video`, so all video types with passthrough audio (primarily a2v) get the guard.
+
+Verified with the actual production upload `b1378db45...` (stereo PCM at 192 kHz, 5 s): source `(1, 2, 960000)` → resampled `(2, 240000)` at 48 kHz → encodes to 104,804-byte MP4 cleanly. Previous error was `av.error.ValueError: [Errno 22] Invalid argument: 'avcodec_open2(aac)'` at `container.mux()`.
+
+v1.9.2's `_ENCODE_LOCK` stays — concurrent-encode hygiene is still worth having even though it wasn't this bug's cause.
+
 ## v1.9.3 — 2026-04-19
 
 ### Composition export: per-clip audio segmentation + AAC encoder flag
