@@ -155,14 +155,34 @@ def export_composition(
 
     if beat_synced:
         audio_idx = len(clip_paths)  # song is the last -i input
+
+        # v1.9.6: slice duration must be the BEAT GAP (audioStart[i+1] -
+        # audioStart[i]), NOT the LTX-quantized clip_duration. Clip durations
+        # round up to 8k+1 frames (e.g. 2.04 s instead of 2.00 s), so using
+        # clip_duration as the atrim span overlaps adjacent slices by ~40 ms
+        # at every seam — audible repeat of the last fraction of each beat.
+        # The beat-gap approach pulls non-overlapping song ranges. For the
+        # LAST clip there is no next beat, so fall back to clip_duration[N-1].
+        # Zero / non-monotonic gaps fall back to clip_duration[i] — defensive
+        # against clients that pass garbage audioStart values.
+        slice_durations: list[float] = []
+        for i, start in enumerate(clip_audio_starts):
+            if i < len(clip_paths) - 1:
+                gap = clip_audio_starts[i + 1] - start
+                if gap <= 0:
+                    gap = clip_durations[i]
+                slice_durations.append(float(gap))
+            else:
+                slice_durations.append(float(clip_durations[i]))
+
         audio_parts: list[str] = []
         audio_labels: list[str] = []
-        for i, (start, dur) in enumerate(zip(clip_audio_starts, clip_durations)):
+        for i, (start, slice_dur) in enumerate(zip(clip_audio_starts, slice_durations)):
             label = f"[a{i:02d}]"
             # asetpts=N/SR/TB resets timestamps so concat doesn't choke on
             # non-monotonic PTS across the sliced segments.
             audio_parts.append(
-                f"[{audio_idx}:a]atrim=start={start}:duration={dur},asetpts=N/SR/TB{label}"
+                f"[{audio_idx}:a]atrim=start={start}:duration={slice_dur},asetpts=N/SR/TB{label}"
             )
             audio_labels.append(label)
         audio_concat = (
@@ -170,8 +190,10 @@ def export_composition(
         )
         filter_complex = ";".join([filter_complex, *audio_parts, audio_concat])
         audio_map = ["-map", "[aout]"]
-        # No -shortest needed: audio is exactly the same length as video by
-        # construction (atrim duration per clip == video clip duration).
+        # No -shortest needed: each atrim slice is bounded by the next beat's
+        # audioStart (or by clip_duration for the last clip), so the audio
+        # total length is (sum of beat gaps) + last clip_duration — within
+        # one LTX-quantization step of the video length.
         audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", "192k"]
     elif audio_path is not None:
         # Legacy full-song overlay — unchanged behavior for pre-audioStart

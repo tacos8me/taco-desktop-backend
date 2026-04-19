@@ -2,6 +2,18 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.6 — 2026-04-19
+
+### Audio-seam fix + turbo dispatch fix
+
+Two fixes surfaced by the v1.9.5 end-to-end validation run.
+
+**Beat-gap atrim (frontend report):** v1.9.3 sliced the song via `atrim duration=clip_durations[i]`, but LTX quantizes to 8k+1 frames (e.g. 2.04 s for 49 frames @ 24 fps) while the frontend's beat grid is typically clean 2.0 s. Result: adjacent atrim slices overlapped by ~40 ms of song content at every seam — audible repeat on each beat transition. Fix: slice duration is now the beat gap `audioStart[i+1] - audioStart[i]` for every clip except the last, and `clip_durations[-1]` for the last (no next beat). Non-monotonic audioStart falls back to `clip_durations[i]` per clip defensively. Output audio length is now `sum(beat_gaps) + clip_duration[last]` — within one LTX-quantization step of video length, no content overlap.
+
+**Turbo worker refuses non-video jobs (my validation found):** turbo and remote workers' dispatch functions hard-crash on non-video job types (`Turbo worker cannot handle export-composition — only video jobs supported`). Pre-v1.9.6, if a turbo worker dequeued an `EXPORT_COMPOSITION` job before the main worker, the job failed immediately. Export under turbo was effectively broken. Fix: new `accept_check: Callable[[Job], bool] | None` param on `job_queue.worker_loop` — when it returns False, the worker re-queues the job and yields (50 ms sleep to avoid hot-spin). Wired on both the local turbo worker and every remote-provider worker with `accept_check=lambda job: job.type in _VIDEO_JOB_TYPES`. Main worker takes everything as before.
+
+Live verified: beat-synced export under turbo completes with audio duration 4.040 s for `audioStart=[0.0, 2.0]` + `duration=2.04` clips — exactly `2.0 + 2.04 = 4.04`. Prior v1.9.5 behavior would have been 4.08 s (2.04 × 2) with 40 ms of song content repeated at the seam.
+
 ## v1.9.5 — 2026-04-19
 
 ### MusicVideo contract fixes — three bugs from frontend's 5-agent audit

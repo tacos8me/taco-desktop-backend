@@ -1746,10 +1746,13 @@ async def _scale_remote_pool() -> None:
                             partial(_dispatch_job_turbo_remote, provider=provider),
                             uploads, history,
                             # Always skip inference_lock — remote workers never
-                            # touch local GPUs. This is safe because the pool only
-                            # scales > 0 while _turbo_active is True, and turbo
-                            # mode routes only video jobs to the queue.
+                            # touch local GPUs. This is safe because remote
+                            # workers are video-only (accept_check below) and
+                            # the remote dispatcher raises on non-video types.
                             turbo_check=lambda job: True,
+                            # v1.9.6: re-queue non-video jobs for the main
+                            # worker (export-composition, char-rank, etc.).
+                            accept_check=lambda job: job.type in _VIDEO_JOB_TYPES,
                             on_complete=_decr_queue_on_complete,
                         ),
                         name=f"remote-worker-{provider}-{i}",
@@ -1892,6 +1895,9 @@ async def _enter_turbo_mode() -> None:
     _turbo_worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo, uploads, history,
                     turbo_check=lambda job: _turbo_active,
+                    # v1.9.6: video-only — export-composition, char-rank, etc.
+                    # get re-queued for the main worker to pick up.
+                    accept_check=lambda job: job.type in _VIDEO_JOB_TYPES,
                     on_complete=_decr_queue_on_complete),
         name="turbo-worker",
     )

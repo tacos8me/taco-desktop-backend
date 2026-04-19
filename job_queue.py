@@ -231,6 +231,7 @@ async def worker_loop(
     history: "HistoryStore | None" = None,
     turbo_check: Callable[[Job], bool] | Callable[[], bool] | None = None,
     on_complete: Callable[[Job], None] | None = None,
+    accept_check: Callable[[Job], bool] | None = None,
 ) -> None:
     """Background worker that processes jobs from the queue.
 
@@ -242,6 +243,13 @@ async def worker_loop(
     turbo_check receives the Job being dispatched so it can decide per-job
     whether the lock is needed (e.g. Flux image jobs still need the lock
     even when turbo is active for video jobs).
+
+    accept_check (v1.9.6): optional per-job gate deciding whether THIS worker
+    handles the job at all. When it returns False, the job is put back on
+    the queue and another worker gets a chance. Used by turbo + remote
+    workers to refuse non-video jobs (export-composition, char-rank, etc.)
+    that only the main worker knows how to dispatch. A short sleep prevents
+    a hot-spin when the main worker is temporarily busy.
     """
     logger.info("Queue worker started")
     while True:
@@ -249,6 +257,16 @@ async def worker_loop(
         job = job_store.get(job_id)
         if job is None or job.status == JobStatus.CANCELLED:
             queue.task_done()
+            continue
+
+        # v1.9.6: turbo / remote workers refuse jobs they can't dispatch and
+        # re-queue them for the main worker. Without this, a turbo worker
+        # that grabs an EXPORT_COMPOSITION job fails it immediately with
+        # "Turbo worker cannot handle export-composition".
+        if accept_check is not None and not accept_check(job):
+            queue.task_done()
+            await queue.put(job_id)
+            await asyncio.sleep(0.05)  # avoid tight spin if main is busy
             continue
 
         job.status = JobStatus.PROCESSING
