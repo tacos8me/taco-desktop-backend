@@ -40,8 +40,15 @@ def export_composition(
     clips: list[dict],
     transitions: list[dict],
     uploads: UploadStore,
+    audio_uri: str | None = None,
 ) -> bytes:
-    """Stitch clips with xfade transitions, return MP4 bytes."""
+    """Stitch clips with xfade transitions, optional audio overlay, return MP4 bytes.
+
+    audio_uri: optional `storage://<upload_id>` pointing at an audio file
+    (wav/mp3/etc.) to overlay as the output audio track. When set, the audio is
+    fed as an extra ffmpeg input, mapped to the output, and truncated to the
+    video length via `-shortest`.
+    """
     clip_paths: list[Path] = []
     clip_durations: list[float] = []
 
@@ -53,17 +60,26 @@ def export_composition(
     if not clip_paths:
         raise ValueError("No clips to export")
 
-    # Single clip — just return it
-    if len(clip_paths) == 1:
+    audio_path: Path | None = None
+    if audio_uri:
+        # uploads.resolve() validates the URI and raises FileNotFoundError
+        # if the file is missing — no redundant exists() check needed.
+        audio_path = uploads.resolve(audio_uri)
+
+    # Single clip + no audio — return raw bytes, skip ffmpeg entirely.
+    # With audio we still need ffmpeg to mux the track.
+    if len(clip_paths) == 1 and audio_path is None:
         return clip_paths[0].read_bytes()
 
-    # Build ffmpeg command with xfade chain
+    # Build ffmpeg command with xfade chain (or concat + audio overlay)
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         output_path = Path(tmp.name)
 
     inputs: list[str] = []
     for p in clip_paths:
         inputs.extend(["-i", str(p)])
+    if audio_path is not None:
+        inputs.extend(["-i", str(audio_path)])
 
     # Build xfade filter chain
     # Check if any transitions have actual duration
@@ -73,11 +89,15 @@ def export_composition(
     )
 
     if not has_xfade:
-        # Simple concat — no xfade needed
-        filter_parts = []
-        for i in range(len(clip_paths)):
-            filter_parts.append(f"[{i}:v]")
-        filter_complex = f"{''.join(filter_parts)}concat=n={len(clip_paths)}:v=1:a=0[vout]"
+        if len(clip_paths) == 1:
+            # Single clip + audio overlay — pass video through unchanged.
+            filter_complex = "[0:v]null[vout]"
+        else:
+            # Simple concat — no xfade needed
+            filter_parts = []
+            for i in range(len(clip_paths)):
+                filter_parts.append(f"[{i}:v]")
+            filter_complex = f"{''.join(filter_parts)}concat=n={len(clip_paths)}:v=1:a=0[vout]"
     else:
         # xfade chain
         filter_parts: list[str] = []
@@ -111,7 +131,9 @@ def export_composition(
         *inputs,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
+        *(["-map", f"{len(clip_paths)}:a:0"] if audio_path else []),
         "-c:v", "libopenh264",
+        *(["-c:a", "aac", "-b:a", "192k", "-shortest"] if audio_path else []),
         str(output_path),
     ]
 

@@ -2,6 +2,65 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.1 — 2026-04-19
+
+### `GET /uploads/get/{upload_id}` — serve uploads back
+
+Routing gap fix. The upload store has always been disk-backed + persistent, but there was no GET route to read files back. Frontend consumers (noodle-m MusicVideo tab reloading an uploaded song, composition-export audio preview) hit 404s.
+
+- **New**: `GET /uploads/get/{upload_id}` returns the raw bytes with an inferred `Content-Type` (`image/jpeg`, `image/png`, `image/webp`, `audio/wav`, `audio/mpeg`, `audio/flac`, `audio/ogg`, `video/mp4`; fallback `application/octet-stream`). Auth via global bearer middleware — the 128-bit `uuid4` hex ID is the capability.
+- **Errors**: `400 invalid_upload_id` (malformed), `404 upload_not_found` (valid ID, no file), `500 upload_read_failed` (disk I/O).
+- **Deferred by design**: no TTL, no per-key ownership enforcement, no signed URLs, no HTTP Range — add selectively if needed.
+- New helper `_infer_media_type_from_magic(head) -> str` alongside the existing `_content_type_matches_magic` (v1.8.2).
+
+## v1.9.0 — 2026-04-19
+
+### Composition export: optional audio overlay
+
+`POST /v2/compositions/{comp_id}/export` now accepts an optional body `{"audio_uri": "storage://<id>"}`. When set, ffmpeg muxes the referenced audio file onto the stitched video output (AAC @ 192kbps, `-shortest`). No body / empty body preserves pre-v1.9 video-only behavior. Single-clip + audio works via an inserted `[0:v]null[vout]` pass-through filter (prior single-clip short-circuit that returned raw bytes is bypassed when audio is present).
+
+### RunPod as a second remote-sidecar provider alongside Modal
+
+v1.6's single remote-sidecar pool becomes a **multi-provider** pool. Modal and RunPod run side-by-side, each with independent target/active/max worker counts. Operators can burst to both simultaneously (up to `2 local + 4 modal + 2 runpod = 8` concurrent video workers) or pick whichever is cheapest / has availability. No Modal retirement — existing deployments keep working unchanged.
+
+**Why**: RunPod RTX PRO 6000 Blackwell serverless is cheaper than Modal (~$2.66/hr active vs ~$3.03/hr), the RunPod account has free credits, and two providers = redundancy against single-vendor outages.
+
+#### Backwards compatibility
+
+All pre-v1.9 deployments keep working. `LTX_REMOTE_SIDECAR_URL` / `LTX_REMOTE_SIDECAR_TOKEN` / `LTX_REMOTE_SIDECAR_MAX_WORKERS` are still honored and transparently aliased to the `modal` provider. The legacy `POST /v1/system/pool/remote-workers {"count": N}` body shape still scales modal only. Legacy flat fields (`remote_sidecar_configured`, `remote_worker_target/active/max`, `remote_sidecar_url`) stay in the `GET /v1/system/pool` response as aliases to the modal provider.
+
+#### API — breaking additions (response shape expanded, not removed)
+
+- **`GET /v1/system/pool`** adds `providers: {modal: {configured, url, target, active, max}, runpod: {...}}`. Legacy flat fields preserved.
+- **`POST /v1/system/pool/remote-workers`** now accepts `{"modal": N, "runpod": M}` alongside the legacy `{"count": N}`. Response returns the same shape as `GET /v1/system/pool` plus `applied_now`.
+- **`POST /v1/system/pool/remote-workers/{provider}`** (new) — cleanest RESTful per-provider scale, `{provider}` ∈ `{"modal", "runpod"}`.
+
+#### Config
+
+- New env vars: `LTX_MODAL_SIDECAR_URL/TOKEN/MAX_WORKERS`, `LTX_RUNPOD_SIDECAR_URL/TOKEN/MAX_WORKERS`. Modal vars fall back to `LTX_REMOTE_SIDECAR_*` when unset.
+- New `config.LTX_PROVIDER_LORAS_MOUNT` maps provider → LoRA mount path for outpaint LoRA rewrites (Modal `/mnt/nvme-1/huggingface/loras/`, RunPod `/runpod-volume/loras/`).
+- `LTX_RUNPOD_MAX_WORKERS` defaults to 2 (matches the endpoint's `workers.max` in `endpoint.yaml`).
+
+#### Internal refactors
+
+- `ltx_sidecar_client.ltx_remote_sidecars: dict[str, LtxSidecarClient]` replaces the single `ltx_remote_sidecar` module-level. The singular name is kept as a backwards-compat alias pointing at the modal entry.
+- `server.py` pool state becomes per-provider dicts: `_remote_worker_targets` + `_remote_worker_tasks` keyed by provider. `_PROVIDERS = ("modal", "runpod")`.
+- `_dispatch_job_turbo_remote(job, *, provider: str)` gains a provider kwarg. `_scale_remote_pool()` uses `functools.partial` to bind each worker task to its provider at spawn time.
+- Dashboard grows a second row ("RunPod Pool") mirroring the Modal row. JS walks `data.providers` with fallback to legacy flat fields.
+
+#### New repo: `/mnt/nvme-1/servers/ltx-sidecar-runpod/`
+
+- `runpod_app.py` — FastAPI app mirroring `modal_app.py::fastapi_app`. `/ping` health probe, `/health`, `/load`, `/unload`, `/generate` all share the Modal client contract.
+- `Dockerfile` — `runpod/pytorch:2.11.0-py3.12-cuda13.0-ubuntu24.04` base + LTX-2 editable install + minimal taco-inference-deps.
+- `download_weights.py` — one-shot script to populate the RunPod Network Volume (~80 GB).
+- `endpoint.yaml` — RunPod Load-Balancing Serverless config (GPU `RTX_PRO_6000`, `min_workers=1`, `max_workers=2`).
+
+#### Migration
+
+- No action required for existing single-provider Modal users — old env vars still work.
+- To add RunPod: build + push the image at `/mnt/nvme-1/servers/ltx-sidecar-runpod/`, create the Serverless endpoint + Network Volume, populate weights, add `LTX_RUNPOD_SIDECAR_URL` + `LTX_RUNPOD_SIDECAR_TOKEN` to `.env`, restart backend.
+- **Security note**: rotate any RunPod API keys that were shared in chat/transcripts during planning. The `SIDECAR_AUTH_TOKEN` secret on the RunPod endpoint is independent of the user-account API key.
+
 ## v1.8.2 — 2026-04-18
 
 ### server.py security sweep — admin gate, quotas, validation, timing hardening

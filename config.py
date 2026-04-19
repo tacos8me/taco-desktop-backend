@@ -83,16 +83,37 @@ LOAD_ERNIE = os.environ.get("LOAD_ERNIE", "").lower() in ("1", "true", "yes")
 # Managed via systemctl; taco-backend calls /load and /unload to control GPU memory.
 LTX_SIDECAR_URL = os.environ.get("LTX_SIDECAR_URL", "http://127.0.0.1:8093")
 
-# Optional SECOND LTX sidecar in the turbo pool (v1.5 — Modal RTX Pro 6000, etc.).
-# When set, turbo mode spins up an EXTRA concurrent worker dispatching to this
-# URL, giving 3 concurrent video workers total (main cuda:0 + local cuda:1 sidecar
-# + remote). Leave empty to disable. Token is the Bearer value — NOT an env-var name.
+# Optional REMOTE LTX sidecars in the turbo pool (v1.5 → v1.9 multi-provider).
+# Each provider spins up its own worker tasks alongside main (cuda:0) + local
+# (cuda:1 sidecar). Jobs pull from the shared _job_queue — whichever worker is
+# available first grabs next. Leave URL empty to disable that provider.
+#
+# v1.9.0: per-provider config. `LTX_REMOTE_SIDECAR_*` (singular) from v1.6-v1.8
+# is still honored and aliased to the `modal` provider for backwards compat.
 LTX_REMOTE_SIDECAR_URL = os.environ.get("LTX_REMOTE_SIDECAR_URL", "").strip()
 LTX_REMOTE_SIDECAR_TOKEN = os.environ.get("LTX_REMOTE_SIDECAR_TOKEN", "").strip()
-# v1.6: upper bound on concurrent remote workers (each = 1 Modal container).
-# User can scale 0..MAX via `POST /v1/system/pool/remote-workers`. Must not
-# exceed the Modal function's `max_containers` or we queue forever.
 LTX_REMOTE_SIDECAR_MAX_WORKERS = int(os.environ.get("LTX_REMOTE_SIDECAR_MAX_WORKERS", "4"))
+
+# Modal provider — explicit per-provider env, falls back to legacy LTX_REMOTE_SIDECAR_*.
+LTX_MODAL_SIDECAR_URL = os.environ.get("LTX_MODAL_SIDECAR_URL", LTX_REMOTE_SIDECAR_URL).strip()
+LTX_MODAL_SIDECAR_TOKEN = os.environ.get("LTX_MODAL_SIDECAR_TOKEN", LTX_REMOTE_SIDECAR_TOKEN).strip()
+LTX_MODAL_MAX_WORKERS = int(os.environ.get("LTX_MODAL_MAX_WORKERS", str(LTX_REMOTE_SIDECAR_MAX_WORKERS)))
+
+# RunPod provider — Load-Balancing Serverless endpoint on RTX PRO 6000 Blackwell.
+# Token is the RunPod API key (Bearer). Max workers should match the endpoint's
+# scaling ceiling (`max_workers` in endpoint.yaml).
+LTX_RUNPOD_SIDECAR_URL = os.environ.get("LTX_RUNPOD_SIDECAR_URL", "").strip()
+LTX_RUNPOD_SIDECAR_TOKEN = os.environ.get("LTX_RUNPOD_SIDECAR_TOKEN", "").strip()
+LTX_RUNPOD_MAX_WORKERS = int(os.environ.get("LTX_RUNPOD_MAX_WORKERS", "2"))
+
+# Provider-aware LoRA mount paths. The local backend stores LoRAs at LORAS_DIR;
+# each remote provider has the same LoRAs prestaged at a different mount. When
+# dispatching outpaint jobs with lora_path pointing into LORAS_DIR, we rewrite
+# the prefix to the provider's mount before sending to that sidecar.
+LTX_PROVIDER_LORAS_MOUNT = {
+    "modal": "/mnt/nvme-1/huggingface/loras/",
+    "runpod": "/runpod-volume/loras/",
+}
 
 # ACE-Step music generation sidecar on cuda:1 (v1.2).
 ACE_SIDECAR_URL = os.environ.get("ACE_SIDECAR_URL", "http://127.0.0.1:8001")

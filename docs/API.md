@@ -24,7 +24,7 @@
   - [`GET/POST /v1/system/config`](#get-v1systemconfig) · [`POST /v1/system/config/reset`](#post-v1systemconfigreset)
   - [`GET/POST /v1/system/flux-config`](#get-v1systemflux-config) · [`POST /v1/system/flux-config/reset`](#post-v1systemflux-configreset)
   - [`GET/POST /v1/system/sampler`](#get-v1systemsampler)
-- [Uploads](#uploads) — [`POST /v1/upload`](#post-v1upload) · [`PUT /uploads/put/{upload_id}`](#put-uploadsputupload_id)
+- [Uploads](#uploads) — [`POST /v1/upload`](#post-v1upload) · [`PUT /uploads/put/{upload_id}`](#put-uploadsputupload_id) · [`GET /uploads/get/{upload_id}`](#get-uploadsgetupload_id-v191)
 - [LoRA registries](#lora-registries) — [LTX](#ltx-loras) · [Flux](#flux-loras)
 - [v1 sync generation](#v1-sync-generation)
   - [`POST /v1/text-to-video`](#post-v1text-to-video) · [`POST /v1/image-to-video`](#post-v1image-to-video) · [`POST /v1/audio-to-video`](#post-v1audio-to-video) · [`POST /v1/retake`](#post-v1retake)
@@ -118,7 +118,7 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs, resolved 
 
 - **cuda:0** (RTX PRO 6000 96 GB) — LTX ↔ Flux, mutually exclusive, auto-swap on dispatch.
 - **cuda:1** (RTX PRO 6000 96 GB) — ACE (~18 GB, port 8001) coexisting with either JoyAI (~50 GB, port 8092) or ERNIE-Image (~33 GB, port 8094); JoyAI and ERNIE are mutually exclusive.
-- **Turbo mode** claims cuda:1 for a second LTX worker + optional remote-sidecar pool (via `LTX_REMOTE_SIDECAR_URL`). Total capacity while turbo is on: `2 + remote_worker_active` concurrent video workers.
+- **Turbo mode** claims cuda:1 for a second LTX worker + optional multi-provider remote-sidecar pool (Modal + RunPod, v1.9.0). Total capacity while turbo is on: `2 local + sum(providers[*].active)` concurrent video workers — up to `2 + 4 (modal) + 2 (runpod) = 8` with both providers configured at default max.
 
 ---
 
@@ -345,43 +345,60 @@ Turbo entry ~20 s, exit ~15 s. v1.6+: turbo stacks the optional remote-sidecar p
 
 ### `GET /v1/system/pool`
 
-Inspect the LTX remote-sidecar pool.
+Inspect the LTX remote-sidecar pool. **v1.9.0 multi-provider** — each provider (`modal`, `runpod`) has independent target/active/max counts. Legacy flat `remote_*` fields are kept as backwards-compat aliases for the `modal` provider.
 
 ```json
 {
   "turbo_active": true,
+  "providers": {
+    "modal":  {"configured": true,  "url": "https://...modal.run",         "target": 3, "active": 3, "max": 4},
+    "runpod": {"configured": true,  "url": "https://api.runpod.ai/v2/.../lb", "target": 1, "active": 1, "max": 2}
+  },
   "remote_sidecar_configured": true,
-  "remote_sidecar_url": "https://example.modal.run",
+  "remote_sidecar_url": "https://...modal.run",
   "remote_worker_target": 3,
   "remote_worker_active": 3,
   "remote_worker_max": 4
 }
 ```
 
-- `remote_sidecar_configured` — `true` iff `LTX_REMOTE_SIDECAR_URL` is set.
-- `remote_worker_target` — operator's desired count; persists across turbo toggles.
-- `remote_worker_active` — currently live worker tasks. Always `0` when `turbo_active` is false (the pool is turbo-scoped).
-- `remote_worker_max` — `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4).
+- `providers` — authoritative per-provider state. Each entry:
+  - `configured` — the URL env var is set
+  - `target` — operator's desired count; persists across turbo toggles
+  - `active` — currently live worker tasks (always `0` when `turbo_active=false` — the pool is turbo-scoped)
+  - `max` — upper bound (`LTX_MODAL_MAX_WORKERS` / `LTX_RUNPOD_MAX_WORKERS`)
+- Flat `remote_*` fields alias the `modal` provider for pre-v1.9 clients.
 
-Total concurrent video workers when turbo is on: `2 + remote_worker_active`.
+Total concurrent video workers when turbo is on: `2 local + sum(providers[*].active)`.
 
 ### `POST /v1/system/pool/remote-workers`
 
-Set target remote-worker count. Clamped to `[0, remote_worker_max]`. Immediate if turbo is on; stored for next turbo-enable otherwise.
+Set target remote-worker counts. Clamped per-provider to `[0, providers[p].max]`. Immediate if turbo is on; stored for next turbo-enable otherwise.
 
-**Body:** `{"count": 3}` (`PoolCountRequest`, `count >= 0`)
-**Response:**
-```json
-{
-  "remote_worker_target": 3,
-  "remote_worker_active": 3,
-  "remote_worker_max": 4,
-  "applied_now": true
-}
-```
+**Body (two shapes accepted):**
+- `{"count": 3}` — legacy v1.6 shape, scales **modal only**
+- `{"modal": 3, "runpod": 1}` — per-provider targets (v1.9.0)
+
+Unknown provider keys return `400 {"error": "unknown_provider: [...]"}`. Unconfigured providers return `400 {"error": "provider_not_configured: runpod"}`.
+
+**Response:** same shape as `GET /v1/system/pool`, plus `"applied_now": true/false` indicating whether the live pool was scaled immediately (turbo on) or the target was just stored for next turbo-enable (turbo off).
 
 **Errors:**
-- `400 {"error": "remote_sidecar_not_configured: set LTX_REMOTE_SIDECAR_URL in .env"}`
+- `400 {"error": "remote_sidecar_not_configured: set LTX_MODAL_SIDECAR_URL or LTX_RUNPOD_SIDECAR_URL in .env"}`
+- `400 {"error": "invalid_json"}` / `"body_must_be_object"`
+- `400 {"error": "count_must_be_int"}` / `"count_must_be_nonneg"`
+- `500 {"error": "pool_scale_failed: ..."}`
+
+### `POST /v1/system/pool/remote-workers/{provider}` (v1.9.0)
+
+Cleanest RESTful variant — scale a single provider. Path `{provider}` must be `modal` or `runpod`.
+
+**Body:** `{"count": N}` (`PoolCountRequest`, `count >= 0`)
+**Response:** same shape as `GET /v1/system/pool`, plus `applied_now`.
+
+**Errors:**
+- `400 {"error": "unknown_provider: foo"}` — path segment not in `{modal, runpod}`
+- `400 {"error": "provider_not_configured: runpod"}` — URL env var empty
 - `500 {"error": "pool_scale_failed: ..."}`
 
 ### `GET /v1/system/config`
@@ -494,6 +511,19 @@ Use the returned `storage_uri` in any generation request that takes an `image_ur
 - **Max size:** `MAX_UPLOAD_BYTES = 1 GiB`.
 - **Response:** `201 Created` (empty body).
 - **Errors:** `413 Upload exceeds 1024MB limit` when size exceeds the cap.
+
+### `GET /uploads/get/{upload_id}` (v1.9.1)
+
+Read back a previously-uploaded file. Use this to hydrate media players on page reload (noodle-m MusicVideo tab) or to preview files referenced by `storage://<id>` URIs.
+
+- **Response:** `200` with the raw file bytes. `Content-Type` is inferred from the file's magic bytes — `image/jpeg`, `image/png`, `image/webp`, `audio/wav`, `audio/mpeg`, `audio/flac`, `audio/ogg`, `video/mp4`. Unknown formats return `application/octet-stream` (browsers sniff in most cases).
+- **Auth:** global bearer required. The `upload_id` is a 128-bit `uuid4` hex — unforgeable, and the ID itself is the capability (no per-key ownership scoping on uploads today).
+- **Errors:**
+  - `400 invalid_upload_id` — malformed ID (not UUID-shaped, path-traversal attempts).
+  - `404 upload_not_found` — well-formed ID but no file on disk.
+  - `500 upload_read_failed` — disk I/O error reading the magic-byte head.
+
+**Non-goals** (deferred): no TTL / expiry, no per-key ownership enforcement, no signed URLs, no HTTP Range requests. Add selectively if needed.
 
 ---
 
@@ -1379,6 +1409,19 @@ Query params: `limit` (default 50, clamped to 200), `offset` (default 0). Return
 
 Enqueues a `JobType.EXPORT_COMPOSITION` job; returns the same `202` envelope as any v2 submit. Poll via [`GET /v2/jobs/{id}`](#get-v2jobsjob_id).
 
+**Body (optional, v1.9.0):** `{"audio_uri": "storage://<upload_id>"}`
+
+When `audio_uri` is a valid `storage://` URI pointing at an audio file, the exporter adds it as an extra ffmpeg input, maps it as the output audio track, and truncates to the video length via `-shortest`. Leave empty / omit body for video-only export (pre-v1.9.0 behavior, unchanged).
+
+- The audio file must already exist as a user upload (`PUT /uploads/put/{id}` then reference via `storage://<id>`). Any format ffmpeg supports (WAV, MP3, AAC, FLAC, OGG) works.
+- Single-clip + audio works — the single clip is piped through a null video filter and muxed with the audio track.
+- Audio longer than the video is trimmed (`-shortest`). Audio shorter than the video will truncate the output video to the audio length.
+
+**Errors** (surfaced as the job's terminal `error` field):
+- `"Audio not found: storage://..."` — the URI doesn't resolve to a file on disk (UploadStore raises `FileNotFoundError`)
+- `"Invalid storage URI: <...>"` — URI doesn't start with `storage://`
+- `"FFmpeg failed: ..."` — ffmpeg exit non-zero (last 5 lines of stderr echoed, truncated to 300 chars)
+
 ---
 
 ## SSE session tokens
@@ -1562,8 +1605,9 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | POST | `/v1/ltx/unload` | yes | Unload LTX |
 | POST | `/v1/ltx/reload` | yes | Reload LTX |
 | POST | `/v1/system/turbo` | yes | Toggle turbo mode |
-| GET | `/v1/system/pool` | yes | Remote-sidecar pool state |
-| POST | `/v1/system/pool/remote-workers` | yes | Set target remote worker count |
+| GET | `/v1/system/pool` | yes | Remote-sidecar pool state (per-provider in v1.9.0) |
+| POST | `/v1/system/pool/remote-workers` | yes | Set target remote worker counts (legacy `{count}` or per-provider dict) |
+| POST | `/v1/system/pool/remote-workers/{provider}` | yes | Set target worker count for one provider (v1.9.0) |
 | GET | `/v1/system/sampler` | yes | Sampler subset of gen config |
 | POST | `/v1/system/sampler` | yes | Toggle CFG++ / Euler |
 | GET | `/v1/system/config` | yes | Full LTX gen config |
@@ -1583,6 +1627,7 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | POST | `/v1/chat/completions` | yes | llama-swap proxy |
 | POST | `/v1/upload` | yes | Get upload slot |
 | PUT | `/uploads/put/{upload_id}` | yes | Upload bytes |
+| GET | `/uploads/get/{upload_id}` | yes | Read back upload (v1.9.1) |
 | GET | `/v1/loras` | yes | List LTX LoRAs |
 | POST | `/v1/loras` | yes | Upload LTX LoRA (multipart) |
 | DELETE | `/v1/loras/{lora_id}` | yes | Delete LTX LoRA |
@@ -1737,7 +1782,7 @@ curl -X POST "$API/v2/batch" \
   - `JobType.VIDEO_OUTPAINT` added.
   - New [`OutpaintPosition`](#outpaintposition-v170) enum (9 values).
 - **v1.6** (2026-04-15)
-  - LTX remote-sidecar pool: `GET /v1/system/pool`, `POST /v1/system/pool/remote-workers`. Turbo + up to 4 Modal workers for 6-way concurrent video.
+  - LTX remote-sidecar pool: `GET /v1/system/pool`, `POST /v1/system/pool/remote-workers`, `POST /v1/system/pool/remote-workers/{provider}`. Turbo + up to 4 Modal + 2 RunPod workers for 8-way concurrent video (v1.9.0).
   - `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_TOKEN`, `LTX_REMOTE_SIDECAR_MAX_WORKERS` env vars.
 - **v1.5**
   - Turbo entry hardening: cuda:1 drain verification via `nvidia-smi` bus-id matching.

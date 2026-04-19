@@ -228,21 +228,33 @@ class LtxSidecarClient:
 ltx_sidecar = LtxSidecarClient(label="local")
 
 
-# Optional second sidecar in the turbo pool (e.g., Modal RTX Pro 6000).
-# Set `LTX_REMOTE_SIDECAR_URL` + `LTX_REMOTE_SIDECAR_TOKEN` in .env to enable.
-# When enabled, turbo mode spins up a THIRD concurrent video worker pointing
-# at this URL, stacking on top of main (cuda:0 in-process) + local cuda:1
-# sidecar. Jobs pull from the shared _job_queue round-robin-ish (whichever
-# worker is available first grabs next).
-ltx_remote_sidecar: LtxSidecarClient | None = (
-    LtxSidecarClient(
-        config.LTX_REMOTE_SIDECAR_URL,
-        auth_token=config.LTX_REMOTE_SIDECAR_TOKEN,
-        label="remote",
-        # Remote sidecars (Modal cold-start) can take ~60-90s for the first
-        # request on a cold container. Bump management timeout accordingly.
+# Remote sidecar pool — v1.9.0 multi-provider. Dict keyed by provider name
+# ("modal", "runpod"). Providers with empty URL are omitted. Each worker task
+# in _scale_remote_pool is bound to one provider, so dispatch is provider-tagged
+# by task closure (no per-job routing logic needed).
+ltx_remote_sidecars: dict[str, LtxSidecarClient] = {}
+
+if config.LTX_MODAL_SIDECAR_URL:
+    ltx_remote_sidecars["modal"] = LtxSidecarClient(
+        config.LTX_MODAL_SIDECAR_URL,
+        auth_token=config.LTX_MODAL_SIDECAR_TOKEN,
+        label="modal",
+        # Modal cold-start on scaledown_window expiry can take ~60-90s.
         mgmt_timeout=120.0,
     )
-    if config.LTX_REMOTE_SIDECAR_URL
-    else None
-)
+
+if config.LTX_RUNPOD_SIDECAR_URL:
+    ltx_remote_sidecars["runpod"] = LtxSidecarClient(
+        config.LTX_RUNPOD_SIDECAR_URL,
+        auth_token=config.LTX_RUNPOD_SIDECAR_TOKEN,
+        label="runpod",
+        # RunPod Load-Balancing Serverless with min_workers=1 keeps one warm;
+        # 60s management timeout is enough for the warm path. Cold start on a
+        # second concurrent request can take 90-120s but goes through /generate
+        # which already has the 600s generate_timeout.
+        mgmt_timeout=60.0,
+    )
+
+# Legacy alias — v1.6-v1.8 code imports `ltx_remote_sidecar` (singular). Point
+# it at the modal entry (the only provider before v1.9) so nothing breaks.
+ltx_remote_sidecar: LtxSidecarClient | None = ltx_remote_sidecars.get("modal")

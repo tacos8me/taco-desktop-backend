@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.7.0 (2026-04-17).
+**Version**: v1.9.1 (2026-04-19).
 
 ## Quick lookup
 
@@ -70,17 +70,22 @@ Toggled via `POST /v1/system/turbo` (body: `{"enable": true/false}`). Temporaril
 - **Batch integration**: `_batch_worker` uses `asyncio.gather` to run items concurrently (2 under turbo).
 - **Why systemctl-stop, not HTTP /unload**: v1.4 trusted HTTP `/unload` to free cuda:1. Silent unloads that succeeded on the wire while tensors stayed resident caused `CUDA OOM` on the subsequent ltx-sidecar `load`. `systemctl stop` + nvidia-smi drain verification is the hammer.
 
-### Remote-sidecar pool (v1.6)
+### Remote-sidecar pool (v1.6 → v1.9.0 multi-provider)
 
-Optional Modal (RTX Pro 6000) workers augment turbo's local 2. Pool scales 0..N on demand via dashboard slider.
+Optional remote workers augment turbo's local 2. v1.9.0: **multi-provider** — Modal and RunPod run side-by-side, each with independent target/active/max counts. Dict-keyed structure in `ltx_sidecar_client.py`: `ltx_remote_sidecars: dict[str, LtxSidecarClient]`.
 
-- Env: `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_TOKEN`, `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default 4). Token is the literal Bearer value, not an env-var name.
-- Endpoints: `GET /v1/system/pool` (state), `POST /v1/system/pool/remote-workers {"count": N}` (target). Scales live iff turbo is active; otherwise target is stored for next turbo-on.
-- Module-level `ltx_remote_sidecar` in `ltx_sidecar_client.py` is `None` when unconfigured, otherwise a `LtxSidecarClient(label="remote", mgmt_timeout=120)`.
-- `_dispatch_job_turbo_remote` (server.py:~1520) is called by remote worker tasks. **It reads local media files (`audio_path`/`image_path`/`video_path`/keyframe images) via `Path(p).read_bytes()`, base64-encodes, and passes as `*_b64` kwargs** — the Modal container has no mount of this host's `uploads/`. Local sidecar path (`_dispatch_job_turbo`, ~:1666) uses `*_path` directly.
-- Transport failure on the remote (502/503/504) does NOT auto-exit turbo — remote is optional extra capacity; the job fails individually and main + local-sidecar workers keep serving. Local sidecar failure DOES trigger `_auto_exit_turbo_on_sidecar_failure`.
-- Dashboard "Remote Pool" row renders N+1 buttons (0..MAX), polled every 5 s via `GET /v1/system/pool`.
-- Outpaint over remote: Modal has the outpaint LoRA pre-staged at `/mnt/nvme-1/huggingface/loras/ic-lora-outpaint.safetensors` (via `modal_app.py::download_weights`). `_dispatch_job_turbo_remote` rewrites local LoRA paths under `config.LORAS_DIR` to the Modal volume path before calling. Custom (unknown) IC-LoRAs fall back to single-machine dispatch.
+- **Env (v1.9.0)**: `LTX_MODAL_SIDECAR_URL/TOKEN/MAX_WORKERS` and `LTX_RUNPOD_SIDECAR_URL/TOKEN/MAX_WORKERS`. Legacy `LTX_REMOTE_SIDECAR_*` (singular) still honored and aliased to the modal provider for backwards compat.
+- **Client module** (`ltx_sidecar_client.py`): `ltx_remote_sidecars` dict keyed by provider name. Module-level `ltx_remote_sidecar` (singular) is preserved as an alias pointing at the modal entry so v1.6-v1.8 code keeps working.
+- **Server state** (`server.py`): `_remote_worker_targets: dict[str, int]` (per-provider targets, persist across turbo toggles) + `_remote_worker_tasks: dict[str, list[asyncio.Task]]`. `_PROVIDERS = ("modal", "runpod")`.
+- **Endpoints**:
+  - `GET /v1/system/pool` → `{turbo_active, providers: {modal: {...}, runpod: {...}}, remote_*: <legacy aliases>}`.
+  - `POST /v1/system/pool/remote-workers` accepts either `{"count": N}` (legacy — scales modal only) or `{"modal": N, "runpod": M}` (per-provider).
+  - `POST /v1/system/pool/remote-workers/{provider}` with `{"count": N}` — RESTful per-provider.
+- **Dispatch**: `_dispatch_job_turbo_remote(job, *, provider: str)` takes the provider kwarg. `_scale_remote_pool()` uses `functools.partial` to bind each worker task to its provider at spawn time. The LoRA-path rewrite for outpaint uses `config.LTX_PROVIDER_LORAS_MOUNT[provider]` → Modal `/mnt/nvme-1/huggingface/loras/`, RunPod `/runpod-volume/loras/`.
+- **Media base64**: same for both providers — `_read_b64()` reads local `audio_path`/`image_path`/`video_path`/keyframe images and ships as `*_b64` kwargs. Neither Modal nor RunPod can see the host's `uploads/`.
+- **Transport failure**: neither provider's transport errors auto-exit turbo — remotes are optional extra capacity. Local sidecar failure still triggers `_auto_exit_turbo_on_sidecar_failure`.
+- **Dashboard**: two rows — `poolBtnGrid` (Modal) + `poolBtnGridRunpod` (RunPod). Each row renders N+1 buttons 0..MAX, polled every 5 s via `GET /v1/system/pool`. JS walks `data.providers.{modal,runpod}` with fallback to legacy flat fields for safety.
+- **RunPod sidecar**: new repo at `/mnt/nvme-1/servers/ltx-sidecar-runpod/`. Load-Balancing Serverless on RTX PRO 6000 Blackwell, FastAPI inside each worker, `/ping` health probe. Dockerfile mirrors Modal's image recipe.
 
 ### ACE music sidecar (v1.2)
 

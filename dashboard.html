@@ -779,14 +779,10 @@ input[type="range"]::-moz-range-track {
     <button class="btn btn-success" id="btnTurboOn" onclick="toggleTurbo(true)" title="Claim cuda:1 for dual-GPU inference (disables ACE + JoyAI)">Turbo Mode ON</button>
     <button class="btn btn-danger" id="btnTurboOff" onclick="toggleTurbo(false)" title="Release cuda:1 back to ACE/JoyAI">Turbo Mode OFF</button>
   </div>
-  <div class="btn-row-label">Remote Pool <span id="poolStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
-  <div class="btn-grid" id="poolBtnGrid" style="grid-template-columns:repeat(5,1fr)">
-    <button class="btn" data-n="0" onclick="setRemoteWorkers(0)" title="Disable remote pool">0</button>
-    <button class="btn" data-n="1" onclick="setRemoteWorkers(1)" title="1 Modal worker">1</button>
-    <button class="btn" data-n="2" onclick="setRemoteWorkers(2)" title="2 Modal workers">2</button>
-    <button class="btn" data-n="3" onclick="setRemoteWorkers(3)" title="3 Modal workers">3</button>
-    <button class="btn" data-n="4" onclick="setRemoteWorkers(4)" title="4 Modal workers (max)">4</button>
-  </div>
+  <div class="btn-row-label">Modal Pool <span id="poolStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
+  <div class="btn-grid" id="poolBtnGrid" style="grid-template-columns:repeat(5,1fr)"></div>
+  <div class="btn-row-label">RunPod Pool <span id="poolStatusRunpod" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
+  <div class="btn-grid" id="poolBtnGridRunpod" style="grid-template-columns:repeat(5,1fr)"></div>
   <div class="btn-row-label">Sampler <span id="samplerStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(euler)</span></div>
   <div class="btn-grid">
     <button class="btn" id="btnEuler" onclick="setSampler('euler')" title="Standard Euler (upstream default)">Euler</button>
@@ -1313,8 +1309,13 @@ async function toggleTurbo(enable) {
 }
 
 // ---------------------------------------------------------------------------
-// Remote Pool (v1.6) — Modal RTX Pro 6000 workers controlled by the dashboard
+// Remote Pool (v1.6 → v1.9.0 multi-provider) — Modal + RunPod workers
 // ---------------------------------------------------------------------------
+
+const POOL_PROVIDERS = [
+  { key: "modal",  label: "Modal",  envVar: "LTX_MODAL_SIDECAR_URL",  statusEl: "poolStatus",       grid: "poolBtnGrid" },
+  { key: "runpod", label: "RunPod", envVar: "LTX_RUNPOD_SIDECAR_URL", statusEl: "poolStatusRunpod", grid: "poolBtnGridRunpod" },
+];
 
 async function pollPool() {
   try {
@@ -1328,23 +1329,47 @@ async function pollPool() {
 }
 
 function updatePoolUI(data) {
-  const statusEl = document.getElementById("poolStatus");
-  const grid = document.getElementById("poolBtnGrid");
-  const configured = !!data.remote_sidecar_configured;
-  const target = data.remote_worker_target || 0;
-  const active = data.remote_worker_active || 0;
-  const max = data.remote_worker_max || 4;
+  // v1.9.0: providers object is authoritative. Fall back to legacy flat fields
+  // (aliased to modal) if server is pre-v1.9 — keeps the UI working during
+  // transition.
+  let providers = data && data.providers;
+  if (!providers) {
+    providers = {
+      modal: {
+        configured: !!data.remote_sidecar_configured,
+        target: data.remote_worker_target || 0,
+        active: data.remote_worker_active || 0,
+        max: data.remote_worker_max || 4,
+      },
+      runpod: { configured: false, target: 0, active: 0, max: 0 },
+    };
+  }
+  const turboActive = !!data.turbo_active;
+  for (const p of POOL_PROVIDERS) {
+    renderProviderRow(p, providers[p.key] || {}, turboActive);
+  }
+}
 
-  // Resize button grid to match max (in case MAX_WORKERS changes)
-  const desiredButtons = max + 1; // 0..max inclusive
+function renderProviderRow(meta, state, turboActive) {
+  const statusEl = document.getElementById(meta.statusEl);
+  const grid = document.getElementById(meta.grid);
+  if (!statusEl || !grid) return;
+
+  const configured = !!state.configured;
+  const target = state.target || 0;
+  const active = state.active || 0;
+  const max = state.max || 0;
+
+  // Rebuild buttons only when the max changes — avoids DOM churn every 5s.
+  const desiredButtons = Math.max(1, max + 1); // always show at least "0"
   while (grid.children.length < desiredButtons) {
     const n = grid.children.length;
     const btn = document.createElement("button");
     btn.className = "btn";
     btn.dataset.n = n;
-    btn.onclick = () => setRemoteWorkers(n);
+    btn.onclick = () => setRemoteWorkers(meta.key, n);
     btn.textContent = n;
-    btn.title = n === 0 ? "Disable remote pool" : (n + " Modal worker" + (n === 1 ? "" : "s"));
+    btn.title = n === 0 ? ("Disable " + meta.label + " pool") : (n + " " + meta.label + " worker" + (n === 1 ? "" : "s"));
     grid.appendChild(btn);
   }
   while (grid.children.length > desiredButtons) {
@@ -1352,26 +1377,22 @@ function updatePoolUI(data) {
   }
   grid.style.gridTemplateColumns = "repeat(" + desiredButtons + ",1fr)";
 
-  // Status string + colors
   if (!configured) {
-    statusEl.textContent = "(not configured — set LTX_REMOTE_SIDECAR_URL)";
+    statusEl.textContent = "(not configured — set " + meta.envVar + ")";
     statusEl.style.color = "var(--text-dim)";
     for (const btn of grid.children) { btn.disabled = true; btn.classList.remove("active"); }
     return;
   }
 
   for (const btn of grid.children) { btn.disabled = false; }
-
-  // Highlight the button matching target
   for (const btn of grid.children) {
     btn.classList.toggle("active", parseInt(btn.dataset.n, 10) === target);
   }
 
-  // Status line reflects live vs desired when turbo is mid-transition
   if (target === 0) {
     statusEl.textContent = "(disabled)";
     statusEl.style.color = "var(--text-dim)";
-  } else if (!data.turbo_active) {
+  } else if (!turboActive) {
     statusEl.textContent = "(target " + target + " — turbo off, applies on next turbo-on)";
     statusEl.style.color = "var(--warning, #e0a95a)";
   } else if (active < target) {
@@ -1383,23 +1404,17 @@ function updatePoolUI(data) {
   }
 }
 
-async function setRemoteWorkers(n) {
+async function setRemoteWorkers(provider, n) {
   const headers = { "Content-Type": "application/json", ...getAuthHeaders() };
   try {
-    const res = await fetch("/v1/system/pool/remote-workers", {
+    const res = await fetch("/v1/system/pool/remote-workers/" + encodeURIComponent(provider), {
       method: "POST", headers,
       body: JSON.stringify({ count: n }),
     });
     const data = await res.json();
     if (res.ok) {
-      toast("Remote pool target: " + n, "ok");
-      updatePoolUI({
-        remote_sidecar_configured: true,
-        remote_worker_target: data.remote_worker_target,
-        remote_worker_active: data.remote_worker_active,
-        remote_worker_max: data.remote_worker_max,
-        turbo_active: data.applied_now,
-      });
+      toast(provider + " pool target: " + n, "ok");
+      updatePoolUI(data);
       pollGpu();
     } else {
       toast("Pool set failed: " + (data.error || res.status), "err");

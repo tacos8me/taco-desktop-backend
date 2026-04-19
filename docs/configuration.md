@@ -37,15 +37,25 @@ All environment variables are read from the `.env` file in the project root (`/m
 | `ERNIE_SIDECAR_URL` | `http://127.0.0.1:8094` | URL of the ERNIE-Image text-to-image sidecar |
 | `LTX_SIDECAR_URL` | `http://127.0.0.1:8093` | URL of the local LTX video sidecar on cuda:1 (used in turbo / `DUAL_GPU_LTX` modes) |
 
-### Remote LTX Sidecar Pool (v1.5 / v1.6)
+### Remote LTX Sidecar Pool (v1.5 → v1.9.0 multi-provider)
 
-Optional HTTP sidecar(s) running on remote hardware (canonical deployment: Modal RTX Pro 6000). Adds 1..N extra concurrent video workers on top of the 2 local workers during turbo mode. Pool is turbo-scoped — workers only run while turbo is active.
+Optional HTTP sidecar(s) on remote hardware. v1.9.0 supports **multiple providers alongside each other** (Modal + RunPod), each scaled independently. Every provider adds 1..N extra concurrent video workers on top of the 2 local workers during turbo mode. Pool is turbo-scoped — workers only run while turbo is active.
+
+**Legacy v1.6-v1.8**: `LTX_REMOTE_SIDECAR_URL` / `LTX_REMOTE_SIDECAR_TOKEN` / `LTX_REMOTE_SIDECAR_MAX_WORKERS` are still honored and aliased to the `modal` provider. No migration needed — old deployments keep working.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LTX_REMOTE_SIDECAR_URL` | `""` (disabled) | Base URL of the remote LTX sidecar. When set, turbo mode can spawn extra worker loops dispatching to this URL. Leave empty to keep the pool disabled entirely. |
-| `LTX_REMOTE_SIDECAR_TOKEN` | `""` | Bearer token injected as `Authorization: Bearer <value>` on every request to the remote sidecar. This is the token value itself, not an env-var name |
-| `LTX_REMOTE_SIDECAR_MAX_WORKERS` | `4` | Upper bound on concurrent remote workers (each = one Modal container). Must NOT exceed the remote app's container cap, or jobs queue forever. User scales 0..MAX at runtime via `POST /v1/system/pool/remote-workers` |
+| `LTX_REMOTE_SIDECAR_URL` | `""` | **Legacy alias** — points at the `modal` provider when set. Prefer `LTX_MODAL_SIDECAR_URL` in new deployments. |
+| `LTX_REMOTE_SIDECAR_TOKEN` | `""` | Legacy alias. Bearer token value (not env-var name). |
+| `LTX_REMOTE_SIDECAR_MAX_WORKERS` | `4` | Legacy alias. Upper bound on the modal pool. |
+| `LTX_MODAL_SIDECAR_URL` | legacy | Modal-specific base URL. Falls back to `LTX_REMOTE_SIDECAR_URL` if unset. |
+| `LTX_MODAL_SIDECAR_TOKEN` | legacy | Modal Bearer token. |
+| `LTX_MODAL_MAX_WORKERS` | `LTX_REMOTE_SIDECAR_MAX_WORKERS` | Modal pool cap. Must NOT exceed the Modal app's `max_containers` (default 4 in `modal_app.py`). |
+| `LTX_RUNPOD_SIDECAR_URL` | `""` (disabled) | RunPod Load-Balancing Serverless base URL — typically `https://api.runpod.ai/v2/<endpoint_id>/lb`. |
+| `LTX_RUNPOD_SIDECAR_TOKEN` | `""` | Bearer token matching the endpoint's `SIDECAR_AUTH_TOKEN` secret. |
+| `LTX_RUNPOD_MAX_WORKERS` | `2` | RunPod pool cap. Must match or be ≤ the endpoint's `workers.max`. |
+
+Scale at runtime via `POST /v1/system/pool/remote-workers` (per-provider dict or legacy `{count}`) or `POST /v1/system/pool/remote-workers/{provider}` (RESTful per-provider). See [API.md](API.md#post-v1systempoolremote-workers).
 
 ### Queue Limits
 
@@ -76,10 +86,18 @@ MAX_BATCH_QUEUE_DEPTH=5
 MAX_BATCH_ITEMS=50
 # DUAL_GPU_LTX=1    # Uncomment for dedicated dual-GPU LTX mode
 # TORCH_COMPILE=1   # Uncomment to enable torch.compile (adds 60-120s warmup)
-# Remote-sidecar pool (v1.5+) — leave URL empty to disable
+# Remote-sidecar pool (v1.5 → v1.9.0 multi-provider) — leave URLs empty to disable
+# Legacy single-provider (still works, aliases to modal):
 # LTX_REMOTE_SIDECAR_URL=https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run
-# LTX_REMOTE_SIDECAR_TOKEN=your-bearer-token-here
+# LTX_REMOTE_SIDECAR_TOKEN=your-modal-bearer-token
 # LTX_REMOTE_SIDECAR_MAX_WORKERS=4
+# v1.9.0 per-provider form:
+# LTX_MODAL_SIDECAR_URL=https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run
+# LTX_MODAL_SIDECAR_TOKEN=your-modal-bearer-token
+# LTX_MODAL_MAX_WORKERS=4
+# LTX_RUNPOD_SIDECAR_URL=https://api.runpod.ai/v2/<endpoint_id>/lb
+# LTX_RUNPOD_SIDECAR_TOKEN=your-runpod-bearer-token
+# LTX_RUNPOD_MAX_WORKERS=2
 ```
 
 ## Generation Config (`.gen_config.json`)

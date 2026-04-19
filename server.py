@@ -27,7 +27,7 @@ from flux_manager import FluxManager, FluxLoraError
 from joyai_client import joyai, JoyAIError
 from ernie_client import ernie, ErnieError
 from ace_client import ace, AceError
-from ltx_sidecar_client import ltx_sidecar, ltx_remote_sidecar, LtxSidecarError
+from ltx_sidecar_client import ltx_sidecar, ltx_remote_sidecar, ltx_remote_sidecars, LtxSidecarError
 from chat_manager import ChatManager
 from helpers import _duration_to_frames, _resolution_to_dims
 from upload_store import UploadStore
@@ -112,12 +112,35 @@ _VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None         # local sidecar worker (cuda:1)
 
-# v1.6: remote-sidecar pool. User-controlled target count persists across
-# turbo toggles. `_remote_worker_tasks` is the CURRENT live workers (scales
-# to match target while turbo is active; scales to 0 when turbo is off).
-_remote_worker_tasks: list[asyncio.Task] = []
-_remote_worker_target: int = 1 if config.LTX_REMOTE_SIDECAR_URL else 0
+# v1.6 / v1.9.0 multi-provider: remote-sidecar pool. User-controlled target
+# count per provider persists across turbo toggles. `_remote_worker_tasks[p]`
+# is the CURRENT live workers for provider p (scales to match target while
+# turbo is active; scales to 0 when turbo is off).
+_PROVIDERS: tuple[str, ...] = ("modal", "runpod")
+_remote_worker_tasks: dict[str, list[asyncio.Task]] = {p: [] for p in _PROVIDERS}
+_remote_worker_targets: dict[str, int] = {
+    "modal": 1 if config.LTX_MODAL_SIDECAR_URL else 0,
+    "runpod": 0,  # opt-in — leave at 0, operator scales up via dashboard
+}
 _remote_pool_lock = asyncio.Lock()  # serialize concurrent scale requests
+
+
+def _provider_max(provider: str) -> int:
+    """Upper bound of remote workers for a given provider."""
+    return {
+        "modal": config.LTX_MODAL_MAX_WORKERS,
+        "runpod": config.LTX_RUNPOD_MAX_WORKERS,
+    }.get(provider, 0)
+
+
+def _total_remote_target() -> int:
+    """Sum of per-provider targets — the v1.6 flat `_remote_worker_target`."""
+    return sum(_remote_worker_targets.values())
+
+
+def _total_remote_active() -> int:
+    """Sum of per-provider live worker counts."""
+    return sum(len(v) for v in _remote_worker_tasks.values())
 
 # cuda:1 activity tracker for auto-turbo. Updated on every successful
 # JoyAI edit or ACE music completion. Initialized to now so the 30-min
@@ -466,8 +489,10 @@ async def _dispatch_job(job: Job) -> bytes:
                 return await flux.generate_image_edit(**p, callback_on_step_end=cb, phase_sink=on_progress)
         case JobType.EXPORT_COMPOSITION:
             from export_handler import export_composition
+            audio_uri = p.get("audio_uri")
             return await asyncio.get_running_loop().run_in_executor(
-                None, lambda: export_composition(p["clips"], p["transitions"], uploads)
+                None,
+                lambda: export_composition(p["clips"], p["transitions"], uploads, audio_uri=audio_uri),
             )
         case _:
             raise ValueError(f"Unknown job type: {job.type}")
@@ -1584,23 +1609,27 @@ async def _auto_exit_turbo_on_sidecar_failure() -> None:
         logger.exception("Auto-exit turbo after sidecar failure: failed")
 
 
-async def _dispatch_job_turbo_remote(job: Job) -> bytes:
-    """Route a video job to the REMOTE LTX sidecar (v1.5+ — e.g. Modal RTX Pro 6000).
+async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> bytes:
+    """Route a video job to a REMOTE LTX sidecar for the given provider.
 
-    Runs on workers in the remote pool (v1.6: 0..MAX_WORKERS controlled by the
-    dashboard). Unlike the local sidecar path, remote transport failures do
-    NOT auto-exit turbo — the remote is treated as optional extra capacity.
-    If it's broken, jobs on those workers fail; main + local-sidecar workers
-    keep serving.
+    v1.5: single Modal sidecar. v1.6: 0..MAX_WORKERS pool. v1.9.0: multi-provider
+    (``provider`` selects the LtxSidecarClient from ``ltx_remote_sidecars``).
+    Each worker task in ``_scale_remote_pool`` binds a specific provider via
+    functools.partial, so dispatch is task-tagged with no per-job routing.
+
+    Unlike the local sidecar path, remote transport failures do NOT auto-exit
+    turbo — remotes are optional extra capacity. If one is broken, its workers
+    fail their jobs; main + local-sidecar + other-provider workers keep serving.
 
     v1.6.1: media files (audio for a2v, image for i2v keyframes, video for
-    retake) get inlined as base64 in the request body — the remote sidecar
-    can't see our uploads/ directory, so we read + ship the bytes.
+    retake) get inlined as base64 in the request body — remote sidecars can't
+    see our uploads/ directory.
     """
     if job.type not in _VIDEO_JOB_TYPES:
         raise ValueError(f"Remote turbo worker cannot handle {job.type} — only video jobs supported")
-    if ltx_remote_sidecar is None:
-        raise RuntimeError("remote_sidecar_not_configured")
+    client = ltx_remote_sidecars.get(provider)
+    if client is None:
+        raise RuntimeError(f"remote_sidecar_not_configured: {provider}")
     p = job.params
 
     import base64
@@ -1628,19 +1657,20 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
                 new_kf["image_b64"] = _read_b64(new_kf.pop("image_path"))
             remote_keyframes.append(new_kf)
 
-    # v1.7.0: for outpaint, the Modal container has the outpaint LoRA baked
-    # into its volume at a known path. Rewrite taco-backend's lora_path to
-    # the Modal path so the fused-transformer cache key matches across
-    # requests (avoids per-request LoRA file re-staging).
+    # v1.7.0 + v1.9.0: for outpaint, each remote provider has the IC-LoRA
+    # pre-staged on its own network volume at a provider-specific mount.
+    # Rewrite the local LORAS_DIR prefix to the provider's mount so fused-
+    # transformer cache keys match across requests on that provider (avoids
+    # per-request LoRA file re-staging).
     remote_lora_path = p.get("lora_path")
     if job.type == JobType.VIDEO_OUTPAINT and remote_lora_path:
         local_loras_dir = str(config.LORAS_DIR).rstrip("/") + "/"
         if remote_lora_path.startswith(local_loras_dir):
-            remote_lora_path = remote_lora_path.replace(
-                local_loras_dir, "/mnt/nvme-1/huggingface/loras/"
-            )
+            provider_mount = config.LTX_PROVIDER_LORAS_MOUNT.get(provider)
+            if provider_mount:
+                remote_lora_path = remote_lora_path.replace(local_loras_dir, provider_mount)
 
-    return await ltx_remote_sidecar.generate(
+    return await client.generate(
         job_type=job.type,
         prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
         width=p["width"], height=p["height"],
@@ -1669,66 +1699,77 @@ async def _dispatch_job_turbo_remote(job: Job) -> bytes:
 
 
 async def _scale_remote_pool() -> None:
-    """Reconcile `_remote_worker_tasks` to match the desired count.
+    """Reconcile ``_remote_worker_tasks[provider]`` to the per-provider target.
 
-    Desired count is ``_remote_worker_target`` IF turbo is active (remote
-    workers are turbo-scoped to avoid pulling non-video jobs from the shared
-    queue; outside turbo, Flux/ACE/JoyAI/ERNIE submit heterogeneous job types
-    and only the main worker can safely dispatch them). Otherwise desired = 0.
+    Desired per-provider count is ``_remote_worker_targets[p]`` IF turbo is
+    active (remote workers are turbo-scoped — outside turbo, Flux/ACE/JoyAI/
+    ERNIE submit heterogeneous job types and only the main worker can safely
+    dispatch them). Otherwise desired = 0 for every provider.
+
+    v1.9.0: iterates every configured provider in ``ltx_remote_sidecars``.
+    Each worker task is bound to its provider via functools.partial so the
+    task pulls from the shared queue but dispatches to its own URL.
 
     Safe to call concurrently — guarded by ``_remote_pool_lock``.
     """
-    global _remote_worker_tasks
-    if ltx_remote_sidecar is None:
+    from functools import partial
+
+    if not ltx_remote_sidecars:
         return
 
     async with _remote_pool_lock:
-        desired = _remote_worker_target if _turbo_active else 0
-        desired = max(0, min(desired, config.LTX_REMOTE_SIDECAR_MAX_WORKERS))
-        current = len(_remote_worker_tasks)
+        for provider, client in ltx_remote_sidecars.items():
+            max_workers = _provider_max(provider)
+            target = _remote_worker_targets.get(provider, 0) if _turbo_active else 0
+            desired = max(0, min(target, max_workers))
+            tasks = _remote_worker_tasks.setdefault(provider, [])
+            current = len(tasks)
 
-        if desired > current:
-            # Warming the remote once keeps Modal's cold-start out of the
-            # first job's latency — /health doesn't need auth on our side.
-            if current == 0:
-                try:
-                    await asyncio.wait_for(ltx_remote_sidecar.health(), timeout=90.0)
-                except Exception as exc:
-                    logger.warning("Remote pool: health probe failed (will try anyway): %s", exc)
-            for i in range(current, desired):
-                task = asyncio.create_task(
-                    worker_loop(
-                        job_store, _job_queue, _inference_lock,
-                        _dispatch_job_turbo_remote, uploads, history,
-                        # Always skip inference_lock — remote workers never
-                        # touch local GPUs. This is safe because the pool only
-                        # scales > 0 while _turbo_active is True, and turbo
-                        # mode routes only video jobs to the queue.
-                        turbo_check=lambda job: True,
-                        on_complete=_decr_queue_on_complete,
-                    ),
-                    name=f"remote-worker-{i}",
-                )
-                _remote_worker_tasks.append(task)
-            logger.info("Remote pool: scaled %d -> %d workers", current, desired)
+            if desired > current:
+                # Warming once keeps cold-start out of the first job's latency.
+                if current == 0:
+                    try:
+                        await asyncio.wait_for(client.health(), timeout=90.0)
+                    except Exception as exc:
+                        logger.warning(
+                            "Remote pool[%s]: health probe failed (will try anyway): %s",
+                            provider, exc,
+                        )
+                for i in range(current, desired):
+                    task = asyncio.create_task(
+                        worker_loop(
+                            job_store, _job_queue, _inference_lock,
+                            partial(_dispatch_job_turbo_remote, provider=provider),
+                            uploads, history,
+                            # Always skip inference_lock — remote workers never
+                            # touch local GPUs. This is safe because the pool only
+                            # scales > 0 while _turbo_active is True, and turbo
+                            # mode routes only video jobs to the queue.
+                            turbo_check=lambda job: True,
+                            on_complete=_decr_queue_on_complete,
+                        ),
+                        name=f"remote-worker-{provider}-{i}",
+                    )
+                    tasks.append(task)
+                logger.info("Remote pool[%s]: scaled %d -> %d workers", provider, current, desired)
 
-        elif desired < current:
-            while len(_remote_worker_tasks) > desired:
-                task = _remote_worker_tasks.pop()
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            logger.info("Remote pool: scaled %d -> %d workers", current, desired)
-            # NOTE: deliberately not calling ltx_remote_sidecar.unload() here.
-            # On Modal our /unload path calls SplitModelManager.evict_all(),
-            # which clears the worker list. A future /generate against a
-            # still-warm container then fails with "no LTX workers available"
-            # because @modal.enter only runs once per container lifetime.
-            # Modal's scaledown_window (5 min) reclaims the GPU naturally
-            # when the pool stays at 0; that's the authoritative path for
-            # credit-saving. See v1.5 changelog for the scaledown math.
+            elif desired < current:
+                while len(tasks) > desired:
+                    task = tasks.pop()
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                logger.info("Remote pool[%s]: scaled %d -> %d workers", provider, current, desired)
+                # NOTE: deliberately not calling client.unload() here.
+                # On Modal our /unload path calls SplitModelManager.evict_all(),
+                # which clears the worker list. A future /generate against a
+                # still-warm container then fails with "no LTX workers available"
+                # because @modal.enter only runs once per container lifetime.
+                # Modal's scaledown_window (5 min) / RunPod's idle_timeout
+                # reclaim the GPU naturally when the pool stays at 0; that's
+                # the authoritative path for credit-saving.
 
 
 async def _dispatch_job_turbo(job: Job) -> bytes:
@@ -1855,10 +1896,13 @@ async def _enter_turbo_mode() -> None:
     # current target (0..MAX). See `_scale_remote_pool` + the pool control
     # endpoints. Scales to 0 automatically in `_exit_turbo_mode`.
     await _scale_remote_pool()
-    remote_active = len(_remote_worker_tasks)
+    remote_active = _total_remote_active()
+    breakdown = ", ".join(
+        f"{p}={len(t)}" for p, t in _remote_worker_tasks.items() if t
+    ) or "none"
     logger.info(
-        "TURBO MODE ON: %d concurrent video workers (2 local + %d remote)",
-        2 + remote_active, remote_active,
+        "TURBO MODE ON: %d concurrent video workers (2 local + %d remote [%s])",
+        2 + remote_active, remote_active, breakdown,
     )
 
 
@@ -1875,8 +1919,8 @@ async def _exit_turbo_mode() -> None:
     # Flip the flag first so `_scale_remote_pool` treats desired=0.
     _turbo_active = False
 
-    # Step 1a: scale remote pool to zero. Preserves `_remote_worker_target`
-    # so the user's setting persists across turbo toggles.
+    # Step 1a: scale remote pool to zero. Preserves `_remote_worker_targets`
+    # so the user's per-provider settings persist across turbo toggles.
     await _scale_remote_pool()
 
     # Step 1b: cancel the local-sidecar worker loop.
@@ -1965,56 +2009,131 @@ class PoolCountRequest(BaseModel):
     count: int = Field(ge=0)
 
 
+def _pool_state_payload() -> dict:
+    """Per-provider pool state + legacy flat-field aliases.
+
+    v1.9.0 response shape. ``providers`` is the authoritative per-provider map;
+    the flat ``remote_*`` fields are kept as aliases to the modal provider so
+    pre-v1.9 dashboards and scripts don't break.
+    """
+    providers: dict[str, dict] = {}
+    for provider in _PROVIDERS:
+        client = ltx_remote_sidecars.get(provider)
+        providers[provider] = {
+            "configured": client is not None,
+            "url": (getattr(client, "_base_url", None) if client else None) or None,
+            "target": _remote_worker_targets.get(provider, 0),
+            "active": len(_remote_worker_tasks.get(provider, [])),
+            "max": _provider_max(provider),
+        }
+    modal = providers.get("modal", {})
+    return {
+        "turbo_active": _turbo_active,
+        "providers": providers,
+        # Legacy flat fields — aliased to modal for backwards compat with v1.6-v1.8.
+        "remote_sidecar_configured": bool(modal.get("configured")),
+        "remote_sidecar_url": modal.get("url"),
+        "remote_worker_target": int(modal.get("target", 0)),
+        "remote_worker_active": int(modal.get("active", 0)),
+        "remote_worker_max": int(modal.get("max", 0)),
+    }
+
+
 @app.get("/v1/system/pool")
 async def get_pool_state() -> JSONResponse:
-    """Current state of the LTX remote-sidecar pool.
+    """Current state of the LTX remote-sidecar pool (v1.9.0 multi-provider).
 
-    Fields:
-      - ``remote_sidecar_configured``: whether ``LTX_REMOTE_SIDECAR_URL`` is set
-      - ``remote_sidecar_url``: the URL (no auth token leaked)
-      - ``remote_worker_target``: user's desired active count when turbo is on
-      - ``remote_worker_active``: currently live worker tasks
-      - ``remote_worker_max``: upper bound (LTX_REMOTE_SIDECAR_MAX_WORKERS)
-      - ``turbo_active``: remote pool is turbo-scoped; active count is 0 when off
+    Response:
+      - ``turbo_active``: pool is turbo-scoped; active counts are 0 when off
+      - ``providers``: per-provider dict keyed by name (``modal``, ``runpod``)
+        with ``configured``, ``url``, ``target``, ``active``, ``max``
+      - Legacy flat ``remote_*`` fields aliased to the modal provider
     """
-    return JSONResponse(content={
-        "turbo_active": _turbo_active,
-        "remote_sidecar_configured": ltx_remote_sidecar is not None,
-        "remote_sidecar_url": config.LTX_REMOTE_SIDECAR_URL or None,
-        "remote_worker_target": _remote_worker_target,
-        "remote_worker_active": len(_remote_worker_tasks),
-        "remote_worker_max": config.LTX_REMOTE_SIDECAR_MAX_WORKERS,
-    })
+    return JSONResponse(content=_pool_state_payload())
 
 
 @app.post("/v1/system/pool/remote-workers")
-async def set_pool_remote_workers(body: PoolCountRequest, request: Request) -> JSONResponse:
-    """Set the target remote-sidecar worker count (0..MAX).
+async def set_pool_remote_workers(request: Request) -> JSONResponse:
+    """Set target remote-sidecar worker counts (0..MAX).
 
-    Takes effect immediately if turbo is active (scales the live pool).
-    If turbo is inactive, the target is stored and applied at next turbo-on.
+    Accepts two body shapes:
+      - ``{"count": N}`` — legacy v1.6 shape, scales the ``modal`` provider only
+      - ``{"modal": N, "runpod": M}`` — per-provider targets (v1.9.0)
+
+    Takes effect immediately if turbo is active; otherwise targets are stored
+    and applied at next turbo-on.
     """
     deny = _require_admin(request)
     if deny is not None:
         return deny
-    global _remote_worker_target
-    if ltx_remote_sidecar is None:
-        return _error(400, "remote_sidecar_not_configured: set LTX_REMOTE_SIDECAR_URL in .env")
-    target = max(0, min(body.count, config.LTX_REMOTE_SIDECAR_MAX_WORKERS))
-    _remote_worker_target = target
-    # If turbo is already on, scale the live pool right now; otherwise the
-    # target takes effect on next turbo-enter.
+    if not ltx_remote_sidecars:
+        return _error(400, "remote_sidecar_not_configured: set LTX_MODAL_SIDECAR_URL or LTX_RUNPOD_SIDECAR_URL in .env")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "invalid_json")
+    if not isinstance(body, dict):
+        return _error(400, "body_must_be_object")
+
+    # Accept either legacy {"count": N} (modal-only) or per-provider keys.
+    if "count" in body:
+        if "modal" not in ltx_remote_sidecars:
+            return _error(400, "modal_provider_not_configured")
+        try:
+            count = int(body["count"])
+        except (TypeError, ValueError):
+            return _error(400, "count_must_be_int")
+        if count < 0:
+            return _error(400, "count_must_be_nonneg")
+        _remote_worker_targets["modal"] = max(0, min(count, _provider_max("modal")))
+    else:
+        unknown = set(body.keys()) - set(_PROVIDERS)
+        if unknown:
+            return _error(400, f"unknown_provider: {sorted(unknown)}")
+        for provider, raw in body.items():
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                return _error(400, f"count_must_be_int: {provider}")
+            if n < 0:
+                return _error(400, f"count_must_be_nonneg: {provider}")
+            if provider not in ltx_remote_sidecars:
+                if n == 0:
+                    continue  # no-op — caller explicitly leaving this provider disabled
+                return _error(400, f"provider_not_configured: {provider}")
+            _remote_worker_targets[provider] = max(0, min(n, _provider_max(provider)))
+
     try:
         await _scale_remote_pool()
     except Exception as exc:
         logger.exception("Remote pool scale failed")
         return _error(500, f"pool_scale_failed: {exc}")
-    return JSONResponse(content={
-        "remote_worker_target": _remote_worker_target,
-        "remote_worker_active": len(_remote_worker_tasks),
-        "remote_worker_max": config.LTX_REMOTE_SIDECAR_MAX_WORKERS,
-        "applied_now": _turbo_active,
-    })
+    payload = _pool_state_payload()
+    payload["applied_now"] = _turbo_active
+    return JSONResponse(content=payload)
+
+
+@app.post("/v1/system/pool/remote-workers/{provider}")
+async def set_pool_remote_workers_provider(
+    provider: str, body: PoolCountRequest, request: Request
+) -> JSONResponse:
+    """Set the target worker count for a specific provider (v1.9.0)."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    if provider not in _PROVIDERS:
+        return _error(400, f"unknown_provider: {provider}")
+    if provider not in ltx_remote_sidecars:
+        return _error(400, f"provider_not_configured: {provider}")
+    _remote_worker_targets[provider] = max(0, min(body.count, _provider_max(provider)))
+    try:
+        await _scale_remote_pool()
+    except Exception as exc:
+        logger.exception("Remote pool scale failed")
+        return _error(500, f"pool_scale_failed: {exc}")
+    payload = _pool_state_payload()
+    payload["applied_now"] = _turbo_active
+    return JSONResponse(content=payload)
 
 
 @app.get("/v1/system/config")
@@ -2587,6 +2706,31 @@ async def upload_put(upload_id: str, request: Request) -> Response:
     uploads.save(upload_id, data)
     _record_upload_bytes(api_key, len(data))
     return Response(status_code=201)
+
+
+@app.get("/uploads/get/{upload_id}")
+async def upload_get(upload_id: str, request: Request) -> Response:
+    """Read back a previously-uploaded file (v1.9.1).
+
+    The upload_id is a 128-bit uuid4 hex, unforgeable. Any caller with the ID
+    and a valid bearer token can fetch the file — the ID itself is the
+    capability. See plan doc for deferred scoping policy (TTL, per-key
+    ownership, signed URLs, range requests — all explicitly out of scope).
+    """
+    try:
+        path = uploads.resolve(f"storage://{upload_id}")
+    except ValueError:
+        return _error(400, "invalid_upload_id")
+    except FileNotFoundError:
+        return _error(404, "upload_not_found")
+    # Sniff only the first 16 bytes — don't read the whole file into memory.
+    try:
+        with path.open("rb") as f:
+            head = f.read(16)
+    except OSError:
+        return _error(500, "upload_read_failed")
+    media_type = _infer_media_type_from_magic(head)
+    return FileResponse(path=str(path), media_type=media_type)
 
 
 # ---------------------------------------------------------------------------
@@ -3821,6 +3965,35 @@ def _upload_quota_error(api_key: str, proposed_bytes: int) -> JSONResponse | Non
 # v1.8.2 / SEC P2-7 — Content-Type magic-byte verification. Only applied
 # when the client declared a content-type we recognize; octet-stream and
 # unknown types are passed through unchanged.
+def _infer_media_type_from_magic(first_bytes: bytes) -> str:
+    """Infer a canonical MIME type from the first few bytes of a file.
+
+    Used by ``GET /uploads/get/{id}`` (v1.9.0) to set a sensible Content-Type
+    on upload reads so browsers (especially Safari) don't reject media.
+    Returns ``application/octet-stream`` on unknown/empty input — the browser
+    will sniff the stream in most cases.
+    """
+    b = first_bytes or b""
+    if b.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if b.startswith(b"\x89PNG"):
+        return "image/png"
+    if len(b) >= 12 and b[:4] == b"RIFF":
+        if b[8:12] == b"WEBP":
+            return "image/webp"
+        if b[8:12] == b"WAVE":
+            return "audio/wav"
+    if b.startswith(b"ID3") or b.startswith(b"\xff\xfb") or b.startswith(b"\xff\xf3") or b.startswith(b"\xff\xf2"):
+        return "audio/mpeg"
+    if b.startswith(b"fLaC"):
+        return "audio/flac"
+    if b.startswith(b"OggS"):
+        return "audio/ogg"
+    if len(b) >= 8 and b[4:8] == b"ftyp":
+        return "video/mp4"
+    return "application/octet-stream"
+
+
 def _content_type_matches_magic(declared: str, first_bytes: bytes) -> bool:
     """Return True if ``first_bytes`` (≥ 16 bytes recommended) matches the
     declared content-type's magic signature. Lenient on unrecognized /
@@ -4377,10 +4550,22 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
     comp = compositions.get(comp_id, api_key)
     if not comp:
         return _error(404, "Composition not found")
+    # Optional body: {"audio_uri": "storage://<id>"} to overlay audio on export.
+    # Body is optional for backwards compat with existing clients that POST empty.
+    audio_uri: str | None = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            raw = body.get("audio_uri")
+            if isinstance(raw, str) and raw:
+                audio_uri = raw
+    except Exception:
+        pass  # no body / invalid JSON → proceed without audio
     params = {
         "composition_id": comp_id,
         "clips": comp["data"].get("clips", []),
         "transitions": comp["data"].get("transitions", []),
+        "audio_uri": audio_uri,
     }
     return _submit_job(JobType.EXPORT_COMPOSITION, params, request)
 
