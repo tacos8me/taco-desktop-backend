@@ -2,6 +2,14 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.2 — 2026-04-19
+
+### Fix: concurrent PyAV encode race on `avcodec_open2(aac)`
+
+Under turbo mode (2 local workers), two a2v jobs hitting `_video_to_bytes` around the same time intermittently failed with `av.error.ValueError: [Errno 22] Invalid argument: 'avcodec_open2(aac)'` during `container.mux()` / `start_encoding()`. FFmpeg's muxer initialization (opening the libx264 + AAC encoders) is not fully thread-safe across concurrent output containers in the same process. Single-threaded repro of the exact failing file works byte-for-byte.
+
+Fix: module-level `_ENCODE_LOCK = threading.Lock()` in `split_model_manager.py` wraps every `encode_video(...)` call site (the single funnel `_video_to_bytes`). Denoising still runs in parallel under turbo (the expensive 10-60s part); only the final ~1-2s MP4 encode tail serializes. Throughput impact ≤ 5% on typical 5-30s videos. Applies to every video job type (t2v, i2v, a2v, retake, outpaint).
+
 ## v1.9.1 — 2026-04-19
 
 ### `GET /uploads/get/{upload_id}` — serve uploads back

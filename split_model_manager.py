@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -705,6 +706,24 @@ def _pick_tmp_dir(estimated_bytes: int) -> Path:
     return target
 
 
+# v1.9.2: process-wide lock around PyAV `encode_video` calls.
+#
+# Context: under turbo (2 local workers) concurrent MP4 encodes that ran
+# through PyAV's libx264 + AAC muxer occasionally failed with
+# `av.error.ValueError: [Errno 22] Invalid argument: 'avcodec_open2(aac)'`
+# at `container.mux()` / `start_encoding()`. FFmpeg's muxer initialization
+# (`avcodec_open2` for each output stream's codec context) isn't fully
+# thread-safe across concurrent output containers from the same process —
+# the AAC encoder init racing with libx264 init is the reliable symptom.
+#
+# Reproduced: single-worker encode of the exact failing payload succeeds
+# byte-for-byte; failure only appears when two a2v jobs' encodes overlap.
+# Fix: serialize the PyAV encode phase. Denoising still runs in parallel
+# (the expensive part — 10-60s per job); only the final ~1-2s encode tail
+# serializes. Turbo throughput impact ≤ 5% for typical video lengths.
+_ENCODE_LOCK = threading.Lock()
+
+
 def _video_to_bytes(
     video: Iterator[torch.Tensor],
     fps: float,
@@ -724,13 +743,14 @@ def _video_to_bytes(
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False, dir=str(tmp_dir)) as tmp:
         tmp_path = tmp.name
     try:
-        encode_video(
-            video=video,
-            fps=int(fps),
-            audio=audio if include_audio else None,
-            output_path=tmp_path,
-            video_chunks_number=video_chunks_number,
-        )
+        with _ENCODE_LOCK:
+            encode_video(
+                video=video,
+                fps=int(fps),
+                audio=audio if include_audio else None,
+                output_path=tmp_path,
+                video_chunks_number=video_chunks_number,
+            )
         result = Path(tmp_path).read_bytes()
     finally:
         Path(tmp_path).unlink(missing_ok=True)
