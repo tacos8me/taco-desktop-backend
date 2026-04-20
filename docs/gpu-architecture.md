@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.9.1 (2026-04-19). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. See [CHANGELOG](../CHANGELOG.md).
+**Current version:** v1.10.0 (2026-04-20). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. v1.10.0 adds seamless MusicVideo export via multi-frame chain conditioning (no GPU-topology changes). See [CHANGELOG](../CHANGELOG.md).
 
 ## Dual-GPU Layout
 

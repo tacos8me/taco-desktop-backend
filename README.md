@@ -61,7 +61,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 
 ## Endpoints overview
 
-73 endpoints total. Key routes:
+74 endpoints total. Key routes:
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -96,7 +96,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`. Every 
 
 | Document | Contents |
 |----------|----------|
-| [API Reference](docs/API.md) | Full 71-endpoint spec with request/response schemas, error taxonomy, common types |
+| [API Reference](docs/API.md) | Full 74-endpoint spec with request/response schemas, error taxonomy, common types |
 | [Quick Start Guide](docs/QUICKSTART.md) | 5-minute integration guide for frontend devs |
 | [Outpaint Frontend Guide](docs/outpaint-frontend-guide.md) | `/v2/video-outpaint` integration (v1.7.0) |
 | [Retake Frontend Guide](docs/retake-frontend-guide.md) | `/v2/retake` integration for noodle-v |

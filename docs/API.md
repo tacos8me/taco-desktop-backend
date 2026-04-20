@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.8.2 (2026-04-18)
+**Server version:** v1.10.0 (2026-04-20)
 **Public base URL:** `https://api.noodlefinger.io` *(canonical; Cloudflare-proxied via the shared `noodle` tunnel)*
 **LAN / dev base URL:** `http://<host>:8090` (uvicorn direct)
 

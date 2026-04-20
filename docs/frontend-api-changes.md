@@ -79,6 +79,7 @@ The request bodies are **identical** between v1 and v2. Only the response change
 | `POST` | `/v1/upload` | Synchronous. Returns `upload_url` + `storage_uri`. |
 | `PUT` | `/uploads/put/{id}` | Synchronous. File upload. |
 | `GET` | `/uploads/get/{id}` | Synchronous. Read back an upload (v1.9.1). Content-Type inferred from magic bytes. |
+| `POST` | `/v2/video/extract-frames` | Synchronous (v1.10.0). `{video_uri, frame_indices: [int]}` → N `storage://` PNG URIs. For multi-frame chain conditioning. |
 
 ### New job management endpoints
 

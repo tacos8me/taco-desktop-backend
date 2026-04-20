@@ -2,12 +2,16 @@
 
 Everything you need to ship a working client in 5 minutes. For everything else → [docs/API.md](./API.md).
 
-## What's new in v1.9.1 (2026-04-19)
+## What's new in v1.10.0 (2026-04-20)
 
-- **`GET /uploads/get/{upload_id}`** (v1.9.1) — read back a previously-uploaded file. Use this to hydrate media players on page reload (e.g. MusicVideo tab `<audio src>`). Content-Type is inferred from magic bytes (`image/*`, `audio/*`, `video/mp4`). Auth via bearer; the 128-bit `uuid4` ID is the capability.
-- **Composition audio overlay** (v1.9.0) — `POST /v2/compositions/{id}/export` accepts optional `{"audio_uri": "storage://<id>"}`. FFmpeg muxes the audio onto the stitched video (AAC @ 192 kbps, `-shortest`). Video-only export (empty/no body) unchanged.
-- **Multi-provider remote pool** (v1.9.0) — `GET /v1/system/pool` now returns `providers: {modal, runpod}` with per-provider target/active/max; legacy flat `remote_*` fields preserved as modal aliases. Scale via `POST /v1/system/pool/remote-workers {"modal": N, "runpod": M}` or `POST /v1/system/pool/remote-workers/{provider}`. Up to 2 local + 4 Modal + 2 RunPod = **8 concurrent video jobs** at peak.
-- **Video outpaint** (v1.7.0) — `POST /v2/video-outpaint`. 9 positions. See [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
+- **Seamless MusicVideo chain conditioning** (v1.10.0) — non-first clips are conditioned on the last 3 safe frames of their predecessor so motion and visual state flow continuously across cuts. Composition export trims the duplicated tail so the 3 chain frames appear exactly once. Result: no visible seam at clip boundaries. Full FE orchestration spec in [docs/handover-frontend-v1.10-chain.md](./handover-frontend-v1.10-chain.md).
+- **`POST /v2/video/extract-frames`** (v1.10.0) — server-side PyAV helper. Body `{video_uri, frame_indices: [int]}` (1–16, sorted+deduped). Returns lossless PNGs as `storage://` URIs. Bearer + capability-URL security. Bounded concurrency (semaphore 2 + 30 s timeout). Output bytes count against `PER_KEY_UPLOAD_BYTES_PER_DAY`.
+- **`AudioToVideoRequest.keyframes`** (v1.10.0) — a2v now accepts the same `keyframes: list[KeyframeInput]` shape as i2v (mutually exclusive with `image_uri`+`image_strength`; 422 on conflict). Legacy single-keyframe path unchanged.
+- **`tailTrimFrames: int` per-clip composition field** (v1.10.0, default 0) — backend trims the last N frames of each input at export time. Cascades into beat-gap atrim + force-IDR seam math.
+- **`GET /uploads/get/{upload_id}`** (v1.9.1) — read back a previously-uploaded file. Content-Type inferred from magic bytes.
+- **Composition audio overlay** (v1.9.0) — `POST /v2/compositions/{id}/export` accepts optional `{"audio_uri": "storage://<id>"}`.
+- **Multi-provider remote pool** (v1.9.0) — up to 2 local + 4 Modal + 2 RunPod = **8 concurrent video jobs** at peak.
+- **Video outpaint** (v1.7.0) — `POST /v2/video-outpaint`. See [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
 - **Turbo hardening** (v1.5) — `systemctl`-based cuda:1 tenant eviction on entry, 20 s drain deadline with automatic rollback on failure.
 - All changes additive. Legacy env vars (`LTX_REMOTE_SIDECAR_URL`), legacy pool body shape (`{"count": N}`), and the video-only export call keep working unchanged.
 
