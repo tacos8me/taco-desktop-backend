@@ -1624,6 +1624,7 @@ class SplitModelManager:
         width: int, height: int, num_frames: int, fps: float, seed: int,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
         model: str = "ltx-2-3-pro",
+        keyframes: list[dict] | None = None,
         on_prompt_enhanced: Callable[[str], None] | None = None,
         on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
@@ -1633,9 +1634,20 @@ class SplitModelManager:
 
         worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
+        # v1.10.0: `keyframes` supersedes single `image_path` when set. Back-compat
+        # path builds a single head-frame keyframe internally so downstream code
+        # only sees one source of truth.
+        effective_keyframes: list[dict]
+        if keyframes:
+            effective_keyframes = list(keyframes)
+        elif image_path is not None:
+            effective_keyframes = [{"image_path": image_path, "frame_index": 0, "strength": 1.0}]
+        else:
+            effective_keyframes = []
+
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
-        _enhance_image = image_path
+        _enhance_image = effective_keyframes[0]["image_path"] if effective_keyframes else None
         if is_fast:
             (ctx_p,) = self._encode_prompts([prompt], enhance_first_prompt=enhance_prompt, enhance_prompt_image=_enhance_image, on_enhanced=on_prompt_enhanced)
             (ctx_p,) = self._contexts_to_device([ctx_p], device)
@@ -1664,9 +1676,10 @@ class SplitModelManager:
             )
             encoded_audio_latent = torch.cat([encoded_audio_latent, pad], dim=2)
 
-        images: list[ImageConditioningInput] = []
-        if image_path is not None:
-            images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=1.0)]
+        images: list[ImageConditioningInput] = [
+            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"])
+            for kf in effective_keyframes
+        ]
 
         generator = torch.Generator(device=device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -2234,6 +2247,7 @@ class SplitModelManager:
         model: str, width: int, height: int, num_frames: int, fps: float, seed: int,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
         enhance_prompt: bool = False,
+        keyframes: list[dict] | None = None,
         on_prompt_enhanced: Callable[[str], None] | None = None,
         on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
@@ -2247,6 +2261,7 @@ class SplitModelManager:
                     self._run_a2v, worker, prompt, audio_path, image_path,
                     width, height, num_frames, fps, seed, on_progress, user_lora,
                     enhance_prompt, model,
+                    keyframes=keyframes,
                     on_prompt_enhanced=on_prompt_enhanced,
                     on_cancel_check=on_cancel_check,
                 ),

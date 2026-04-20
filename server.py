@@ -22,7 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import config
 import split_model_manager
@@ -785,12 +785,27 @@ class AudioToVideoRequest(BaseModel):
     # first-keyframe strength when `image_uri` is set. Matches the field on
     # ImageToVideoRequest so clients can tune a2v's intro frame intensity.
     image_strength: float = Field(default=0.85, ge=0.0, le=1.0)
+    # v1.10.0: multi-keyframe support for seamless MusicVideo chain mode.
+    # Mutually exclusive with image_uri / image_strength in practice — the
+    # model_validator below rejects mixed specifications with 422.
+    keyframes: list[KeyframeInput] | None = None
     model: ModelName
     resolution: Resolution
     duration: float = Field(default=6.0, gt=0, le=30)
     fps: float = Field(default=24.0, gt=0, le=60)
     lora: LoRAInput | None = None
     enhance_prompt: bool = False
+
+    @model_validator(mode="after")
+    def _check_keyframes_exclusive(self) -> "AudioToVideoRequest":
+        if self.keyframes is not None:
+            if self.image_uri is not None:
+                raise ValueError("Cannot specify both image_uri and keyframes")
+            # image_strength default is 0.85; reject explicit non-default when
+            # keyframes is set (it would be silently ignored otherwise).
+            if self.image_strength != 0.85:
+                raise ValueError("Cannot specify image_strength together with keyframes")
+        return self
 
 
 class RetakeRequest(BaseModel):
@@ -1167,8 +1182,14 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
     return prompt
 
 
-def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int) -> list[dict] | JSONResponse:
-    """Resolve keyframes, converting symbolic/negative frame indices to absolute values."""
+def _resolve_keyframes(body, num_frames: int, *, allow_neither: bool = False) -> list[dict] | JSONResponse | None:
+    """Resolve keyframes, converting symbolic/negative frame indices to absolute values.
+
+    v1.10.0: reused by both ImageToVideoRequest (requires image_uri or keyframes)
+    and AudioToVideoRequest (both are optional — audio is the only required input).
+    When ``allow_neither`` is True and the body has neither ``image_uri`` nor
+    ``keyframes``, returns ``None`` (caller uses the audio-only path).
+    """
     if body.keyframes and body.image_uri:
         return _error(422, "Cannot specify both image_uri and keyframes")
     if body.keyframes:
@@ -1198,6 +1219,8 @@ def _resolve_keyframes(body: ImageToVideoRequest, num_frames: int) -> list[dict]
     elif body.image_uri:
         path = str(uploads.resolve(body.image_uri))
         return [{"image_path": path, "frame_index": 0, "strength": body.image_strength}]
+    elif allow_neither:
+        return None
     else:
         return _error(422, "Either image_uri or keyframes is required")
 
@@ -2453,12 +2476,14 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
     lora_path, lora_strength = lora_result
     try:
         audio_path = str(uploads.resolve(body.audio_uri))
-        image_path: str | None = None
-        if body.image_uri:
-            image_path = str(uploads.resolve(body.image_uri))
-
         width, height = _resolution_to_dims(body.resolution)
         num_frames = _duration_to_frames(body.duration, body.fps)
+        keyframe_inputs = _resolve_keyframes(body, num_frames, allow_neither=True)
+        if isinstance(keyframe_inputs, JSONResponse):
+            return keyframe_inputs
+        # v1.10.0: image_uri path is now folded into keyframe_inputs by
+        # _resolve_keyframes (single-keyframe list). _run_a2v receives only
+        # `keyframes` from here.
         seed = random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
@@ -2467,7 +2492,8 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
             video_bytes = await manager.generate_audio_to_video(
                 prompt=body.prompt,
                 audio_path=audio_path,
-                image_path=image_path,
+                image_path=None,
+                keyframes=keyframe_inputs,
                 model=body.model,
                 width=width,
                 height=height,
@@ -3097,13 +3123,14 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
         return lora_result
     lora_path, lora_strength = lora_result
     audio_path = str(uploads.resolve(body.audio_uri))
-    image_path: str | None = None
-    if body.image_uri:
-        image_path = str(uploads.resolve(body.image_uri))
     width, height = _resolution_to_dims(body.resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
+    keyframe_inputs = _resolve_keyframes(body, num_frames, allow_neither=True)
+    if isinstance(keyframe_inputs, JSONResponse):
+        return keyframe_inputs
     seed = random.randint(0, 2**32 - 1)
-    params = dict(prompt=body.prompt, audio_path=audio_path, image_path=image_path,
+    params = dict(prompt=body.prompt, audio_path=audio_path, image_path=None,
+                  keyframes=keyframe_inputs,
                   model=body.model, width=width, height=height, num_frames=num_frames,
                   fps=body.fps, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength,

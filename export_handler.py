@@ -59,14 +59,43 @@ def export_composition(
     """
     clip_paths: list[Path] = []
     clip_durations: list[float] = []
+    clip_fps: list[float] = []
+    clip_tail_trim: list[int] = []
 
     for clip in clips:
         path = _resolve_clip_path(clip["historyId"], uploads)
         clip_paths.append(path)
-        clip_durations.append(clip.get("duration", 6.0))
+        duration = float(clip.get("duration", 6.0))
+        clip_durations.append(duration)
+        fps = float(clip.get("fps", 24.0))
+        clip_fps.append(fps)
+        clip_tail_trim.append(int(clip.get("tailTrimFrames", 0) or 0))
 
     if not clip_paths:
         raise ValueError("No clips to export")
+
+    # v1.10.0: effective_durations cascade = raw duration − trimmed tail.
+    # Silent guards per spec:
+    #   - Last clip always tailTrimFrames=0 (no follower, no continuity seam).
+    #   - Single-clip exports zero out unconditionally.
+    #   - Over-trim (tail >= declared frames) clamps to declared-1 with WARN.
+    # xfade path skips trim entirely — handled at filter-build time below.
+    effective_durations: list[float] = []
+    for i in range(len(clip_paths)):
+        tail = clip_tail_trim[i]
+        fps = clip_fps[i]
+        declared_frames = max(1, int(round(clip_durations[i] * fps)))
+        if len(clip_paths) == 1 or i == len(clip_paths) - 1:
+            tail = 0
+            clip_tail_trim[i] = 0
+        elif tail >= declared_frames:
+            logger.warning(
+                "export_composition: clip %d tailTrimFrames=%d >= declared_frames=%d; clamping to %d",
+                i, tail, declared_frames, declared_frames - 1,
+            )
+            tail = declared_frames - 1
+            clip_tail_trim[i] = tail
+        effective_durations.append(clip_durations[i] - tail / fps)
 
     audio_path: Path | None = None
     if audio_uri:
@@ -111,7 +140,21 @@ def export_composition(
     # no scale/setsar is needed here. Frame rate is left alone so the first
     # clip's fps wins (concat filter's default behavior) — don't force a
     # target fps because it'd stutter if the user mixes sources.
+    # v1.10.0: per-input `trim=end_frame=<kept>` BEFORE `setpts=PTS-STARTPTS`.
+    # Order matters — trim preserves original PTS (it selects a frame window
+    # on the input timeline), and setpts then rebases to zero. Reversing the
+    # order would trim after rebasing, which drops the WRONG frames.
+    # xfade path skips trim (xfade already overlaps — can't stack the two).
     def _norm(i: int, out_label: str) -> str:
+        tail = clip_tail_trim[i]
+        if tail > 0 and not has_xfade:
+            fps = clip_fps[i]
+            declared_frames = max(1, int(round(clip_durations[i] * fps)))
+            kept = max(1, declared_frames - tail)
+            return (
+                f"[{i}:v]trim=end_frame={kept},setpts=PTS-STARTPTS,"
+                f"format=yuv420p{out_label}"
+            )
         return f"[{i}:v]setpts=PTS-STARTPTS,format=yuv420p{out_label}"
 
     if not has_xfade:
@@ -190,15 +233,20 @@ def export_composition(
         # LAST clip there is no next beat, so fall back to clip_duration[N-1].
         # Zero / non-monotonic gaps fall back to clip_duration[i] — defensive
         # against clients that pass garbage audioStart values.
+        # v1.10.0: non-last slice clamps to effective_durations[i] (defensive —
+        # prevents atrim past the trimmed EOF when a clip's tail was cut).
+        # Last clip uses effective_durations[-1] (== clip_durations[-1] because
+        # last clip's tailTrimFrames is always zeroed above).
         slice_durations: list[float] = []
         for i, start in enumerate(clip_audio_starts):
             if i < len(clip_paths) - 1:
                 gap = clip_audio_starts[i + 1] - start
                 if gap <= 0:
                     gap = clip_durations[i]
+                gap = min(float(gap), effective_durations[i])
                 slice_durations.append(float(gap))
             else:
-                slice_durations.append(float(clip_durations[i]))
+                slice_durations.append(float(effective_durations[i]))
 
         audio_parts: list[str] = []
         audio_labels: list[str] = []
@@ -246,11 +294,13 @@ def export_composition(
     #
     # Seam times are the cumulative sum of clip_durations, excluding the
     # final total (which IS the end of stream — no seam there).
+    # v1.10.0: seam cumsum uses effective_durations (== clip_durations when
+    # no tails are trimmed — byte-identical to v1.9.9 in that case).
     force_keyframe_args: list[str] = []
     if len(clip_paths) > 1:
         seam_times: list[float] = []
         acc = 0.0
-        for dur in clip_durations[:-1]:
+        for dur in effective_durations[:-1]:
             acc += float(dur)
             seam_times.append(acc)
         if seam_times:
