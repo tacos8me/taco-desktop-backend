@@ -2,6 +2,52 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.12.0 — 2026-04-20
+
+### Feat: multi-frame video-segment chain conditioning (the proper fix)
+
+v1.10.0 through v1.11.5 tried to chain-condition clips by sending 3 extracted PNG frames as keyframes at `frame_index=[0, 1, 2]`, strength 1.0. Empirical testing at v1.11.5 proved this architecture can only hard-pin pixel frame 0 (via `VideoConditionByLatentIndex`); frames 1-2 are soft-guided via `VideoConditionByKeyframeIndex` (appended context tokens, main video latent still free-denoised). Subject identity drifted cliff-wise at seam 2+ because each chain hop's anchor was itself a free-generated frame from the prior clip's tail.
+
+v1.12 fixes this architecturally. FE extracts a contiguous 9-pixel-frame MP4 segment from the prior clip's tail via new `/v2/video/extract-segment` endpoint. Backend VAE-encodes the segment as a 2-latent-frame tensor and pins target's latents [0, 1] via a single `VideoConditionByLatentIndex(latent=multi_frame_latent, latent_idx=0, strength=1.0)`. LTX's causal VAE maps latent 0 → pixel 0, latent 1 → pixel frames 1-8 — so 9 consecutive target pixel frames are hard-pinned at every sigma step, with real continuous motion content from the prior clip (not held stills as in the v1.11.3 slideshow regression).
+
+### New API surface
+
+- **`POST /v2/video/extract-segment`** — body `{video_uri: "storage://...", start_frame: int, num_frames: int}`, where `num_frames ∈ {9, 17, 25, 33}` (8k+1 for k∈{1..4}); v1.12 ships with 9 as the default. Response `{segment_uri: "storage://...", width, height, num_frames, fps}`. Same capability-URL + bearer + `PER_KEY_UPLOAD_BYTES_PER_DAY` quota pattern as `/v2/video/extract-frames`. Segment MP4s are ~500 KB–1.5 MB for 9 H.264 frames — more efficient than 9 lossless PNGs.
+
+- **`AudioToVideoRequest.segment_uri` and `ImageToVideoRequest.segment_uri`** — new optional string field. Mutually exclusive with `image_uri` and `keyframes` (3-way exclusion enforced by Pydantic validator). When set, backend decodes the segment via PyAV, normalizes pixels, VAE-encodes, and pins target's head latents.
+
+### Internals
+
+- `history_store._extract_segment_as_mp4(video_bytes, start_frame, num_frames)` — single-pass PyAV decode of a contiguous frame range, re-encoded as H.264 MP4 (video-only, no audio track). Shares `_FRAME_EXTRACT_SEMAPHORE` with extract-frames.
+- `split_model_manager._build_segment_conditioning_latent(segment_path, target_h, target_w, dtype, device, video_encoder)` — mirrors `_build_outpaint_reference_latent`: decodes via `decode_video_from_file`, preprocesses via `video_preprocess`, returns a multi-latent-frame tensor.
+- `_image_conds_for_keyframes(..., segment_path=...)` — when `segment_path` is set, routes to segment path (single multi-frame `VideoConditionByLatentIndex`); otherwise falls through to the classical `combined_image_conditionings` (v1.11.5 single-pixel-frame-0 pin + soft-guide for [1, 2]).
+- `_run_i2v` and `_run_a2v` accept a new `segment_path` kwarg; `SplitModelManager.generate_image_to_video` and `generate_audio_to_video` forward it to the threadpool submission.
+- `_dispatch_job_turbo_remote` base64-encodes the segment MP4 as `segment_b64` for remote workers (Modal + RunPod). `ltx_sidecar_client.generate()` gains `segment_path` / `segment_b64` kwargs.
+- Modal + RunPod sidecars: added `segment_b64` to `GenerateRequest`; staging logic writes to `/tmp/<uuid>.mp4` before calling the manager. i2v endpoint now accepts `keyframes` OR `segment_path` instead of requiring `keyframes`.
+- Local cuda:1 LTX sidecar (`ltx-sidecar`) also accepts `segment_path` directly (shared filesystem with taco-backend, no b64 staging needed).
+
+### Known limitation (deferred to v1.13)
+
+LTX's causal VAE assumes frame 0 of an encoded segment is the "start" of a video — it replicates that frame for causal padding. Encoding a 9-frame segment from the middle of a clip gives internally-consistent latents for those 9 frames but NOT bit-identical to what the prior clip's full-length encoding produced for the same frames. Residual RMSE expected: 1-3 on a 0-255 scale. Measurable but visually imperceptible in most content. v1.13 candidate: save prior clip's final 2 latent frames to history and reuse them directly (no VAE re-encode, eliminates causal mismatch entirely).
+
+### Back-compat
+
+- Clients not sending `segment_uri`: unchanged. v1.11.5 keyframes path routes through `combined_image_conditionings` as before.
+- Single-keyframe `image_uri` requests: unchanged. Frame 0 hard-pin at strength=1.0 via `VideoConditionByLatentIndex`.
+- Legacy compositions with v1.11.2+ `keyframes` / `audioDurationSec` / `tailTrimFrames`: byte-identical export.
+- `/v2/video/extract-frames` endpoint: unchanged. FE can use either endpoint depending on conditioning mode.
+- Composition export (`export_handler.py`): zero changes. `tailTrimFrames` math is abstract over trim value; FE sets `tailTrimFrames=9` on clips whose successors use segment mode.
+
+### FE contract
+
+FE flow: generate clip 0 → on completion, `POST /v2/video/extract-segment {video_uri, start_frame: num_frames - 9, num_frames: 9}` → use returned `segment_uri` on next clip's a2v/i2v request. On composition save, set `tailTrimFrames=9` on non-final clips. Gate UI behind `flags.v112_seamless_segment`; default off until backend verified in prod. See `docs/handover-frontend-v1.10-chain.md` v1.12 section.
+
+### Verification
+
+- 120/120 pytest green
+- `/v2/video/extract-segment` smoke-tested: correctly rejects single-frame inputs as `segment_out_of_range`, emits valid MP4 uploads on valid ranges.
+- Service restarted on Unit A+B+C code.
+
 ## v1.11.5 — 2026-04-20
 
 ### Fix: revert v1.11.3's wrong routing + promote diagnostic log level

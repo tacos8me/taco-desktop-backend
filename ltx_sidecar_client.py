@@ -137,6 +137,9 @@ class LtxSidecarClient:
         position: str | None = None,
         conditioning_strength: float | None = None,
         skip_stage_2: bool | None = None,
+        # v1.12: chain-segment MP4 for multi-frame latent conditioning.
+        segment_path: str | None = None,
+        segment_b64: str | None = None,
     ) -> bytes:
         """POST /generate — returns raw MP4 bytes.
 
@@ -189,6 +192,11 @@ class LtxSidecarClient:
             payload["conditioning_strength"] = conditioning_strength
         if skip_stage_2 is not None:
             payload["skip_stage_2"] = skip_stage_2
+        # v1.12 chain-segment conditioning
+        if segment_path is not None:
+            payload["segment_path"] = segment_path
+        if segment_b64 is not None:
+            payload["segment_b64"] = segment_b64
 
         url = f"{self._base_url}/generate"
         t0 = time.perf_counter()

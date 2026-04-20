@@ -775,6 +775,8 @@ class ImageToVideoRequest(BaseModel):
     image_uri: str | None = None
     image_strength: float = Field(default=0.85, ge=0.0, le=1.0)
     keyframes: list[KeyframeInput] | None = None
+    # v1.12: multi-frame video-segment chain conditioning (see AudioToVideoRequest doc).
+    segment_uri: str | None = None
     model: ModelName
     resolution: Resolution
     duration: float = Field(gt=0, le=30)
@@ -782,6 +784,20 @@ class ImageToVideoRequest(BaseModel):
     generate_audio: bool = False
     lora: LoRAInput | None = None
     enhance_prompt: bool = False
+
+    @model_validator(mode="after")
+    def _check_i2v_exclusive(self) -> "ImageToVideoRequest":
+        # v1.12: 3-way mutual exclusion across {image_uri, keyframes, segment_uri}.
+        modes_set = sum([
+            self.image_uri is not None,
+            self.keyframes is not None,
+            self.segment_uri is not None,
+        ])
+        if modes_set > 1:
+            raise ValueError("Specify at most one of: image_uri, keyframes, segment_uri")
+        if self.segment_uri is not None and "image_strength" in self.model_fields_set:
+            raise ValueError("Cannot specify image_strength together with segment_uri")
+        return self
 
 
 class AudioToVideoRequest(BaseModel):
@@ -801,6 +817,12 @@ class AudioToVideoRequest(BaseModel):
     # Mutually exclusive with image_uri / image_strength in practice — the
     # model_validator below rejects mixed specifications with 422.
     keyframes: list[KeyframeInput] | None = None
+    # v1.12: multi-frame video-segment chain conditioning. When set, backend
+    # VAE-encodes the segment as a multi-latent-frame tensor and pins target's
+    # head latents via a single VideoConditionByLatentIndex — replacing the
+    # v1.11.5 single-frame-pin (which drifted at seam 2+) with true
+    # multi-pixel-frame hard-pin. Mutually exclusive with image_uri/keyframes.
+    segment_uri: str | None = None
     model: ModelName
     resolution: Resolution
     duration: float = Field(default=6.0, gt=0, le=30)
@@ -810,13 +832,19 @@ class AudioToVideoRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_keyframes_exclusive(self) -> "AudioToVideoRequest":
-        if self.keyframes is not None:
-            if self.image_uri is not None:
-                raise ValueError("Cannot specify both image_uri and keyframes")
+        # v1.12: 3-way mutual exclusion across {image_uri, keyframes, segment_uri}.
+        modes_set = sum([
+            self.image_uri is not None,
+            self.keyframes is not None,
+            self.segment_uri is not None,
+        ])
+        if modes_set > 1:
+            raise ValueError("Specify at most one of: image_uri, keyframes, segment_uri")
+        if self.keyframes is not None or self.segment_uri is not None:
             # v1.10.1: use model_fields_set so the check is robust to future
             # default changes and correctly detects client-explicit values.
             if "image_strength" in self.model_fields_set:
-                raise ValueError("Cannot specify image_strength together with keyframes")
+                raise ValueError("Cannot specify image_strength together with keyframes or segment_uri")
         return self
 
 
@@ -878,6 +906,29 @@ class ExtractFramesRequest(BaseModel):
         if any(i < 0 for i in v):
             raise ValueError("frame_indices must be non-negative")
         return sorted(set(v))
+
+
+class ExtractSegmentRequest(BaseModel):
+    """v1.12 — body for POST /v2/video/extract-segment.
+
+    Server-side PyAV helper that extracts a contiguous range of pixel frames
+    out of a stored MP4 and re-encodes as a standalone small MP4 upload. The
+    segment is then used as multi-frame chain conditioning input for the next
+    clip (see v1.12 plan and docs/debug-v1.11.3-chain-conditioning.md).
+
+    num_frames must be 8k+1 (9, 17, 25, 33) so the segment's causal VAE
+    encoding produces k+1 latent frames. v1.12 defaults to 9 (k=1, 2 latents).
+    """
+    video_uri: str = Field(pattern=r"^storage://[0-9a-f]{32}$")
+    start_frame: int = Field(ge=0)
+    num_frames: int = Field(default=9)
+
+    @field_validator("num_frames")
+    @classmethod
+    def _validate_num_frames(cls, v: int) -> int:
+        if v not in (9, 17, 25, 33):
+            raise ValueError("num_frames must be one of {9, 17, 25, 33} (8k+1 for k in 1..4)")
+        return v
 
 
 class TextToImageRequest(BaseModel):
@@ -1213,14 +1264,26 @@ def _build_prompt(prompt: str, camera_motion: str | None) -> str:
     return prompt
 
 
-def _resolve_keyframes(body, num_frames: int, *, allow_neither: bool = False) -> list[dict] | JSONResponse | None:
+def _resolve_keyframes(body, num_frames: int, *, allow_neither: bool = False) -> list[dict] | dict | JSONResponse | None:
     """Resolve keyframes, converting symbolic/negative frame indices to absolute values.
 
     v1.10.0: reused by both ImageToVideoRequest (requires image_uri or keyframes)
     and AudioToVideoRequest (both are optional — audio is the only required input).
     When ``allow_neither`` is True and the body has neither ``image_uri`` nor
     ``keyframes``, returns ``None`` (caller uses the audio-only path).
+
+    v1.12: if ``body.segment_uri`` is set, returns a dict
+    ``{"mode": "segment", "segment_path": str}`` instead of a list. Callers
+    branch on ``isinstance(result, dict)``.
     """
+    # v1.12: segment mode takes precedence. Pydantic mutex validator already
+    # ensures segment_uri is mutually exclusive with keyframes/image_uri.
+    if getattr(body, "segment_uri", None):
+        try:
+            segment_path = str(uploads.resolve(body.segment_uri))
+        except (ValueError, FileNotFoundError):
+            return _error(404, "segment_uri not found")
+        return {"mode": "segment", "segment_path": segment_path}
     if body.keyframes and body.image_uri:
         return _error(422, "Cannot specify both image_uri and keyframes")
     if body.keyframes:
@@ -1814,6 +1877,8 @@ async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> by
     audio_b64 = _read_b64(p.get("audio_path"))
     image_b64 = _read_b64(p.get("image_path"))
     video_b64 = _read_b64(p.get("video_path"))
+    # v1.12: chain-segment MP4 for multi-frame conditioning.
+    segment_b64 = _read_b64(p.get("segment_path"))
 
     # Keyframes: list of {image_path, frame_index, strength}. Inline each image.
     keyframes = p.get("keyframes")
@@ -1852,6 +1917,8 @@ async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> by
         audio_path=None, audio_b64=audio_b64,
         image_path=None, image_b64=image_b64,
         video_path=None, video_b64=video_b64,
+        # v1.12: chain-segment MP4 for multi-frame conditioning on remote worker.
+        segment_path=None, segment_b64=segment_b64,
         start_time=p.get("start_time"),
         duration=p.get("duration"),
         mode=p.get("mode"),
@@ -2457,9 +2524,11 @@ async def text_to_video(body: TextToVideoRequest) -> Response:
 @app.post("/v1/image-to-video")
 async def image_to_video(body: ImageToVideoRequest) -> Response:
     num_frames = _duration_to_frames(body.duration, body.fps)
-    keyframe_inputs = _resolve_keyframes(body, num_frames)
-    if isinstance(keyframe_inputs, JSONResponse):
-        return keyframe_inputs
+    resolved = _resolve_keyframes(body, num_frames)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    segment_path = resolved["segment_path"] if isinstance(resolved, dict) else None
+    keyframe_inputs = resolved if isinstance(resolved, list) else None
     if _paused:
         return _error(503, "System is paused for maintenance")
     # Auto-swap handles manager.is_ready lazily inside the lock
@@ -2477,6 +2546,7 @@ async def image_to_video(body: ImageToVideoRequest) -> Response:
             video_bytes = await manager.generate_image_to_video(
                 prompt=body.prompt,
                 keyframes=keyframe_inputs,
+                segment_path=segment_path,
                 model=body.model,
                 width=width,
                 height=height,
@@ -2509,12 +2579,14 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
         audio_path = str(uploads.resolve(body.audio_uri))
         width, height = _resolution_to_dims(body.resolution)
         num_frames = _duration_to_frames(body.duration, body.fps)
-        keyframe_inputs = _resolve_keyframes(body, num_frames, allow_neither=True)
-        if isinstance(keyframe_inputs, JSONResponse):
-            return keyframe_inputs
+        resolved = _resolve_keyframes(body, num_frames, allow_neither=True)
+        if isinstance(resolved, JSONResponse):
+            return resolved
         # v1.10.0: image_uri path is now folded into keyframe_inputs by
         # _resolve_keyframes (single-keyframe list). _run_a2v receives only
-        # `keyframes` from here.
+        # `keyframes` from here. v1.12: dict → segment mode.
+        segment_path = resolved["segment_path"] if isinstance(resolved, dict) else None
+        keyframe_inputs = resolved if isinstance(resolved, list) else None
         seed = random.randint(0, 2**32 - 1)
 
         async with _inference_lock:
@@ -2525,6 +2597,7 @@ async def audio_to_video(body: AudioToVideoRequest) -> Response:
                 audio_path=audio_path,
                 image_path=None,
                 keyframes=keyframe_inputs,
+                segment_path=segment_path,
                 model=body.model,
                 width=width,
                 height=height,
@@ -3131,15 +3204,19 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
 async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSONResponse:
     width, height = _resolution_to_dims(body.resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
-    keyframe_inputs = _resolve_keyframes(body, num_frames)
-    if isinstance(keyframe_inputs, JSONResponse):
-        return keyframe_inputs
+    resolved = _resolve_keyframes(body, num_frames)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    # v1.12: dict return → segment mode; list return → classical keyframes.
+    segment_path = resolved["segment_path"] if isinstance(resolved, dict) else None
+    keyframe_inputs = resolved if isinstance(resolved, list) else None
     lora_result = _resolve_lora(body)
     if isinstance(lora_result, JSONResponse):
         return lora_result
     lora_path, lora_strength = lora_result
     seed = random.randint(0, 2**32 - 1)
-    params = dict(prompt=body.prompt, keyframes=keyframe_inputs, model=body.model,
+    params = dict(prompt=body.prompt, keyframes=keyframe_inputs, segment_path=segment_path,
+                  model=body.model,
                   width=width, height=height, num_frames=num_frames, fps=body.fps,
                   seed=seed, generate_audio=body.generate_audio,
                   lora_path=lora_path, lora_strength=lora_strength,
@@ -3156,12 +3233,15 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
     audio_path = str(uploads.resolve(body.audio_uri))
     width, height = _resolution_to_dims(body.resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
-    keyframe_inputs = _resolve_keyframes(body, num_frames, allow_neither=True)
-    if isinstance(keyframe_inputs, JSONResponse):
-        return keyframe_inputs
+    resolved = _resolve_keyframes(body, num_frames, allow_neither=True)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    # v1.12: dict return → segment mode; list return → classical keyframes; None → audio-only.
+    segment_path = resolved["segment_path"] if isinstance(resolved, dict) else None
+    keyframe_inputs = resolved if isinstance(resolved, list) else None
     seed = random.randint(0, 2**32 - 1)
     params = dict(prompt=body.prompt, audio_path=audio_path, image_path=None,
-                  keyframes=keyframe_inputs,
+                  keyframes=keyframe_inputs, segment_path=segment_path,
                   model=body.model, width=width, height=height, num_frames=num_frames,
                   fps=body.fps, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength,
@@ -3287,6 +3367,66 @@ async def v2_video_extract_frames(body: ExtractFramesRequest, request: Request) 
         })
     _record_upload_bytes(api_key, total_bytes)
     return JSONResponse(content={"frames": frames_out})
+
+
+@app.post("/v2/video/extract-segment")
+async def v2_video_extract_segment(body: ExtractSegmentRequest, request: Request) -> JSONResponse:
+    """v1.12 — server-side PyAV video-segment extractor for chain conditioning.
+
+    Decodes [start_frame, start_frame+num_frames) contiguous pixel frames from
+    a stored MP4 and re-encodes as a small standalone H.264 MP4 upload. The
+    segment is consumed by the next clip's conditioning path, where the
+    backend VAE-encodes it as a multi-latent-frame tensor and pins the new
+    clip's head latents via a single VideoConditionByLatentIndex — giving
+    true multi-pixel-frame hard-pin instead of v1.11.5's single-frame pin
+    (which drifted cliff-wise at seam 2+; see docs/debug-v1.11.3-chain-conditioning.md).
+
+    Shares concurrency with /v2/video/extract-frames via _FRAME_EXTRACT_SEMAPHORE.
+    Same capability-URL + bearer + PER_KEY_UPLOAD_BYTES_PER_DAY pattern.
+    """
+    api_key = _extract_api_key(request) or ""
+    try:
+        video_path = uploads.resolve(body.video_uri)
+    except (ValueError, FileNotFoundError):
+        return _error(404, "video_not_found")
+
+    def _decode_and_encode() -> tuple[bytes, int, int, float]:
+        from history_store import _extract_segment_as_mp4
+        video_bytes = video_path.read_bytes()
+        return _extract_segment_as_mp4(video_bytes, body.start_frame, body.num_frames)
+
+    try:
+        async with _FRAME_EXTRACT_SEMAPHORE:
+            mp4_bytes, width, height, fps = await asyncio.wait_for(
+                asyncio.to_thread(_decode_and_encode), timeout=30.0,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("extract-segment timed out for %s start=%d n=%d",
+                       body.video_uri, body.start_frame, body.num_frames)
+        return _error(504, "pyav_timeout")
+    except IndexError as exc:
+        return _error(422, f"segment_out_of_range: {exc}")
+    except RuntimeError as exc:
+        logger.warning("extract-segment decode/encode failure for %s: %s", body.video_uri, exc)
+        return _error(500, "extract_failed")
+    except Exception:
+        logger.exception("extract-segment unexpected failure for %s", body.video_uri)
+        return _error(500, "extract_failed")
+
+    quota = _upload_quota_error(api_key, len(mp4_bytes))
+    if quota is not None:
+        return quota
+
+    upload_id, storage_uri = uploads.create()
+    uploads.save(upload_id, mp4_bytes)
+    _record_upload_bytes(api_key, len(mp4_bytes))
+    return JSONResponse(content={
+        "segment_uri": storage_uri,
+        "width": width,
+        "height": height,
+        "num_frames": body.num_frames,
+        "fps": fps,
+    })
 
 
 @app.post("/v2/text-to-image")

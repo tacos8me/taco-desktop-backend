@@ -199,6 +199,82 @@ def _extract_frames_as_pils(video_bytes: bytes, indices: list[int]) -> list[Imag
     return [collected[i] for i in indices]
 
 
+def _extract_segment_as_mp4(video_bytes: bytes, start_frame: int, num_frames: int) -> tuple[bytes, int, int, float]:
+    """v1.12 — decode [start_frame, start_frame+num_frames) as a standalone MP4.
+
+    Re-encodes the extracted frames as H.264 MP4 bytes (no audio track) for
+    use as multi-frame chain conditioning input (see docs/debug-v1.11.3-chain-conditioning.md
+    and the v1.12 plan). Output is video-only, same width/height/fps as source.
+
+    Returns (mp4_bytes, width, height, fps).
+
+    Raises:
+        IndexError: if start_frame + num_frames exceeds the stream length.
+        RuntimeError: on decode/encode failure or when the container has no video stream.
+    """
+    import av
+    import io as _io
+    from fractions import Fraction
+
+    if num_frames < 1:
+        raise ValueError("num_frames must be >= 1")
+    if start_frame < 0:
+        raise ValueError("start_frame must be >= 0")
+
+    end_frame = start_frame + num_frames
+    collected: list = []  # PyAV VideoFrame objects in decode order
+    width = height = 0
+    fps = 24.0
+    try:
+        with av.open(_io.BytesIO(video_bytes), mode="r") as container:
+            if not container.streams.video:
+                raise RuntimeError("no_video_stream")
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            fps = float(stream.average_rate) if stream.average_rate else 24.0
+            for i, frame in enumerate(container.decode(stream)):
+                if i >= end_frame:
+                    break
+                if i >= start_frame:
+                    collected.append(frame)
+                    if not width:
+                        width = frame.width
+                        height = frame.height
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"decode_failed: {exc}") from exc
+
+    if len(collected) < num_frames:
+        raise IndexError(
+            f"segment_out_of_range: requested frames [{start_frame}, {end_frame}) "
+            f"but stream ended at frame {start_frame + len(collected)}"
+        )
+
+    try:
+        out_buf = _io.BytesIO()
+        with av.open(out_buf, mode="w", format="mp4") as out_container:
+            time_base = Fraction(1, int(round(fps * 1000))) if fps > 0 else Fraction(1, 24000)
+            out_stream = out_container.add_stream("h264", rate=Fraction(int(round(fps * 1000)), 1000))
+            out_stream.width = width
+            out_stream.height = height
+            out_stream.pix_fmt = "yuv420p"
+            out_stream.time_base = time_base
+            out_stream.options = {"crf": "18", "preset": "fast"}
+            for i, frame in enumerate(collected):
+                new_frame = av.VideoFrame.from_ndarray(frame.to_ndarray(format="rgb24"), format="rgb24")
+                new_frame = new_frame.reformat(format="yuv420p")
+                new_frame.pts = i
+                new_frame.time_base = Fraction(1, int(round(fps))) if fps > 0 else Fraction(1, 24)
+                for packet in out_stream.encode(new_frame):
+                    out_container.mux(packet)
+            for packet in out_stream.encode(None):
+                out_container.mux(packet)
+        return out_buf.getvalue(), width, height, fps
+    except Exception as exc:
+        raise RuntimeError(f"encode_failed: {exc}") from exc
+
+
 def _make_thumbnail(media_bytes: bytes, upload_id: str) -> str | None:
     """Create a 256px-wide JPEG thumbnail for image OR video bytes.
 

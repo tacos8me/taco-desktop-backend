@@ -42,6 +42,7 @@ from ltx_core.conditioning import (
     ConditioningItemAttentionStrengthWrapper,
     VideoConditionByReferenceLatent,
 )
+from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
 from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -281,6 +282,37 @@ def _build_outpaint_reference_latent(
     return video_encoder(letterboxed)
 
 
+def _build_segment_conditioning_latent(
+    *,
+    segment_path: str,
+    target_h: int,
+    target_w: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    video_encoder,
+) -> torch.Tensor:
+    # v1.12: VAE-encode a multi-frame video segment for chain conditioning.
+    # Segment MP4 is a short clip (typically 9 pixel frames = 2 latent frames)
+    # extracted from the prior clip's tail by /v2/video/extract-segment. Decode
+    # via PyAV, normalize pixels to [-1, 1], resize to target stage resolution,
+    # VAE-encode. Caller wraps the returned latent in a VideoConditionByLatentIndex
+    # at latent_idx=0 to hard-pin target's head latents. The resulting pin covers
+    # pixel frames [0 .. (F_px - 1)] of the target clip with real continuous
+    # motion content from the prior clip. Small causal-context RMSE expected
+    # at pixel 0 (~1-3 on 0-255 scale) because the VAE replicates frame 0 for
+    # its causal padding; v1.13 follow-up could eliminate this via latent reuse.
+    meta = get_videostream_metadata(segment_path)
+    frame_gen = decode_video_from_file(
+        path=segment_path,
+        device=device,
+        max_duration=(meta.frames / meta.fps) if meta.fps > 0 else None,
+    )
+    source = video_preprocess(frame_gen, target_h, target_w, dtype, device)
+    if source is None:
+        raise ValueError(f"segment has no decodable frames: {segment_path}")
+    return video_encoder(source)
+
+
 def _image_conds_for_keyframes(
     images: list[ImageConditioningInput],
     height: int,
@@ -288,25 +320,28 @@ def _image_conds_for_keyframes(
     video_encoder,
     dtype: torch.dtype,
     device: torch.device,
+    segment_path: str | None = None,
 ):
-    # v1.11.5: this helper used to route consecutive-from-0 keyframe patterns
-    # through `image_conditionings_by_replacing_latent` to hard-pin all three
-    # chain keyframes. That was a mistake — `VideoConditionByLatentIndex` takes
-    # a LATENT-frame index, not a pixel-frame index. LTX's causal VAE maps
-    # latent 0 → pixel 0, latent 1 → pixels 1..8, latent 2 → pixels 9..16, so
-    # pinning latents [0,1,2] with three single-image latents produces a
-    # 17-pixel-frame "slideshow" at the clip head (pixel frames 1-8 all held
-    # to kf[1], 9-16 all held to kf[2]). Verified against real output at RMSE
-    # 4.47 of pixel frame 2 vs kf[1] and 9.27 of pixel frame 15 vs kf[2].
+    # v1.12: if a segment_path is provided, VAE-encode the multi-frame segment
+    # and pin target's head latents via a single VideoConditionByLatentIndex at
+    # latent_idx=0. This is the proper fix for chain conditioning — it gives
+    # true multi-pixel-frame hard-pin (2 latent frames = pixel frames 0-8)
+    # instead of v1.11.5's single-frame pin. Unlike stacking single-image
+    # encodings (v1.11.3's broken approach — held 17 pixel frames as a
+    # slideshow because latent 1 covers pixel 1-8 etc.), encoding a real video
+    # segment gives the VAE real inter-frame motion via its causal temporal
+    # convolutions, producing a coherent multi-latent-frame tensor.
     #
-    # Correct hard-pin for consecutive pixel frames requires encoding a
-    # multi-frame video segment (not three separate images) and pinning via a
-    # single `VideoConditionByLatentIndex` with a multi-frame latent. That's a
-    # bigger architectural change — see docs/debug-v1.11.3-chain-conditioning.md
-    # follow-ups. Until then, fall through to `combined_image_conditionings`
-    # (LatentIndex pin at frame 0 + KeyframeIndex soft-guide at frames 1, 2) —
-    # the classical LTX semantic, which gives clean pixel-frame-0 pinning and
-    # accepts soft-guide drift on frames 1, 2 as the known trade-off.
+    # Fallback: if segment_path is None, use the classical `combined_image_conditionings`
+    # helper (LatentIndex hard-pin at frame 0 + KeyframeIndex soft-guide at
+    # frames 1, 2). The v1.11.3 → v1.11.5 story is in
+    # docs/debug-v1.11.3-chain-conditioning.md.
+    if segment_path is not None:
+        seg_latent = _build_segment_conditioning_latent(
+            segment_path=segment_path, target_h=height, target_w=width,
+            dtype=dtype, device=device, video_encoder=video_encoder,
+        )
+        return [VideoConditionByLatentIndex(latent=seg_latent, latent_idx=0, strength=1.0)]
     return combined_image_conditionings(
         images=images, height=height, width=width,
         video_encoder=video_encoder, dtype=dtype, device=device,
@@ -1490,9 +1525,10 @@ class SplitModelManager:
     @_with_oom_recovery
     @torch.inference_mode()
     def _run_i2v(
-        self, worker: DenoiserWorker, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
+        self, worker: DenoiserWorker, prompt: str, keyframes: list[dict] | None, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool,
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
+        segment_path: str | None = None,
         on_prompt_enhanced: Callable[[str], None] | None = None,
         on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
@@ -1501,7 +1537,7 @@ class SplitModelManager:
         is_fast = model == "ltx-2-3-fast"
         images = [
             ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"], crf=0)
-            for kf in keyframes
+            for kf in (keyframes or [])
         ]
 
         logger.warning(
@@ -1534,7 +1570,7 @@ class SplitModelManager:
         # Stage 1
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
         video_encoder = worker.ledger.video_encoder()
-        stage_1_cond = _image_conds_for_keyframes(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_1_cond = _image_conds_for_keyframes(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device, segment_path=segment_path)
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
@@ -1592,7 +1628,7 @@ class SplitModelManager:
         del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
-        stage_2_cond = _image_conds_for_keyframes(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_2_cond = _image_conds_for_keyframes(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device, segment_path=segment_path)
 
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
@@ -1665,6 +1701,7 @@ class SplitModelManager:
         on_progress=None, user_lora=None, enhance_prompt: bool = False,
         model: str = "ltx-2-3-pro",
         keyframes: list[dict] | None = None,
+        segment_path: str | None = None,
         on_prompt_enhanced: Callable[[str], None] | None = None,
         on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
@@ -1734,7 +1771,7 @@ class SplitModelManager:
         # Stage 1: video-only denoising (audio frozen)
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
         video_encoder = worker.ledger.video_encoder()
-        stage_1_cond = _image_conds_for_keyframes(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_1_cond = _image_conds_for_keyframes(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device, segment_path=segment_path)
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
@@ -1796,7 +1833,7 @@ class SplitModelManager:
         del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
-        stage_2_cond = _image_conds_for_keyframes(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_2_cond = _image_conds_for_keyframes(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device, segment_path=segment_path)
 
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
@@ -2264,10 +2301,11 @@ class SplitModelManager:
             worker.lock.release()
 
     async def generate_image_to_video(
-        self, prompt: str, keyframes: list[dict], model: str, width: int, height: int,
+        self, prompt: str, keyframes: list[dict] | None, model: str, width: int, height: int,
         num_frames: int, fps: float, seed: int, generate_audio: bool = True,
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
         enhance_prompt: bool = False,
+        segment_path: str | None = None,
         on_prompt_enhanced: Callable[[str], None] | None = None,
         on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
@@ -2281,6 +2319,7 @@ class SplitModelManager:
                     self._run_i2v, worker, prompt, keyframes, model, width, height,
                     num_frames, fps, seed, generate_audio, on_progress, user_lora,
                     enhance_prompt,
+                    segment_path=segment_path,
                     on_prompt_enhanced=on_prompt_enhanced,
                     on_cancel_check=on_cancel_check,
                 ),
@@ -2294,6 +2333,7 @@ class SplitModelManager:
         on_progress=None, lora_path: str | None = None, lora_strength: float = 1.0,
         enhance_prompt: bool = False,
         keyframes: list[dict] | None = None,
+        segment_path: str | None = None,
         on_prompt_enhanced: Callable[[str], None] | None = None,
         on_cancel_check: Callable[[], bool] | None = None,
     ) -> bytes:
@@ -2308,6 +2348,7 @@ class SplitModelManager:
                     width, height, num_frames, fps, seed, on_progress, user_lora,
                     enhance_prompt, model,
                     keyframes=keyframes,
+                    segment_path=segment_path,
                     on_prompt_enhanced=on_prompt_enhanced,
                     on_cancel_check=on_cancel_check,
                 ),
