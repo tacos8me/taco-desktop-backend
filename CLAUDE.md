@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.9.9 (2026-04-20).
+**Version**: v1.10.0 (2026-04-20).
 
 ## Quick lookup
 
@@ -22,8 +22,8 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 | Shipped-feature archaeology | `CHANGELOG.md` + `AGENTS.md` (per-version deltas) |
 
 ## Structure
-- `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode + remote pool, dashboard. ~3.9 k lines; key anchors: `_enter_turbo_mode` (~:1712), `_exit_turbo_mode` (~:1795), `_scale_remote_pool` (~:1604), `_dispatch_job` (~:320), `_dispatch_job_turbo` / `_dispatch_job_turbo_remote` (~:1520/1666), `v2_video_outpaint` (~:2685)
-- `split_model_manager.py` — Single-GPU LTX pipeline: SingleGPUModelBuilder + CachingModelFactory, CFG++ sampler (default), BatchSplitAdapter for multi-pass batching. Houses all `_run_*` methods (t2v / i2v / a2v / retake / outpaint / HQ). ~2.2 k lines.
+- `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode + remote pool, dashboard. ~3.9 k lines; key anchors: `_enter_turbo_mode` (~:1712), `_exit_turbo_mode` (~:1795), `_scale_remote_pool` (~:1604), `_dispatch_job` (~:320), `_dispatch_job_turbo` / `_dispatch_job_turbo_remote` (~:1520/1666), `v2_video_outpaint` (~:2685). v1.10.0 adds `POST /v2/video/extract-frames` — PyAV-based multi-frame extractor, lossless PNG output, bearer + capability-URL security (mirrors `/uploads/get/{id}` from v1.9.1), bounded concurrency via `_FRAME_EXTRACT_SEMAPHORE(2)` with a 30 s timeout, output bytes counted against `PER_KEY_UPLOAD_BYTES_PER_DAY`. Also: `AudioToVideoRequest.keyframes: list[KeyframeInput] | None` now matches i2v (multi-keyframe support; the legacy `image_uri`+`image_strength` single-keyframe path is unchanged).
+- `split_model_manager.py` — Single-GPU LTX pipeline: SingleGPUModelBuilder + CachingModelFactory, CFG++ sampler (default), BatchSplitAdapter for multi-pass batching. Houses all `_run_*` methods (t2v / i2v / a2v / retake / outpaint / HQ). ~2.2 k lines. v1.10.0: `_run_a2v` accepts the resolved keyframes list via `ImageConditioningInput` for multi-frame chain conditioning.
 - `flux_manager.py` — Flux 2 image generation: per-request LoRA adapter mode on cuda:0, bf16, `enable_model_cpu_offload` on Dev
 - `ace_client.py` — ACE music generation sidecar client (httpx → ace-step on cuda:1:8001)
 - `chat_manager.py` — Proxies /v1/chat/completions to llama-swap (supports per-request model override for vision ranking)
@@ -35,7 +35,7 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - `history_store.py` — SQLite-backed per-API-key generation history with thumbnails; schema v2 (params_json, gen_config_json, seed, enhanced_prompt)
 - `lora_registry.py` — Flat-dir LTX LoRA storage with registry.json index. IC-LoRA outpaint LoRA lives here with `strategy="ic_lora_outpaint"`.
 - `flux_lora_registry.py` — Flux LoRA folder-drop discovery (filesystem-only, no registry.json)
-- `composition_store.py` / `export_handler.py` — Composition export (video concat / transcode)
+- `composition_store.py` / `export_handler.py` — Composition export (video concat / transcode). v1.10.0: per-clip `tailTrimFrames: int` (default 0) trims the last N frames of each input via `trim=end_frame=<kept>` prepended before the v1.9.8 `setpts=PTS-STARTPTS,format=yuv420p` normalization. Trimmed durations cascade into the v1.9.6 beat-gap atrim and the v1.9.9 force-IDR seam cumsum so audio slicing and keyframe timestamps stay aligned. Last clip and xfade branch always skip trim; single-clip exports zero it out.
 - `nvfp4_loader.py` — NVFP4→BF16 dequantizer for Sikaworld Gemma variant
 - `dashboard.html` — GPU management dashboard SPA (served at /dashboard). Advanced LTX controls, Flux config, **Remote Pool** button grid (0..MAX), turbo toggle, GPU telemetry.
 - `config.py` — Paths, model mapping, device config, resolution tables, TF32 settings, env-var sidecar toggles (`LOAD_FLUX`, `LOAD_ACE`, `LOAD_JOYAI`, `LOAD_ERNIE`, `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_MAX_WORKERS`, etc.)

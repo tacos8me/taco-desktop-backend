@@ -2,7 +2,7 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.9.9 (2026-04-20)
+**Version**: v1.10.0 (2026-04-20)
 **Public API base URL**: `https://api.noodlefinger.io` *(Cloudflare-proxied — `taco.noodlefinger.io` was retired 2026-04-18, DNS no longer resolves)*
 
 ## Features
@@ -83,6 +83,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | GET/POST | `/v1/system/pool` | Get state + scale multi-provider remote pool *(v1.6 modal, v1.9 runpod)* |
 | POST | `/v1/system/pool/remote-workers/{provider}` | Scale one provider (modal\|runpod) *(v1.9.0)* |
 | GET | `/uploads/get/{upload_id}` | Read back an upload *(v1.9.1)* |
+| POST | `/v2/video/extract-frames` | Extract N frames from a video as storage:// PNGs (v1.10.0) |
 | GET/POST | `/v1/system/sampler` | Get/toggle CFG++ vs Euler sampler |
 | GET/POST | `/v1/system/config` | Get/update all generation parameters |
 | POST | `/v1/system/pause` | Evict all models, free VRAM |
