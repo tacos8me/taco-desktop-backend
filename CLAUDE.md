@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.11.2 (2026-04-20).
+**Version**: v1.11.3 (2026-04-20).
 
 ## Quick lookup
 
@@ -23,7 +23,7 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
 ## Structure
 - `server.py` — FastAPI app, all HTTP endpoints, job queue dispatch, history + approved-images APIs, batch scheduler, turbo mode + remote pool, dashboard. ~3.9 k lines; key anchors: `_enter_turbo_mode` (~:1712), `_exit_turbo_mode` (~:1795), `_scale_remote_pool` (~:1604), `_dispatch_job` (~:320), `_dispatch_job_turbo` / `_dispatch_job_turbo_remote` (~:1520/1666), `v2_video_outpaint` (~:2685). v1.10.0 adds `POST /v2/video/extract-frames` — PyAV-based multi-frame extractor, lossless PNG output, bearer + capability-URL security (mirrors `/uploads/get/{id}` from v1.9.1), bounded concurrency via `_FRAME_EXTRACT_SEMAPHORE(2)` with a 30 s timeout, output bytes counted against `PER_KEY_UPLOAD_BYTES_PER_DAY`. Also: `AudioToVideoRequest.keyframes: list[KeyframeInput] | None` now matches i2v (multi-keyframe support; the legacy `image_uri`+`image_strength` single-keyframe path is unchanged).
-- `split_model_manager.py` — Single-GPU LTX pipeline: SingleGPUModelBuilder + CachingModelFactory, CFG++ sampler (default), BatchSplitAdapter for multi-pass batching. Houses all `_run_*` methods (t2v / i2v / a2v / retake / outpaint / HQ). ~2.2 k lines. v1.10.0: `_run_a2v` accepts the resolved keyframes list via `ImageConditioningInput` for multi-frame chain conditioning.
+- `split_model_manager.py` — Single-GPU LTX pipeline: SingleGPUModelBuilder + CachingModelFactory, CFG++ sampler (default), BatchSplitAdapter for multi-pass batching. Houses all `_run_*` methods (t2v / i2v / a2v / retake / outpaint / HQ). ~2.2 k lines. v1.10.0: `_run_a2v` accepts the resolved keyframes list via `ImageConditioningInput` for multi-frame chain conditioning. v1.11.3: module-level `_image_conds_for_keyframes` helper auto-detects chain pattern (consecutive `frame_idx` starting at 0) and routes to `image_conditionings_by_replacing_latent` (hard-pins every frame via `VideoConditionByLatentIndex`). Classical sparse keyframes ([0, 24, 48] first/middle/last) fall through to `combined_image_conditionings` (LatentIndex at frame 0 + KeyframeIndex soft-guide at frames 1+). Applied at i2v / a2v stage 1 + 2 (4 call sites); t2v and outpaint unchanged.
 - `flux_manager.py` — Flux 2 image generation: per-request LoRA adapter mode on cuda:0, bf16, `enable_model_cpu_offload` on Dev
 - `ace_client.py` — ACE music generation sidecar client (httpx → ace-step on cuda:1:8001)
 - `chat_manager.py` — Proxies /v1/chat/completions to llama-swap (supports per-request model override for vision ranking)

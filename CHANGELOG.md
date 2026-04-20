@@ -2,6 +2,36 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.11.3 — 2026-04-20
+
+### Fix: chain conditioning actually pins all 3 head keyframes (root cause across v1.10.0 → v1.11.2)
+
+User report after v1.11.2: first seam (clip 0→1) excellent, second seam (clip 1→2) good, third seam (clip 2→3) step-changes to an entirely different scene. Initial keyframe "vaguely resembles" the output by clip 3. Every fix from v1.9.6 through v1.11.2 addressed a real adjacent problem but left the deeper cause untouched.
+
+Root cause found in `ltx_pipelines.utils.helpers.combined_image_conditionings` (the function taco-backend has been calling for all multi-keyframe a2v/i2v paths since v1.10.0): it **branches on `frame_idx == 0`** and uses two semantically different conditioning mechanisms.
+
+- **Frame 0** → `VideoConditionByLatentIndex`: directly replaces the main video's latent tokens at position 0 and sets denoise_mask = 1 − strength. At strength=1.0, the denoise mask is 0 and the output at frame 0 IS the input image, pinned across every sigma step.
+- **Frames 1+** → `VideoConditionByKeyframeIndex`: appends keyframe tokens as **auxiliary context** (torch.cat to the latent state) with positional encoding at `frame_idx / fps`. The main video's latent at frame positions 1, 2 is **still noise** that gets denoised from scratch; the keyframe tokens only provide soft attention guidance. At strength=1.0 the keyframe tokens themselves stay clean, but the output frames are free-denoised.
+
+This is the classical LTX sparse-keyframes semantic (first/middle/last at [0, 24, 48]) — correct for that use case. For our **chain conditioning** use case, where the 3 head keyframes at [0, 1, 2] are meant to be exact reproductions of the prior clip's tail, only frame 0 actually pinned. Frames 1, 2 drifted softly. That drift — compounded across three chain hops — is exactly the user's observed cliff at seam 2 and the "initial keyframe vaguely resembles" subject drift.
+
+Fix: `ltx_pipelines/helpers.py` already ships a correct helper — `image_conditionings_by_replacing_latent` (lines 164–191) uses `VideoConditionByLatentIndex` for **every** frame with `latent_idx = img.frame_idx`. All keyframes become hard pins at every sigma step.
+
+`split_model_manager.py` gains a module-level `_image_conds_for_keyframes` helper that auto-detects chain pattern (consecutive `frame_idx` starting at 0) and routes to the right LTX helper:
+- Chain pattern (`[0, 1, 2]`, `[0, 1]`, `[0]`) → `image_conditionings_by_replacing_latent` (hard pin on all).
+- Sparse pattern (`[0, 24, 48]` first/middle/last) → `combined_image_conditionings` (classical LTX semantic preserved).
+
+Scope: `_run_a2v` and `_run_i2v`, stage 1 + stage 2 (4 call sites). t2v (`images=[]`) and outpaint (empty images + VideoConditionByReferenceLatent) paths are unchanged.
+
+Detection is strict — `[img.frame_idx for img in images] == list(range(len(images)))` — so i2v first/middle/last users keep classical behavior.
+
+### Back-compat
+- Single-keyframe requests (frame 0 only): both helpers produce identical output (LatentIndex at 0). Zero behavioral change.
+- i2v sparse first/middle/last (e.g., [0, 24, 48]): pattern not chain → combined_image_conditionings → classical LTX semantic preserved.
+- Chain-mode a2v/i2v (e.g., [0, 1, 2]): all frames now hard-pinned. Subject should hold across seams. Long-chain grounding (passing the original user image periodically) remains a frontend concern.
+
+See `docs/debug-v1.11.3-chain-conditioning.md` for the full investigation trail: v1.9.6 → v1.9.9 encoder-layer fixes, v1.10.0 content-discontinuity hypothesis, v1.10.1 strength regression, v1.11.0 / v1.11.1 tailTrimFrames churn, v1.11.2 audioDurationSec decoupling, and the actual root cause.
+
 ## v1.11.2 — 2026-04-20
 
 ### Feat: per-clip `audioDurationSec` decouples audio atrim from video trim

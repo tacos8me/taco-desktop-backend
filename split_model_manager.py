@@ -97,6 +97,7 @@ from ltx_pipelines.utils.helpers import (
     combined_image_conditionings,
     create_noised_state,
     generate_enhanced_prompt,
+    image_conditionings_by_replacing_latent,
     post_process_latent,
 )
 from ltx_pipelines.utils.media_io import (
@@ -278,6 +279,41 @@ def _build_outpaint_reference_latent(
     )
     del source
     return video_encoder(letterboxed)
+
+
+def _image_conds_for_keyframes(
+    images: list[ImageConditioningInput],
+    height: int,
+    width: int,
+    video_encoder,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    # v1.11.3: ltx-pipelines' `combined_image_conditionings` uses two different
+    # mechanisms — VideoConditionByLatentIndex (hard latent replacement) for
+    # frame 0 and VideoConditionByKeyframeIndex (auxiliary context tokens with
+    # soft attention guidance) for frames 1+. That's the classical LTX sparse-
+    # keyframes semantic (first/middle/last @ [0,24,48]) and it's correct there.
+    #
+    # For chain conditioning — 3 consecutive head frames at [0,1,2] meant to be
+    # exact reproductions of the previous clip's tail — we need hard pinning on
+    # all 3, not just frame 0. Route consecutive-from-0 patterns through
+    # `image_conditionings_by_replacing_latent`, which uses LatentIndex for
+    # every frame. Sparse patterns fall through to the classical helper.
+    #
+    # See docs/debug-v1.11.3-chain-conditioning.md for the investigation trail.
+    if images:
+        indices = [img.frame_idx for img in images]
+        if indices == list(range(len(indices))):
+            return image_conditionings_by_replacing_latent(
+                images=images, height=height, width=width,
+                video_encoder=video_encoder, dtype=dtype, device=device,
+            )
+    return combined_image_conditionings(
+        images=images, height=height, width=width,
+        video_encoder=video_encoder, dtype=dtype, device=device,
+    )
+
 
 # ---------------------------------------------------------------------------
 # CachingModelFactory — cached models with lazy-load from SingleGPUModelBuilder
@@ -1494,7 +1530,7 @@ class SplitModelManager:
         # Stage 1
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
         video_encoder = worker.ledger.video_encoder()
-        stage_1_cond = combined_image_conditionings(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_1_cond = _image_conds_for_keyframes(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
@@ -1552,7 +1588,7 @@ class SplitModelManager:
         del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
-        stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_2_cond = _image_conds_for_keyframes(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)
@@ -1688,7 +1724,7 @@ class SplitModelManager:
         # Stage 1: video-only denoising (audio frozen)
         stage_1_shape = VideoPixelShape(batch=1, frames=num_frames, width=width // 2, height=height // 2, fps=fps)
         video_encoder = worker.ledger.video_encoder()
-        stage_1_cond = combined_image_conditionings(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_1_cond = _image_conds_for_keyframes(images=images, height=stage_1_shape.height, width=stage_1_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
@@ -1750,7 +1786,7 @@ class SplitModelManager:
         del stage_1_latent
 
         stage_2_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=fps)
-        stage_2_cond = combined_image_conditionings(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
+        stage_2_cond = _image_conds_for_keyframes(images=images, height=stage_2_shape.height, width=stage_2_shape.width, video_encoder=video_encoder, dtype=dtype, device=device)
 
         if not is_fast:
             worker.ensure_transformer("dev_lora", user_lora=user_lora)

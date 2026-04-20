@@ -2,7 +2,7 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.11.2 (2026-04-20)
+**Version**: v1.11.3 (2026-04-20)
 **Public API base URL**: `https://api.noodlefinger.io` *(Cloudflare-proxied — `taco.noodlefinger.io` was retired 2026-04-18, DNS no longer resolves)*
 
 ## Features
