@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.11.0 (2026-04-20).
+**Version**: v1.11.1 (2026-04-20).
 
 ## Quick lookup
 

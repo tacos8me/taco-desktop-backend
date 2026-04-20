@@ -2,6 +2,29 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.11.1 — 2026-04-20
+
+### Fix: revert v1.11.0's `tailTrimFrames=6` recommendation — audio was audibly clipping at every seam
+
+v1.11.0 bumped the FE spec from `tailTrimFrames=3` → `6` to eliminate a ~83 ms visual stutter at every seam. User testing immediately surfaced a worse symptom: audible audio dropout at every seam (~208 ms of song silently skipped per cut). Ultrathink trade-off analysis:
+
+| `tailTrimFrames` | effective video/clip (49 fr @ 24 fps) | audio dropout per seam (2.0 s beat gap) | visible video seam | verdict |
+|---|---|---|---|---|
+| 0 (legacy) | 2.04 s | 0 ms | hard cut (full content discontinuity) | not chain-compatible |
+| **3** (v1.10.0, v1.11.1) | 1.92 s | 83 ms (sub-threshold) | 2-frame backwards jump (83 ms, sub-threshold) | **minimum total perception** |
+| 6 (v1.11.0 briefly) | 1.79 s | **208 ms (audible)** | 0 ms | trades one sub-threshold artifact for one audible one |
+| clamp removed | 1.79 s | 0 ms | 0 ms | visual cut drifts earlier than the beat — 0.83 s off by seam 4, far worse |
+
+Root cause of the v1.11.0 audio dropout: the v1.9.6 beat-gap atrim slice is `min(gap, effective_duration)`. With `tailTrimFrames=6` the effective duration drops to 1.7917 s (below the 2.0 s gap), and the 208 ms of song between the two clamps to `effective` instead of `gap`, never reaches the timeline at every seam. The clamp is load-bearing (removing it drifts the visual cut progressively earlier than the beat — by seam 4 the cut is 0.83 s BEFORE the beat, much worse than 208 ms of silence). The fundamental math at 49 frames / 24 fps / 2.0 s beats cannot produce a perfectly seamless result on both axes simultaneously — one axis takes the hit; `tailTrimFrames=3` splits it 83/83 ms across both, below perceptual threshold on each.
+
+Fix is spec-revert only, zero code change:
+- `docs/handover-frontend-v1.10-chain.md` reverts `tailTrimFrames=3` throughout, adds the trade-off table + "why 6 sounded clipped" + "why 3 is the sweet spot" sections, migration note (6 → 3).
+- `docs/API.md` clip schema example `tailTrimFrames: 6 → 3`; prose updated to document the audio-clipping trap for anyone who re-discovers this trade-off.
+- `CLAUDE.md` / `README.md` version bump to v1.11.1.
+- Pre-existing saved compositions with `tailTrimFrames=6` will still export (just with the 208 ms audio dropout symptom users reported); re-save to apply `3`, or add a FE one-shot migration bumping 6 → 3 on load.
+
+Backward compat: all prior behavior preserved. Byte-identical export for legacy compositions (no `tailTrimFrames`). No API shape changes in v1.11.1.
+
 ## v1.11.0 — 2026-04-20
 
 ### Stabilization — tailTrimFrames spec correction + v1.10.x rollup
