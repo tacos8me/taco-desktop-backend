@@ -1,6 +1,119 @@
-# v1.11.2 — Frontend Chain Conditioning Spec (noodle-v)
+# v1.12 — Frontend Chain Conditioning Spec (noodle-v)
 
-> Handover doc. Backend v1.10.0 shipped the endpoints; v1.10.1 fixed the a2v strength default; v1.11.0 briefly recommended `tailTrimFrames=6` to eliminate a tiny visual stutter but traded it for 208 ms of audible per-seam audio dropout; v1.11.1 reverted to `tailTrimFrames=3` as the minimum-total-perception config while the backend remained clamp-based. **v1.11.2 adds the FE-designed fix: a new optional per-clip `audioDurationSec` field that decouples the audio atrim from the video `effective_duration`** — enabling `tailTrimFrames=6` (0 ms visual seam) AND full-song audio continuity simultaneously. The two fields serve independent concerns and do not alias each other. FE now runs on the v1.11.2 path; the v1.11.1 path stays as an unconditionally-supported legacy fallback.
+> Handover doc. **v1.12 is the current recommended path** and replaces v1.11.5's 3-PNG-keyframes flow with a single video-segment conditioning. v1.11.5 pinned only 1 pixel frame per seam, which drifted cliff-wise at seam 2+. v1.12 pins 9 consecutive pixel frames via a single VAE-encoded multi-frame latent and eliminates subject drift at the seam. See the "v1.12 flow" section below for the FE change. The v1.11.5 keyframes path stays as an unconditionally-supported legacy fallback — sending 3 PNG keyframes still works, it just has the known drift.
+>
+> Backend version history: v1.10.0 shipped the original multi-keyframe endpoints; v1.10.1 fixed the a2v strength default; v1.11.0→v1.11.2 churned on audio-video timing (beat-gap atrim clamp, eventually decoupled via `audioDurationSec`); v1.11.3→v1.11.5 discovered and reverted a wrong-granularity routing fix after v1.11.3's "slideshow" regression. v1.12 is the architecturally correct chain conditioning.
+
+## v1.12 flow (RECOMMENDED — migrate here)
+
+**What changed**: instead of `POST /v2/video/extract-frames` → 3 PNG URIs → 3 keyframes on the next a2v/i2v, you now call `POST /v2/video/extract-segment` → 1 MP4 URI → pass as `segment_uri` on the next a2v/i2v. Backend VAE-encodes the 9-frame segment as a multi-latent-frame tensor and hard-pins 9 consecutive target pixel frames at every sigma step.
+
+**Endpoint**: `POST /v2/video/extract-segment` (new)
+
+```jsonc
+// request
+{
+  "video_uri":   "storage://<32hex>",
+  "start_frame": <int>,            // 0-indexed; FE computes: num_frames - 9
+  "num_frames":  9                 // must be 8k+1 ∈ {9, 17, 25, 33}; v1.12 ships with 9
+}
+
+// response (200)
+{
+  "segment_uri": "storage://<32hex>",
+  "width":       <int>,
+  "height":      <int>,
+  "num_frames":  9,
+  "fps":         <float>
+}
+```
+
+Errors (same shape as `/v2/video/extract-frames`):
+- `404 video_not_found` — source MP4 not resolvable.
+- `422 invalid_num_frames` — not 8k+1 or not in {9, 17, 25, 33}.
+- `422 segment_out_of_range` — `start_frame + num_frames` exceeds video length.
+- `504 pyav_timeout` — decode/encode took > 30 s.
+- `429 upload_quota_exceeded` — `PER_KEY_UPLOAD_BYTES_PER_DAY` cap hit.
+
+**Request field**: `AudioToVideoRequest.segment_uri: string | null` and `ImageToVideoRequest.segment_uri: string | null`. Mutually exclusive with `image_uri` and `keyframes` (3-way exclusion enforced by a Pydantic validator — sending two returns 422).
+
+**FE flow (MusicVideoStore / useMusicVideoOrchestrator)**:
+
+1. Generate clip 0 normally via `image_uri` (user image) or no image.
+2. On clip 0 completion: read `num_frames` from history metadata. Compute `start_frame = num_frames - 9`.
+3. `POST /v2/video/extract-segment { video_uri: clip0_video, start_frame, num_frames: 9 }` → get `segment_uri`.
+4. Submit clip 1 via `POST /v2/audio-to-video` (or `/v2/image-to-video`) with `segment_uri: <from step 3>`. Do NOT set `keyframes` or `image_uri` (validator rejects mixed modes).
+5. Repeat for every subsequent clip. Final clip submission looks identical to earlier chained clips (it just has no successor).
+6. On composition save: set `tailTrimFrames=9` on every non-final clip (because 9 pixel frames of the prior clip are re-shown as the follower's pinned head). Final clip: `tailTrimFrames=0`. `chainMode="seamless-segment"` at the composition root.
+
+**Composition clip schema addition** (all other fields unchanged from v1.11.2):
+
+```jsonc
+{
+  "historyId":        "h_abc",
+  "sequenceIndex":    0,
+  "duration":         2.042,     // LTX 8k+1 raw, unchanged
+  "audioStart":       0.0,       // unchanged
+  "tailTrimFrames":   9,         // v1.12: 9 on non-final clips (was 6 in v1.11.2)
+  "audioDurationSec": 2.0,       // unchanged — decouples audio slice from video effective
+  "segmentUri":       "storage://..."  // v1.12 NEW: the segment the FOLLOWER conditions on
+}
+```
+
+`segmentUri` on a clip represents the segment extracted from THAT clip's tail, consumed by the next clip. Purely informational for audit / re-export; backend doesn't re-extract.
+
+**Root-level composition field**:
+
+```jsonc
+{ "chainMode": "seamless-segment" }     // v1.12 flag, distinguishes from legacy "seamless"
+```
+
+Valid values:
+- `"hardcut"` — no conditioning, full-clip cuts. Unchanged.
+- `"seamless"` — v1.11.5 legacy, 3 PNG keyframes path. Still supported.
+- `"seamless-segment"` — v1.12 path. Use for all new MusicVideo compositions.
+
+**Clip-length guidance** (FE choice, backend honors either):
+
+- **49-frame LTX clips (2.04 s, beat-gap 2.0 s)** — works. `tailTrimFrames=9` leaves 40 visible pixel frames = 1.667 s per clip. Against 2.0 s beats: 333 ms audio-video drift per seam (125 ms worse than v1.11.2). Acceptable for 2-3 clip comps.
+- **97-frame LTX clips (4.04 s, beat-gap 2.0 s, 2 beats/clip)** — RECOMMENDED for 3+ clip comps. `tailTrimFrames=9` leaves 88 visible pixel frames = 3.667 s per clip. Subject identity held cleanly for 3.67 s per clip instead of 1.67 s → dramatically less drift across long chains. Simple composition math: 2 beats of audio per video clip.
+
+**Strength**: hardcoded 1.0 on the backend. No slider.
+
+**Error handling**:
+- `extract-segment 422 segment_out_of_range`: halt chain with a user-facing toast "Clip N tail unavailable — regenerate or use a shorter chain". Don't fall back silently — segment continuity is the whole point.
+- `extract-segment 429`: surface as "upload quota reached — wait or upgrade tier".
+- `a2v/i2v 422` on `segment_uri`: backend not on v1.12 yet. Auto-downgrade in-memory to v1.11.5 keyframes path for that seam, warn user "chain degraded (legacy mode)".
+
+**Feature flag**: gate FE UI behind `flags.v112_seamless_segment`. Default off until backend is verified on prod + FE does visual regression testing. New comps default `chainMode="seamless-segment"` once flag is on; legacy loaded comps keep their existing `chainMode`.
+
+**Acceptance tests**:
+
+1. 5-clip seamless-segment happy path — asserts 4 `extract-segment` calls + `segment_uri` on each non-first submission + `tailTrimFrames=9` on non-final clips + export length within 1 frame of `sum(clip_durations) − 9 * (N-1) / fps`.
+2. Legacy "seamless" (keyframes, v1.11.5) — byte-identical export to v1.11.5 baseline.
+3. Legacy "hardcut" — byte-identical to v1.9.9 baseline.
+4. `extract-segment 422` halt — toast shown, partial composition preserved.
+5. Seamless-segment → hardcut toggle mid-authoring — next submission uses single-keyframe form.
+6. **Visual seam check** — frame-scrub the exported MP4 at every seam; target clip's pixel frames 0-8 should visually match the prior clip's last 9 frames. No "slideshow" artifact (v1.11.3) or subject cliff (v1.11.5).
+
+**Known limitation**: LTX's causal VAE replicates the segment's frame 0 for padding, so the encoded 9-frame segment's latents aren't bit-identical to what the prior clip's full-length encoding produced for the same frames. Residual RMSE 1-3 on a 0-255 scale at the seam — visually imperceptible in most content. If you scrub and see visible blink at pixel 0, file it — v1.13 latent-reuse path eliminates it entirely.
+
+**Migration from v1.11.5**:
+
+- Keep `flags.v110_seamless_chain` controlling the overall "seamless" UI.
+- Add `flags.v112_seamless_segment` on top. When ON:
+  - Route to `extract-segment` instead of `extract-frames`.
+  - Submit with `segment_uri` instead of `keyframes`.
+  - Save with `tailTrimFrames=9` + `chainMode="seamless-segment"`.
+- Legacy v1.11.5 comps on disk (with `keyframes` + `tailTrimFrames` ∈ {3, 6}) still load + export correctly. No migration required. Optionally add a "re-chain" button that re-extracts segments and saves in the v1.12 shape.
+
+---
+
+## v1.11.2 legacy path (still supported)
+
+The v1.11.2 section below documents the prior 3-PNG keyframes flow with `tailTrimFrames` + `audioDurationSec`. It's fully supported by the backend — sending 3 keyframes + tailTrimFrames=3/6 still works as before. **New compositions should use the v1.12 flow above.**
+
+> Handover doc (historical). Backend v1.10.0 shipped the endpoints; v1.10.1 fixed the a2v strength default; v1.11.0 briefly recommended `tailTrimFrames=6` to eliminate a tiny visual stutter but traded it for 208 ms of audible per-seam audio dropout; v1.11.1 reverted to `tailTrimFrames=3` as the minimum-total-perception config while the backend remained clamp-based. **v1.11.2 adds the FE-designed fix: a new optional per-clip `audioDurationSec` field that decouples the audio atrim from the video `effective_duration`** — enabling `tailTrimFrames=6` (0 ms visual seam) AND full-song audio continuity simultaneously. The two fields serve independent concerns and do not alias each other. FE now runs on the v1.11.2 path; the v1.11.1 path stays as an unconditionally-supported legacy fallback.
 
 ## Goal
 
