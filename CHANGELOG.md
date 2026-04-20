@@ -2,6 +2,24 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.11.4 — 2026-04-20
+
+### Fix: reference images no longer silently H.264-CRF33-compressed before VAE encode
+
+User report post-v1.11.3: a2v with a reference image at `image_strength=1.0` still doesn't reproduce the provided reference — "vaguely resembles" the input even though LTX should be hard-pinning frame 0 at that strength. Root cause: `ltx_pipelines.utils.args.ImageConditioningInput` has a `crf: int = 33` field (`DEFAULT_IMAGE_CRF`) that runs every conditioning image through H.264 encode+decode at CRF 33 inside `load_image_and_preprocess` before VAE encoding. CRF 33 is heavy compression — fine detail, color fidelity, and subject identity all visibly degrade. At strength=1.0 the "pinned" frame 0 becomes `VAE_decode(VAE_encode(CRF33(input)))` instead of what the user sent.
+
+LTX uses CRF 33 during training to match compressed-video statistics, and that's correct for video-frame keyframes (LTX-generated tail frames already went through the MP4 encode-decode pipeline so CRF on top of them doesn't hurt much). For a **user-provided reference image at strength=1.0**, CRF 33 actively fights the "this frame should BE my image" intent.
+
+Fix: construct `ImageConditioningInput(..., crf=0)` everywhere taco-backend builds conditioning from keyframes (i2v + a2v, covering both the initial reference-image path and the chain-conditioning path). PNGs from `/v2/video/extract-frames` are lossless so chain frames also benefit — no roundtrip compression.
+
+Also adds a diagnostic log line at a2v / i2v dispatch: `a2v keyframes=[(0, 1.0)] model=ltx-2-3-pro frames=49`. Lets us (and FE) verify actual strengths hitting the pipeline without having to dump Pydantic bodies. Grep with `journalctl --user -u taco-backend | grep "a2v keyframes"`.
+
+Scope: 2 lines (crf=0 on both ImageConditioningInput constructions) + 2 log lines. No API shape change, no Pydantic field added. Safe, additive, and reversible.
+
+### Ops note for operators
+
+v1.11.x changes only take effect after `systemctl --user restart taco-backend` — Python imports happen at process start, and this chain of releases (v1.10.1 → v1.11.4) requires a restart to pick up. If `/v1/system/gpu` reports uptime older than the v1.11.x commit timestamps (visible in `git log`), the process is running stale code.
+
 ## v1.11.3 — 2026-04-20
 
 ### Fix: chain conditioning actually pins all 3 head keyframes (root cause across v1.10.0 → v1.11.2)

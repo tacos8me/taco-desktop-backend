@@ -1502,9 +1502,15 @@ class SplitModelManager:
         dtype = torch.bfloat16
         is_fast = model == "ltx-2-3-fast"
         images = [
-            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"])
+            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"], crf=0)
             for kf in keyframes
         ]
+
+        logger.info(
+            "i2v keyframes=%s model=%s frames=%d",
+            [(kf["frame_index"], float(kf["strength"])) for kf in keyframes],
+            model, num_frames,
+        )
 
         worker.ensure_transformer("distilled" if is_fast else "dev", user_lora=user_lora)
 
@@ -1681,6 +1687,12 @@ class SplitModelManager:
         else:
             effective_keyframes = []
 
+        logger.info(
+            "a2v keyframes=%s model=%s frames=%d",
+            [(kf["frame_index"], float(kf["strength"])) for kf in effective_keyframes],
+            model, num_frames,
+        )
+
         # Text encoding on GPU:0 (shared encoder) — page in, encode, page out
         self._page_encoder_to_gpu()
         _enhance_image = effective_keyframes[0]["image_path"] if effective_keyframes else None
@@ -1713,7 +1725,7 @@ class SplitModelManager:
             encoded_audio_latent = torch.cat([encoded_audio_latent, pad], dim=2)
 
         images: list[ImageConditioningInput] = [
-            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"])
+            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"], crf=0)
             for kf in effective_keyframes
         ]
 
