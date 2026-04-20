@@ -1431,10 +1431,16 @@ Clip shape (stored in `POST /v2/compositions` body, read back at export time):
   "historyId": "h_abc",
   "sequenceIndex": 0,
   "duration": 2.04,
-  "audioStart": 0.0
+  "audioStart": 0.0,
+  "tailTrimFrames": 6,
+  "fps": 24
 }
 ```
-The clip's `duration` is used verbatim as the `atrim duration=` — keeping it in sync with the video concat eliminates drift. `audioStart` is unvalidated (numeric range is the frontend's contract); negative values or values past the song length will fail ffmpeg with a normal filter-graph error.
+
+- `duration` — used verbatim as the `atrim duration=` for beat-gap audio slicing. Keep it in sync with the actual generated clip length (LTX outputs 8k+1 frames).
+- `audioStart` — unvalidated (numeric range is the frontend's contract). Negative values or values past the song length will fail ffmpeg with a normal filter-graph error.
+- `tailTrimFrames` (v1.10.0+, default 0) — number of frames to drop from the END of this clip at export time. Used by MusicVideo chain mode: the last `safe_tail_count` frames (default 3) are passed as head keyframes to clip N+1, and the preceding `unsafe_tail_count` frames (default 3, Stage-2 artifact zone) are always unreliable. Correct chain value is therefore `tailTrimFrames = safe_tail_count + unsafe_tail_count = 6` (for the default 3-frame chain). Using `3` (drop unsafe only) causes a 2-frame backwards jump + 3-frame repeat at every seam — the "barely noticeable stutter" symptom clarified in v1.11.0. Ignored on the final clip, single-clip exports, and compositions using xfade transitions. Over-trim (`tailTrimFrames >= declared_frames`) clamps to `declared_frames - 1` with a WARN. Backward compat: field omitted or `0` → byte-identical export to v1.9.9.
+- `fps` (v1.10.0+, default 24) — per-clip fps override for the `effective_durations` math above (backend cascades `tailTrimFrames / fps` into beat-gap atrim + force-IDR seam timestamps). LTX is 24 today; include this for future models at different rates.
 
 **Errors** (surfaced as the job's terminal `error` field):
 - `"Audio not found: storage://..."` — the URI doesn't resolve to a file on disk (UploadStore raises `FileNotFoundError`)

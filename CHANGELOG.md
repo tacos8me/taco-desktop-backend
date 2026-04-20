@@ -2,6 +2,30 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.11.0 — 2026-04-20
+
+### Stabilization — tailTrimFrames spec correction + v1.10.x rollup
+
+v1.10.1 restored a2v keyframe strength and fixed an obvious regression, but users still reported a "barely noticeable stutter" at every seam in seamless-chain compositions. Ultrathink review found the cause was a spec bug in the v1.10.0 frontend handover doc:
+
+- The chain sends clip N's frames `[N-6, N-5, N-4]` as keyframes at clip N+1's indices `[0, 1, 2]`.
+- v1.10.0 spec told the frontend to set `tailTrimFrames=3` — drops ONLY the unsafe Stage-2 artifact tail (`[N-3, N-2, N-1]`).
+- Result: clip N still shows `[43, 44, 45]`, then clip N+1 starts with the regenerated versions of the same 3 frames → **2-frame backwards jump + 3-frame content repeat** at every seam.
+- Correct value is `tailTrimFrames = safe_tail_count + unsafe_tail_count = 6`. Viewer then sees a monotonic timeline `… 41, 42 | 43', 44', 45', 46', …` — no repeat, no jump.
+
+Fix is spec-clarification only, zero code change:
+- `docs/handover-frontend-v1.10-chain.md` bumped to v1.11.0, `tailTrimFrames=3 → 6` throughout, added an ASCII timeline diagram, migration note for existing FE implementations.
+- `docs/API.md` clip schema expanded with explicit `tailTrimFrames` math and the bug's history ("using 3 causes a barely noticeable stutter"). `fps` per-clip override documented.
+- Version lock at v1.11.0 to signify v1.10 stabilization.
+
+### v1.10.x rollup (recap of what's on master)
+
+- **v1.10.0** — multi-frame chain conditioning: `POST /v2/video/extract-frames`, `AudioToVideoRequest.keyframes`, `tailTrimFrames` composition field. Root-cause fix for seam glitches.
+- **v1.10.1** — `AudioToVideoRequest.image_strength` default `0.85 → 1.0` (v1.10.0 silently regressed a2v image conditioning by 15% per sigma step).
+- **v1.11.0** — this release. Spec clarification only.
+
+Backward compat: all prior behavior preserved. Legacy compositions (no `tailTrimFrames`) export byte-identical to v1.9.9. Pre-v1.10.0 a2v clients that relied on the default image_strength behavior get the original effective strength=1.0 restored by v1.10.1. No API shape changes in v1.11.0.
+
 ## v1.10.1 — 2026-04-20
 
 ### Fix: a2v keyframe regression — `image_strength` default 0.85 → 1.0
