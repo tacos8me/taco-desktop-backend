@@ -1443,6 +1443,58 @@ The clip's `duration` is used verbatim as the `atrim duration=` — keeping it i
 
 ---
 
+## Video utilities
+
+### `POST /v2/video/extract-frames` (v1.10.0)
+
+Server-side PyAV helper that extracts specific frame indices from a stored MP4 and re-saves each as a lossless PNG upload. Designed to power the multi-frame chain conditioning flow in noodle-v's MusicVideo export (the last N frames of clip i become the head keyframes of clip i+1, eliminating visible seams at composition boundaries).
+
+**Auth:** bearer required.
+
+**Body:**
+```json
+{
+  "video_uri": "storage://<32 hex>",
+  "frame_indices": [43, 44, 45]
+}
+```
+
+- `video_uri` — must match `^storage://[0-9a-f]{32}$` (Pydantic enforced).
+- `frame_indices` — 1..16 non-negative integers. Server sorts + dedupes before decode.
+
+**Response (200):**
+```json
+{
+  "frames": [
+    {"frame_index": 43, "storage_uri": "storage://...", "width": 1920, "height": 1080},
+    {"frame_index": 44, "storage_uri": "storage://...", "width": 1920, "height": 1080},
+    {"frame_index": 45, "storage_uri": "storage://...", "width": 1920, "height": 1080}
+  ]
+}
+```
+
+Frames are returned in sorted-index order. The `storage_uri` values are freshly-minted uploads — fetch them via `GET /uploads/get/{id}` (v1.9.1), feed them back as `KeyframeInput.image_uri` on the next clip's generate request.
+
+**Output format:** PNG (lossless, `compress_level=6`). JPEG would inject compression artifacts that then propagate through the next clip's VAE encoding; PNG keeps the chain reference pixel-accurate.
+
+**Errors:**
+- `404 video_not_found` — `video_uri` doesn't resolve to a file (unknown id or evicted).
+- `422 frame_index_out_of_range: [...]` — one or more requested indices exceed the stream length.
+- `504 pyav_timeout` — decode exceeded the 30 s timeout (malformed / very long file).
+- `500 extract_failed` — PyAV raised during decode, or no video stream present.
+- `429 upload_quota_exceeded` — emitted PNG bytes would push the caller past `PER_KEY_UPLOAD_BYTES_PER_DAY`.
+- `401 "Invalid or missing API key"` — middleware.
+
+**Quota:** Total PNG bytes count against the per-key 24h rolling upload byte budget (same pool as `PUT /uploads/put/{upload_id}` and `POST /v1/loras`).
+
+**Concurrency:** A dedicated `asyncio.Semaphore(2)` caps simultaneous extracts (separate instance from the preview-extract pool, so long extracts can't starve preview polling on running jobs). Extra callers queue until a slot is free.
+
+**Security model:** Capability URL — bearer unlocks the endpoint and attributes quota, but the returned `storage_uri` values are not scoped to the caller's key. Any bearer holder who knows the upload id can fetch it via `GET /uploads/get/{id}`. Matches the v1.9.1 upload-get pattern. The 32-hex uuid4 id is the capability.
+
+**Use case (chain conditioning):** After clip N finishes, extract indices `[N_frames-6, N_frames-5, N_frames-4]` (safe zone, well clear of stage-2 tail-artifact region). Submit clip N+1 with `keyframes=[{image_uri:f0, frame_index:0, strength:1.0}, {image_uri:f1, frame_index:1, strength:1.0}, {image_uri:f2, frame_index:2, strength:1.0}]`. See the Unit C frontend handover spec for full orchestration flow.
+
+---
+
 ## SSE session tokens
 
 ### `POST /v1/sse-token`
@@ -1662,6 +1714,7 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | POST | `/v2/audio-to-video` | yes | Async a2v |
 | POST | `/v2/retake` | yes | Async retake |
 | POST | `/v2/video-outpaint` | yes | **v1.7.0** Async IC-LoRA outpaint |
+| POST | `/v2/video/extract-frames` | yes | **v1.10.0** PyAV frame extractor (chain conditioning) |
 | POST | `/v2/text-to-image` | yes | Async t2i |
 | POST | `/v2/image-to-image` | yes | Async i2i |
 | POST | `/v2/image-edit` | yes | Async edit |
@@ -1688,7 +1741,7 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue export job |
 
-**Total: 71 routes.**
+**Total: 72 routes.**
 
 ---
 

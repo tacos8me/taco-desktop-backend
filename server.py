@@ -22,7 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import config
 import split_model_manager
@@ -664,6 +664,13 @@ app.add_middleware(
 # task (history.save, sidecar subprocesses, etc.).
 _PREVIEW_EXTRACT_SEMAPHORE = asyncio.Semaphore(2)
 
+# v1.10.0 unit B: bounded concurrency for POST /v2/video/extract-frames.
+# Up to 16 frames × PyAV decode runs on a thread; capped at 2 concurrent to
+# keep the thread pool available for preview extraction and history saves.
+# Separate instance from _PREVIEW_EXTRACT_SEMAPHORE so long extracts can't
+# starve the preview-polling path.
+_FRAME_EXTRACT_SEMAPHORE = asyncio.Semaphore(2)
+
 
 # v1.9.7: approved-images manifest cache. The manifest.json file was parsed
 # fresh on every GET /v1/approved-images + every SSE poll — small file but
@@ -847,6 +854,25 @@ class VideoOutpaintRequest(BaseModel):
     lora: LoRAInput | None = None
     conditioning_strength: float = Field(default=1.0, ge=0.0, le=1.0)
     skip_stage_2: bool = False
+
+
+class ExtractFramesRequest(BaseModel):
+    """v1.10.0 unit B — body for POST /v2/video/extract-frames.
+
+    Server-side PyAV helper that pulls specific frames out of a stored MP4
+    and re-saves them as lossless PNG uploads suitable for feeding as
+    keyframes of the next chain clip (see v1.10.0 multi-frame chain
+    conditioning design).
+    """
+    video_uri: str = Field(pattern=r"^storage://[0-9a-f]{32}$")
+    frame_indices: list[int] = Field(min_length=1, max_length=16)
+
+    @field_validator("frame_indices")
+    @classmethod
+    def _validate_indices(cls, v: list[int]) -> list[int]:
+        if any(i < 0 for i in v):
+            raise ValueError("frame_indices must be non-negative")
+        return sorted(set(v))
 
 
 class TextToImageRequest(BaseModel):
@@ -3183,6 +3209,79 @@ async def v2_video_outpaint(body: VideoOutpaintRequest, request: Request) -> JSO
         width=width, height=height, model="ic-lora-outpaint",
     )
     return _submit_job(JobType.VIDEO_OUTPAINT, params, request, raw=body.model_dump(mode="json"))
+
+
+@app.post("/v2/video/extract-frames")
+async def v2_video_extract_frames(body: ExtractFramesRequest, request: Request) -> JSONResponse:
+    """v1.10.0 unit B — server-side PyAV frame extractor for chain conditioning.
+
+    Decodes the requested frame indices out of a stored MP4 in a single pass,
+    re-saves each as a lossless PNG upload, and returns the resulting
+    storage:// URIs. Powers the multi-frame chain conditioning flow in
+    noodle-v (composition export seam elimination).
+
+    Security model: capability URL — bearer unlocks the endpoint, then any
+    caller with the upload id can fetch the bytes. Same shape as
+    /uploads/get/{id} (v1.9.1). Output bytes count against
+    PER_KEY_UPLOAD_BYTES_PER_DAY.
+    """
+    api_key = _extract_api_key(request) or ""
+    try:
+        video_path = uploads.resolve(body.video_uri)
+    except (ValueError, FileNotFoundError):
+        return _error(404, "video_not_found")
+
+    indices = list(body.frame_indices)  # already sorted+deduped by validator
+
+    def _decode_and_encode() -> tuple[list[bytes], list[tuple[int, int]]]:
+        """Returns (per-frame PNG bytes, per-frame (width, height))."""
+        from history_store import _extract_frames_as_pils
+        import io as _io
+        video_bytes = video_path.read_bytes()
+        pils = _extract_frames_as_pils(video_bytes, indices)
+        png_blobs: list[bytes] = []
+        dims: list[tuple[int, int]] = []
+        for img in pils:
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG", compress_level=6)
+            png_blobs.append(buf.getvalue())
+            dims.append((img.width, img.height))
+        return png_blobs, dims
+
+    try:
+        async with _FRAME_EXTRACT_SEMAPHORE:
+            png_blobs, dims = await asyncio.wait_for(
+                asyncio.to_thread(_decode_and_encode), timeout=30.0,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("extract-frames timed out for %s indices=%s", body.video_uri, indices)
+        return _error(504, "pyav_timeout")
+    except IndexError as exc:
+        return _error(422, f"frame_index_out_of_range: {exc}")
+    except RuntimeError as exc:
+        logger.warning("extract-frames decode failure for %s: %s", body.video_uri, exc)
+        return _error(500, "extract_failed")
+    except Exception:
+        logger.exception("extract-frames unexpected failure for %s", body.video_uri)
+        return _error(500, "extract_failed")
+
+    total_bytes = sum(len(b) for b in png_blobs)
+    quota = _upload_quota_error(api_key, total_bytes)
+    if quota is not None:
+        return quota
+
+    frames_out = []
+    for idx, png, (w, h) in zip(indices, png_blobs, dims):
+        upload_id, storage_uri = uploads.create()
+        uploads.save(upload_id, png)
+        frames_out.append({
+            "frame_index": idx,
+            "storage_uri": storage_uri,
+            "width": w,
+            "height": h,
+        })
+    _record_upload_bytes(api_key, total_bytes)
+    return JSONResponse(content={"frames": frames_out})
 
 
 @app.post("/v2/text-to-image")

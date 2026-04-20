@@ -162,6 +162,43 @@ def _first_video_frame_as_pil(video_bytes: bytes) -> Image.Image | None:
     return None
 
 
+def _extract_frames_as_pils(video_bytes: bytes, indices: list[int]) -> list[Image.Image]:
+    """Decode specified frame indices (sorted, deduped) in one pass.
+
+    Single PyAV iteration over the video stream that collects only the
+    requested frame indices and short-circuits once the largest index is
+    reached. Frames are returned in the input-list order.
+
+    Raises:
+        IndexError: if any requested index exceeds the stream length.
+        RuntimeError: on decode failure or when the container has no video stream.
+    """
+    import av
+    import io as _io
+    wanted = set(indices)
+    max_idx = indices[-1]
+    collected: dict[int, Image.Image] = {}
+    try:
+        with av.open(_io.BytesIO(video_bytes), mode="r") as container:
+            if not container.streams.video:
+                raise RuntimeError("no_video_stream")
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            for i, frame in enumerate(container.decode(stream)):
+                if i in wanted:
+                    collected[i] = frame.to_image()
+                    if i == max_idx:
+                        break
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"decode_failed: {exc}") from exc
+    missing = wanted - collected.keys()
+    if missing:
+        raise IndexError(f"frame_indices {sorted(missing)} exceed stream length")
+    return [collected[i] for i in indices]
+
+
 def _make_thumbnail(media_bytes: bytes, upload_id: str) -> str | None:
     """Create a 256px-wide JPEG thumbnail for image OR video bytes.
 
