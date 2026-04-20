@@ -1430,16 +1430,18 @@ Clip shape (stored in `POST /v2/compositions` body, read back at export time):
 {
   "historyId": "h_abc",
   "sequenceIndex": 0,
-  "duration": 2.04,
+  "duration": 2.042,
   "audioStart": 0.0,
-  "tailTrimFrames": 3,
+  "tailTrimFrames": 6,
+  "audioDurationSec": 2.0,
   "fps": 24
 }
 ```
 
-- `duration` — used verbatim as the `atrim duration=` for beat-gap audio slicing. Keep it in sync with the actual generated clip length (LTX outputs 8k+1 frames).
+- `duration` — used verbatim as the `atrim duration=` for beat-gap audio slicing **only when `audioDurationSec` is absent**. Keep it in sync with the actual generated clip length (LTX outputs 8k+1 frames).
 - `audioStart` — unvalidated (numeric range is the frontend's contract). Negative values or values past the song length will fail ffmpeg with a normal filter-graph error.
-- `tailTrimFrames` (v1.10.0+, default 0) — number of frames to drop from the END of this clip at export time. Used by MusicVideo chain mode: the last 3 frames (`N-3..N-1`, Stage-2 sigma-schedule artifact zone) are unreliable; the 3 frames before them (`N-6..N-4`, the "safe tail") are passed as head keyframes to clip N+1, which regenerates them. **Recommended value: `3`** (drops unsafe tail only; safe tail plays from clip N AND is regenerated at the head of clip N+1, producing a 2-frame backwards jump + 3-frame repeat = ~83 ms visual stutter, below perceptual threshold). Value `6` (drop both tails) was briefly recommended in v1.11.0 but reverted in v1.11.1 because the resulting 1.79 s effective duration clamps the beat-gap atrim and causes 208 ms of audible per-seam audio dropout — measurably worse than the sub-threshold stutter at value `3`. Ignored on the final clip, single-clip exports, and compositions using xfade transitions. Over-trim (`tailTrimFrames >= declared_frames`) clamps to `declared_frames - 1` with a WARN. Backward compat: field omitted or `0` → byte-identical export to v1.9.9.
+- `tailTrimFrames` (v1.10.0+, default 0) — number of frames to drop from the END of this clip at export time. Used by MusicVideo chain mode: the last 3 frames (`N-3..N-1`, Stage-2 sigma-schedule artifact zone) are unreliable; the 3 frames before them (`N-6..N-4`, the "safe tail") are passed as head keyframes to clip N+1, which regenerates them. **Recommended value depends on whether `audioDurationSec` is also sent**: with `audioDurationSec` (v1.11.2+, FE-preferred) use `6` for a 0 ms visual seam AND full-song audio continuity. Without `audioDurationSec` (v1.11.1-style backward-compat), use `3` — the audio-side atrim clamps to `effective_duration`, so tail=6 would drop 208 ms of song per seam (audible), while tail=3 splits the artifact 83 ms audio / 83 ms visual (both sub-threshold). Ignored on the final clip, single-clip exports, and compositions using xfade transitions. Over-trim (`tailTrimFrames >= declared_frames`) clamps to `declared_frames - 1` with a WARN. Backward compat: field omitted or `0` → byte-identical export to v1.9.9.
+- `audioDurationSec` (v1.11.2+, optional) — explicit per-clip audio slice duration in seconds, decoupling the audio atrim from the video `effective_duration`. When present and `> 0`, the exporter uses it verbatim as the per-clip `atrim duration=`; when absent it falls back to `min(beat_gap, effective_duration)` (v1.11.1 clamp). Frontend computes this as `next.beatTime - this.beatTime` for non-final clips and `duration` for the final clip. Using this field with `tailTrimFrames=6` gives seamless chain video + full-song audio; the trade-off is a progressive video-cut-before-beat drift of `audioDurationSec - effective_duration` per seam (~208 ms per seam at 49 frames / 24 fps / 2.0 s beats, accumulating over N clips). When audio duration exceeds video duration, the exporter omits `-shortest` so the last video frame freezes briefly while the song tail completes (preferred over truncating the song).
 - `fps` (v1.10.0+, default 24) — per-clip fps override for the `effective_durations` math above (backend cascades `tailTrimFrames / fps` into beat-gap atrim + force-IDR seam timestamps). LTX is 24 today; include this for future models at different rates.
 
 **Errors** (surfaced as the job's terminal `error` field):

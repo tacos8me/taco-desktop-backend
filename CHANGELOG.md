@@ -2,6 +2,28 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.11.2 — 2026-04-20
+
+### Feat: per-clip `audioDurationSec` decouples audio atrim from video trim
+
+FE audit of the v1.11.0→v1.11.1 churn identified the real fix: the audio-side atrim slice has been clamped to `min(beat_gap, effective_duration)` since v1.10.0, so any video trim silently dropped song material at every seam. v1.11.0's push to `tailTrimFrames=6` made this audible (208 ms per seam); v1.11.1 reverted to `tailTrimFrames=3` as a 83/83 ms split across audio and video (both sub-threshold). Both clamp-based configs gave up song continuity to stay monotonic with the video.
+
+FE now sends an explicit `audioDurationSec: float | None` per clip. When present (> 0, not bool), the exporter uses it verbatim for the `atrim duration=` — audio and video become independent concerns. Absent → v1.11.1 clamp behavior is preserved exactly (backward-compatible for every saved comp on disk today).
+
+FE-preferred path with v1.11.2:
+- `tailTrimFrames=6` (drops both safe and unsafe tails; chain regens them at the follower's head → 0 ms visual seam)
+- `audioDurationSec = next.beatTime - this.beatTime` for non-final clips (= the full beat gap, typically 2.0 s), `= clip.duration` for the final clip
+- Result: song plays with 0 ms dropout across every seam; video cuts progressively earlier than the beats (~208 ms per seam at 49 fr / 24 fps / 2.0 s beats, accumulating to ~832 ms over 5 clips). The final video frame freezes for the accumulated audio-lead while the song completes. Backend's `beat_synced` branch already omits `-shortest`, so freeze-frame tail works without code changes.
+
+Change surface:
+- `export_handler.py` — slice_duration loop prefers `clips[i]["audioDurationSec"]` when numeric + positive; falls back to the v1.11.1 clamp otherwise.
+- `docs/API.md` — clip schema documents `audioDurationSec` and the two recommended configs (v1.11.2 decoupled vs v1.11.1 clamp).
+- `docs/handover-frontend-v1.10-chain.md` — rewritten to describe both paths; v1.11.2 is FE-preferred.
+- No Pydantic model changes (composition data is stored as raw JSON via `composition_store`; unknown clip fields already pass through).
+- No endpoint shape changes. Field is purely additive.
+
+Backward compat: saved comps without `audioDurationSec` → byte-identical to v1.11.1. Saved v1.11.0 comps (`tailTrimFrames=6`, no `audioDurationSec`) still export but retain the audio-dropout symptom; FE ships a one-shot migration to attach `audioDurationSec = beat_gap` on load.
+
 ## v1.11.1 — 2026-04-20
 
 ### Fix: revert v1.11.0's `tailTrimFrames=6` recommendation — audio was audibly clipping at every seam

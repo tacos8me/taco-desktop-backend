@@ -1,63 +1,63 @@
-# v1.11.1 — Frontend Chain Conditioning Spec (noodle-v)
+# v1.11.2 — Frontend Chain Conditioning Spec (noodle-v)
 
-> Handover doc. Backend v1.10.0 ships the endpoints; v1.10.1 fixed the a2v strength default; v1.11.0 attempted to clarify `tailTrimFrames` math but traded a tiny video stutter for an audible audio clip at each seam. **v1.11.1 reverts the recommendation to `tailTrimFrames=3`** — the v1.10.0 value — because the audio clamp + beat-gap atrim math make that the only value where both audio dropout AND visual stutter are below perceptual threshold. Frontend team implements the orchestration flow described here.
+> Handover doc. Backend v1.10.0 shipped the endpoints; v1.10.1 fixed the a2v strength default; v1.11.0 briefly recommended `tailTrimFrames=6` to eliminate a tiny visual stutter but traded it for 208 ms of audible per-seam audio dropout; v1.11.1 reverted to `tailTrimFrames=3` as the minimum-total-perception config while the backend remained clamp-based. **v1.11.2 adds the FE-designed fix: a new optional per-clip `audioDurationSec` field that decouples the audio atrim from the video `effective_duration`** — enabling `tailTrimFrames=6` (0 ms visual seam) AND full-song audio continuity simultaneously. The two fields serve independent concerns and do not alias each other. FE now runs on the v1.11.2 path; the v1.11.1 path stays as an unconditionally-supported legacy fallback.
 
 ## Goal
 
-Each non-first MusicVideo clip is conditioned on the last 3 safe frames of its predecessor, producing seamless playback in composition export.
+Each non-first MusicVideo clip is conditioned on the last 3 safe frames of its predecessor, producing seamless playback in composition export — with full song continuity across every seam.
 
-## Timeline math — `tailTrimFrames=3` is the right value (read the trade-off table below)
+## Timeline math — the two paths
 
-LTX outputs `N` frames per clip (49, 97, 121, or 153 — always `8k+1`). The last ~3 frames (`N-3..N-1`) can have Stage-2 sigma-schedule artifacts. The next 3 frames in (`N-6..N-4`) are the "safe tail" used as chain-conditioning keyframes for the follower clip.
+LTX outputs `N` frames per clip (49, 97, 121, or 153 — always `8k+1`). The last 3 frames (`N-3..N-1`) can have Stage-2 sigma-schedule artifacts. The 3 frames before them (`N-6..N-4`) are the "safe tail" used as chain-conditioning keyframes for the follower clip.
 
-For a 49-frame clip at 24 fps with a typical 2.0 s beat gap, here are the four candidate `tailTrimFrames` values and their measured trade-offs:
+At 49 frames / 24 fps / 2.0 s beat gap, the backend supports two export modes depending on whether the frontend sends the new `audioDurationSec` field:
 
-| `tailTrimFrames` | effective video / clip | audio dropout per seam | visible video seam | verdict |
-|---|---|---|---|---|
-| 0 (legacy, no chain) | 2.04 s | 0 ms | hard cut (color/motion discontinuity) | not chain-compatible |
-| **3** (v1.10.0, v1.11.1 current) | 1.92 s | **83 ms** (below threshold) | 2-frame backwards jump (83 ms, below threshold) | **best trade** — both below perceptual threshold |
-| 6 (v1.11.0 briefly) | 1.79 s | **208 ms** (audible) | smooth (0 ms) | audio clips audibly on every seam |
-| ≥ 4 | intermediate | 125–167 ms | smaller-than-tail=3 jump or "hold" | worse audio than tail=3, marginal video gain |
+| Mode | `tailTrimFrames` | `audioDurationSec` | audio per seam | visible video seam | drift per seam |
+|---|---|---|---|---|---|
+| Hardcut (legacy) | 0 | — | 0 ms | hard cut (content discontinuity) | 0 |
+| Chain, clamp-audio (v1.11.1 legacy) | **3** | — (omit) | 83 ms dropout | 83 ms backwards jump | 0 |
+| **Chain, decoupled-audio (v1.11.2, FE-preferred)** | **6** | **beat_gap** (e.g. `2.0`) | 0 ms — full song | 0 ms (clean) | video cut `audioDurationSec - effective_duration` before beat |
+| ≥ 4 without `audioDurationSec` | intermediate | — | 125–167 ms | intermediate | 0 |
 
-### Why `tailTrimFrames=6` sounded audibly clipped
+### Why `audioDurationSec` is the right fix
 
-With `tailTrimFrames=6`:
-- Effective clip duration = 43 frames / 24 fps = **1.7917 s**
-- Beat gap = 2.0 s (song beats at 0, 2, 4, 6, 8 s)
-- Backend's v1.9.6 beat-gap atrim clamps `slice = min(gap, effective) = 1.7917 s`
-- **Song material between 1.79 s and 2.0 s (208 ms) is never played** at every seam
-- For a 5-clip MusicVideo that's 4 × 208 ms = **832 ms of song silently dropped**
+The v1.9.6 backend ships an audio-side atrim slice that defaulted to `min(beat_gap, effective_duration)`. When chain mode trimmed the video (tail > 0), the clamp pulled audio down too, silently dropping song material at every seam. v1.11.0's recommendation to bump tail to 6 exposed this clamp: 208 ms per seam became audible.
 
-The reason the clamp exists is to keep visual cuts beat-aligned. Removing the clamp (letting audio play the full 2.0 s gap) drifts the visual cut progressively earlier than the beat — by seam 4 the cut is 0.83 s BEFORE the beat, which sounds MUCH worse than a 208 ms silent gap.
+The clamp was load-bearing ONLY because audio-side slice duration had no independent field to follow. v1.11.2 adds `audioDurationSec` per clip. When present, the exporter uses it verbatim for the atrim; the clamp no longer applies. Audio follows beat gaps; video follows its own trim math. Independent concerns, independent fields.
 
-### Why `tailTrimFrames=3` is the sweet spot
+### What the decoupled-audio trade-off actually is
 
-With `tailTrimFrames=3`:
-- Effective clip duration = 46 frames / 24 fps = **1.9167 s**
-- Audio slice = 1.9167 s (per-seam song drop = **83 ms**, below most listeners' perceptual threshold for music)
-- Clip N shows frames 0..45; clip N+1 regenerates frames 43, 44, 45 at its head
-- Viewer sees `… 44, 45, 43', 44', 45', 46', …` — a 2-frame backwards jump + 3-frame content repeat
-- Total visual stutter at the seam = 83 ms (= 2 frames @ 24 fps), also below most viewers' perceptual threshold
+Per chained clip at tail=6 + audioDurationSec=2.0:
+- Audio slice = 2.0 s (full beat gap, no song drop)
+- Video shown = 43 / 24 = 1.792 s (chain-clean seam, no stutter)
+- **Audio leads video by 208 ms per clip**
 
-Both audio and video seam artifacts sit at ~83 ms. Users described this as "barely noticeable stutter". It's the closest you can get to seamless given the LTX `8k+1` quantization + 2.0 s beat gap + chain mechanics. The fundamental math cannot produce a perfectly seamless result at 49 frames / 24 fps / 2.0 s beats — one axis must take the hit; 83 ms split across both is the minimum-total-perception configuration.
+Over 5 clips (4 seams) the accumulated audio-lead is ~832 ms. The compiled MP4 will play:
+- Song continuously from beat 0 → beat 5 with no dropouts or skips
+- Video cuts progressively earlier than the beats: seam 1 at 1.792 s (beat at 2.0), seam 2 at 3.584 s (beat at 4.0), etc.
+- At the end, the last video frame freezes for ~832 ms while the song tail plays out (backend omits `-shortest` in this mode)
 
-### Timeline diagram (tailTrimFrames=3)
+Viewer experience: song is musically clean throughout. Cuts feel slightly rushed but still clearly beat-adjacent (each cut is within one beat's worth of its target). Final moment: the last composed frame (clip N's natural ending frame, no Stage-2 decay because `tailTrimFrames` is always 0 on the final clip) holds on screen for under a second while the music completes. This is the preferred failure mode — song integrity is higher-value than exact cut-on-beat.
+
+### Timeline diagram (tail=6 + audioDurationSec=2.0)
 
 ```
-Clip N  file  : [0, 1, …, 45, 46, 47, 48]             ← full 49-frame LTX output
-Clip N  shown : [0, 1, …, 45]                          ← tailTrimFrames=3 drops unsafe tail only
-                               ↓ (frames 43,44,45 sent as keyframes to N+1)
-Clip N+1 file : [regen-43, regen-44, regen-45, 46', 47', …, 48']
-Clip N+1 shown: [regen-43, regen-44, regen-45, …, 45']   ← also tailTrimFrames=3
+song     : |----beat0----|----beat1----|----beat2----|----beat3----|
+clip 0 v : [0..42]                                                    (1.792 s shown)
+clip 1 v :          [regen-43, regen-44, regen-45, 46', …]            (1.792 s shown)
+clip 2 v :                         [regen-43, regen-44, …]            (1.792 s shown)
+output t : 0    1.79  2.0    3.58  4.0   5.38  6.0
+                ^cut       ^cut        ^cut
+                beat aligned audio  |  video cut 208 ms early
 ```
 
-Viewer: `… 44, 45 | 43', 44', 45', 46', …` — 2-frame "shimmer" at the seam as frames 43–45 play twice (once from clip N, once regen'd from clip N+1). Imperceptible on a generating-subject music video.
+Viewer: `… 44, 45, 46 | 43', 44', 45', 46', …` is replaced by a clean monotonic sequence because `tailTrimFrames=6` drops both the safe tail (regenerated by the follower) and the unsafe tail (Stage-2 artifact zone). No repeat, no backwards jump. Audio plays uninterrupted.
 
-## Backend contract (v1.11.0, on origin/master)
+## Backend contract (v1.11.2, on origin/master)
 
 - `POST /v2/video/extract-frames` — body `{video_uri: "storage://...", frame_indices: [int]}` (1–16 non-negative). Response `{frames: [{frame_index, storage_uri, width, height}]}`. Errors: 404 video_not_found, 422 frame_index_out_of_range, 504 pyav_timeout, 429 upload_quota_exceeded.
-- `POST /v2/audio-to-video` accepts `keyframes: list[KeyframeInput] | None` (mutually exclusive with `image_uri`+`image_strength`). `KeyframeInput = {image_uri, frame_index, strength: [0,1]}`. v1.10.1 note: the default `image_strength` is now `1.0` (was effectively `1.0` in every prior version, briefly regressed to `0.85` in v1.10.0).
-- `POST /v2/compositions` passes through per-clip `tailTrimFrames: int` (default 0) and composition-root `chainMode: "seamless" | "hardcut"`.
+- `POST /v2/audio-to-video` accepts `keyframes: list[KeyframeInput] | None` (mutually exclusive with `image_uri`+`image_strength`). `KeyframeInput = {image_uri, frame_index, strength: [0,1]}`. v1.10.1 note: the default `image_strength` is `1.0`.
+- `POST /v2/compositions` passes through per-clip `tailTrimFrames: int` (default 0), **`audioDurationSec: float | null` (v1.11.2, default absent)**, and composition-root `chainMode: "seamless" | "hardcut"`.
 
 ## Flow (owning module: `musicVideoStore` + `useMusicVideoOrchestrator` hook)
 
@@ -65,27 +65,34 @@ Viewer: `… 44, 45 | 43', 44', 45', 46', …` — 2-frame "shimmer" at the seam
 2. On `completed` event: read `num_frames` from history metadata → `safeTail = [num_frames-6, num_frames-5, num_frames-4]` → `POST /v2/video/extract-frames`.
 3. Submit clip 1 with `keyframes=[{image_uri: f[-6], frame_index: 0, strength: 1.0}, {image_uri: f[-5], frame_index: 1, strength: 1.0}, {image_uri: f[-4], frame_index: 2, strength: 1.0}]`.
 4. Repeat for remaining clips.
-5. On composition save: **`tailTrimFrames=3`** for clips 0..N-2 (drops unsafe tail only; safe tail plays and is regenerated by the follower), **`0`** for the final clip. `chainMode="seamless"`.
+5. On composition save (v1.11.2 FE-preferred path):
+   - **`tailTrimFrames=6`** for clips 0..N-2, **`0`** for the final clip.
+   - **`audioDurationSec = next.beatTime - this.beatTime`** for clips 0..N-2 (= the beat gap, typically `2.0` s).
+   - **`audioDurationSec = clip.duration`** for the final clip (no next beat; matches no-trim behavior).
+   - `chainMode="seamless"`.
+6. (Legacy fallback for FE implementations not yet emitting `audioDurationSec`): omit the field entirely and use `tailTrimFrames=3` for clips 0..N-2, `0` for the final. Backend clamps audio to effective_duration as in v1.11.1.
 
 ## Error handling
 
-- Extract 422 → fall back to single-keyframe (clip N's `f[-4]` URI) for next clip, toast "chain degraded", keep `tailTrimFrames=3`.
+- Extract 422 → fall back to single-keyframe (clip N's `f[-4]` URI) for next clip, toast "chain degraded", keep `tailTrimFrames=6` + `audioDurationSec` as normal.
 - Extract 404 → hard error modal, halt chain.
 - A2V 422 on `keyframes` → backend not on v1.10+; auto-downgrade to hardcut mode in-memory, warn user.
 
 ## Strength default
 
-`[1.0, 1.0, 1.0]` across the 3 head keyframes. LTX strength-1.0 pins the conditioned latent at every sigma step. Hidden dev flag `chainStrengthTaper=[1.0, 0.95, 0.9]` available if residual drift appears after tailTrimFrames is correct; probably not needed.
+`[1.0, 1.0, 1.0]` across the 3 head keyframes. LTX strength-1.0 pins the conditioned latent at every sigma step. Hidden dev flag `chainStrengthTaper=[1.0, 0.95, 0.9]` available if residual drift appears; probably not needed.
 
 ## UI
 
-- Display **effective** duration (raw − trim) on clip cards; tooltip shows raw. Composition total = sum of effective durations.
+- Display **video-effective** duration (raw − trim) on clip cards; tooltip shows raw and audio-slice duration. Composition video total = sum of effective durations; audio total = sum of `audioDurationSec`. The two can legitimately differ by up to one beat gap in total.
 - "Chaining clip N of M" progress indicator during the extract+submit window between clips.
 
 ## Backward compat
 
-- Legacy compositions default `tailTrimFrames=0`, `chainMode="hardcut"`. Byte-identical export to v1.9.9.
-- No other endpoint shape changes.
+- Legacy compositions default `tailTrimFrames=0`, `audioDurationSec` absent, `chainMode="hardcut"`. Byte-identical export to v1.9.9.
+- Compositions saved under v1.11.1 (tail=3, no `audioDurationSec`) still export with v1.11.1 clamp behavior. Re-save to migrate to the v1.11.2 decoupled path.
+- Compositions saved under v1.11.0 (tail=6, no `audioDurationSec`) still export; audio will clamp to 1.79 s per seam (the bug v1.11.2 exists to fix). FE should add a one-shot migration that bumps tail=6 comps with no `audioDurationSec` to include `audioDurationSec = beatGap` on load.
+- No endpoint shape changes. `audioDurationSec` is a purely additive optional clip field.
 
 ## Feature flag
 
@@ -93,13 +100,18 @@ Gate entire UI behind `flags.v110_seamless_chain`. Default `chainMode="seamless"
 
 ## Acceptance tests
 
-1. 5-clip seamless happy path — asserts 3-keyframe submissions + `tailTrimFrames=3` on save + export length within 1 frame of `sum(clip_durations) − 3 * (N-1) / fps`.
+1. 5-clip seamless happy path (v1.11.2 path) — asserts 3-keyframe submissions + `tailTrimFrames=6` + `audioDurationSec` present on every clip + export video length within 1 frame of `sum(effective_durations)` and audio length within 1 frame of `sum(audioDurationSec)`.
 2. Legacy hardcut load+export — byte-identical to v1.9.9 baseline.
-3. Extract 422 fallback — chain continues with single-keyframe, `tailTrimFrames` preserved at 3.
+3. Extract 422 fallback — chain continues with single-keyframe, `tailTrimFrames` + `audioDurationSec` preserved.
 4. Extract 404 halt — modal shown, retry re-invokes.
 5. Seamless→hardcut toggle mid-authoring — all submissions use single-keyframe form.
-6. **Timeline-repeat regression check** — frame-scrub the exported MP4 at every seam; no frame from clip N should visually match a frame in the first ~3 frames of clip N+1.
+6. **Song-continuity regression check** — export a 5-clip seamless comp, confirm no audible seam in the audio (spectrogram continuous, no drop). Frame-scrub the video at every seam; no frame from clip N should visually match a frame in the first ~3 frames of clip N+1.
+7. **Tail-end freeze check** — the final composed frame holds on screen for `sum(audioDurationSec) - sum(effective_durations)` ms while the song completes. Confirm no truncation, no visual glitch at the freeze boundary.
 
-## Migration from the v1.11.0 spec
+## Migration from the v1.11.1 spec
 
-If you implemented against v1.11.0 with `tailTrimFrames=6`: revert to `3`. No code path or data-shape changes needed. Pre-existing saved compositions with `tailTrimFrames=6` will still export (they'll just exhibit the 208 ms per-seam audio dropout); re-save them to apply the new value, or add a one-shot migration that bumps 6 → 3 on load. The v1.10.0 value of `3` is canonical again.
+If you already implemented with `tailTrimFrames=3`, no change is strictly required — the v1.11.1 clamp path still works unchanged. To adopt the v1.11.2 decoupled path:
+
+- On save, switch to `tailTrimFrames=6` for clips 0..N-2 AND add `audioDurationSec = next.beatTime - this.beatTime` (typically `2.0`). Final clip: `tailTrimFrames=0`, `audioDurationSec = clip.duration`.
+- Add a one-shot load migration: any saved comp with `tailTrimFrames=3` and no `audioDurationSec` can stay as-is, or be rewritten to the v1.11.2 shape on user re-save.
+- Any comp with `tailTrimFrames=6` and no `audioDurationSec` is the v1.11.0 bug shape — either bump to `tailTrimFrames=3` OR attach `audioDurationSec = 2.0` on load; the latter is the preferred migration.

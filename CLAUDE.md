@@ -2,7 +2,7 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.11.1 (2026-04-20).
+**Version**: v1.11.2 (2026-04-20).
 
 ## Quick lookup
 
@@ -35,7 +35,7 @@ LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 - `history_store.py` — SQLite-backed per-API-key generation history with thumbnails; schema v2 (params_json, gen_config_json, seed, enhanced_prompt)
 - `lora_registry.py` — Flat-dir LTX LoRA storage with registry.json index. IC-LoRA outpaint LoRA lives here with `strategy="ic_lora_outpaint"`.
 - `flux_lora_registry.py` — Flux LoRA folder-drop discovery (filesystem-only, no registry.json)
-- `composition_store.py` / `export_handler.py` — Composition export (video concat / transcode). v1.10.0: per-clip `tailTrimFrames: int` (default 0) trims the last N frames of each input via `trim=end_frame=<kept>` prepended before the v1.9.8 `setpts=PTS-STARTPTS,format=yuv420p` normalization. Trimmed durations cascade into the v1.9.6 beat-gap atrim and the v1.9.9 force-IDR seam cumsum so audio slicing and keyframe timestamps stay aligned. Last clip and xfade branch always skip trim; single-clip exports zero it out.
+- `composition_store.py` / `export_handler.py` — Composition export (video concat / transcode). v1.10.0: per-clip `tailTrimFrames: int` (default 0) trims the last N frames of each input via `trim=end_frame=<kept>` prepended before the v1.9.8 `setpts=PTS-STARTPTS,format=yuv420p` normalization. Trimmed durations cascade into the v1.9.6 beat-gap atrim and the v1.9.9 force-IDR seam cumsum so audio slicing and keyframe timestamps stay aligned. Last clip and xfade branch always skip trim; single-clip exports zero it out. v1.11.2: per-clip `audioDurationSec: float | None` (optional, FE-preferred) overrides the beat-gap atrim slice per clip — when numeric + positive it's used verbatim for `atrim duration=`, decoupling the audio side from `effective_duration`. Enables `tailTrimFrames=6` (0 ms visual seam via chain regen) with full-song audio continuity; cost is progressive video-cut-before-beat drift = `audioDurationSec − effective_duration` per seam. Absent field → v1.11.1 clamp behavior preserved exactly. No -shortest in the beat_synced branch already, so audio longer than video freezes the final frame for the tail.
 - `nvfp4_loader.py` — NVFP4→BF16 dequantizer for Sikaworld Gemma variant
 - `dashboard.html` — GPU management dashboard SPA (served at /dashboard). Advanced LTX controls, Flux config, **Remote Pool** button grid (0..MAX), turbo toggle, GPU telemetry.
 - `config.py` — Paths, model mapping, device config, resolution tables, TF32 settings, env-var sidecar toggles (`LOAD_FLUX`, `LOAD_ACE`, `LOAD_JOYAI`, `LOAD_ERNIE`, `LTX_REMOTE_SIDECAR_URL`, `LTX_REMOTE_SIDECAR_MAX_WORKERS`, etc.)

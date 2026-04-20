@@ -237,8 +237,22 @@ def export_composition(
         # prevents atrim past the trimmed EOF when a clip's tail was cut).
         # Last clip uses effective_durations[-1] (== clip_durations[-1] because
         # last clip's tailTrimFrames is always zeroed above).
+        # v1.11.2: FE can pass explicit `audioDurationSec` per clip to decouple
+        # audio-side slice from video-side effective_duration — lets tail=6
+        # chain conditioning give a 0 ms visual seam AND full-song audio
+        # continuity (at the cost of a progressive video-cut-before-beat drift
+        # equal to `audioDurationSec - effective_duration` per seam). When the
+        # field is absent the v1.11.1 clamp behavior is preserved exactly.
         slice_durations: list[float] = []
         for i, start in enumerate(clip_audio_starts):
+            explicit = clips[i].get("audioDurationSec")
+            if (
+                isinstance(explicit, (int, float))
+                and not isinstance(explicit, bool)
+                and explicit > 0
+            ):
+                slice_durations.append(float(explicit))
+                continue
             if i < len(clip_paths) - 1:
                 gap = clip_audio_starts[i + 1] - start
                 if gap <= 0:
