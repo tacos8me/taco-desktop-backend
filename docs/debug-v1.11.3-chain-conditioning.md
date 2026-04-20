@@ -85,3 +85,51 @@ Scope:
 1. **Long-chain grounding**: pass the user's original image as a 4th keyframe (sparse, mid-video) every N clips to re-anchor the subject. FE decision.
 2. **Strength taper for motion**: pinning 3 consecutive frames at strength=1.0 may over-constrain motion trajectory. If motion looks "stuck" in early frames, taper to `[1.0, 0.95, 0.9]`. Hidden FE flag already documented in the handover doc.
 3. **Upstream patch to `combined_image_conditionings`**: consider contributing a `mode="pin" | "guide"` parameter upstream so the branching isn't implicit. Not blocking.
+
+## Addendum (v1.11.5): the v1.11.3 fix was wrong, reverted
+
+Post-deploy testing of v1.11.3 + v1.11.4 on a 97-pixel-frame a2v request with keyframes at `[0, 1, 2]` at strength 1.0 showed pixel-frame RMSE against the 3 provided PNGs:
+
+| Pixel frame | vs kf0 | vs kf1 | vs kf2 | Best match |
+|---|---|---|---|---|
+| 0 | **2.42** | 21.87 | 26.06 | kf0 (clean pin) |
+| 1 | 13.62 | 10.37 | 18.53 | kf1 (bleeding) |
+| 2 | 21.07 | **4.47** | 16.80 | kf1 (held) |
+| 4 | 27.62 | 6.49 | 18.63 | kf1 (held) |
+| 7 | 30.30 | 9.09 | 19.53 | kf1 (held) |
+| 8 | 30.17 | 9.24 | 17.74 | kf1 (held) |
+| 15 | 31.90 | 24.36 | **8.98** | kf2 (held) |
+| 16 | 32.04 | 24.57 | 9.27 | kf2 (held) |
+
+The v1.11.3 routing did exactly what I coded it to do — pin `latent_idx=[0, 1, 2]` via `VideoConditionByLatentIndex`. But **LTX's `VideoConditionByLatentIndex` takes a LATENT-frame index, not a pixel-frame index.** LTX's causal VAE maps latent frames to pixel-frame spans via the 8k+1 scheme:
+
+- Latent 0 → pixel 0 (exactly 1 pixel frame)
+- Latent 1 → pixel frames 1..8
+- Latent 2 → pixel frames 9..16
+
+So pinning `latent_idx=1` to `kf1` held pixel frames 1..8 ALL to `kf1`. Pinning `latent_idx=2` to `kf2` held pixel frames 9..16 all to `kf2`. The clip head visibly "slideshows" through three held keyframe images for 17 pixel frames before the model is free to denoise — far worse visually than the soft-guide drift it tried to eliminate.
+
+My v1.10.0 plan phase claimed "consecutive `frame_index=0,1,2` is fully supported by `VideoConditionByLatentIndex` (frame 0) + `VideoConditionByKeyframeIndex` (frames 1, 2) — architecture has no sparse-keyframe assumption." That was wrong in both halves — `VideoConditionByKeyframeIndex` is a soft-guide mechanism by design (it appends keyframe tokens as context; the output's main video latent is still denoised from scratch), and `VideoConditionByLatentIndex` operates at latent-frame granularity which can't pin consecutive pixel frames without encoding a multi-frame video segment.
+
+### v1.11.5 action
+
+Revert v1.11.3's routing. `_image_conds_for_keyframes` now unconditionally delegates to `combined_image_conditionings` — the classical LTX semantic: `VideoConditionByLatentIndex` hard-pin on frame 0, `VideoConditionByKeyframeIndex` soft-guide on frames 1, 2. Keeps v1.11.4's `crf=0` change (reference images no longer CRF-33-compressed before VAE encode) and promotes the diagnostic log from `info` to `warning` so it actually emits (default Python logging threshold dropped `logger.info` silently).
+
+### Proper fix deferred to v1.12
+
+Hard-pinning multiple consecutive pixel frames requires encoding a **multi-frame video segment**, not three separate images. The correct chain-conditioning shape is:
+
+1. Extract the prior clip's last 9 pixel frames as a short video (not 3 PNGs).
+2. VAE-encode as a 2-latent-frame block.
+3. Pin via a single `VideoConditionByLatentIndex(latent=encoded_segment, strength=1.0, latent_idx=0)`. That replaces latents 0-1 of the new clip simultaneously, giving temporally continuous content across the first 9 pixel frames that exactly continues the prior clip's motion trajectory.
+
+Backend changes required:
+- New helper for extracting a video segment (ffmpeg slice) keyed by start/end frame indices.
+- Encode the segment via `video_encoder` as multi-frame latent.
+- `KeyframeInput` schema extension: `video_uri + start_frame + end_frame` or a new `SegmentInput` type.
+- FE switches from `/v2/video/extract-frames` (PNG output) to a new `/v2/video/extract-segment` (keeps as storage URI for re-use as conditioning input, or passes the video_uri + range inline).
+
+Frontend changes:
+- Instead of extracting 3 PNG frames, refer back to the prior clip's MP4 and send a segment reference to the chain endpoint.
+
+Trade-off accepted until v1.12: pixel frame 0 pins cleanly; pixel frames 1, 2 drift softly. Subject-identity drift across many chain hops remains a known limitation best addressed by periodic re-grounding with the user's original image (FE concern, unchanged from earlier notes).

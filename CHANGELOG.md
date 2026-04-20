@@ -2,6 +2,31 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.11.5 — 2026-04-20
+
+### Fix: revert v1.11.3's wrong routing + promote diagnostic log level
+
+Post-deploy empirical test of v1.11.3 + v1.11.4 showed the chain keyframe fix was architecturally wrong. Pinning `VideoConditionByLatentIndex(latent_idx=[0,1,2])` pins LATENT-frame indices, not pixel-frame indices. LTX's causal VAE maps latent 0 → pixel 0, latent 1 → pixel frames 1..8, latent 2 → pixel frames 9..16. Pinning `latent_idx=1` to the user's kf1 held pixel frames 1..8 ALL to kf1's image; `latent_idx=2` held pixel frames 9..16 all to kf2. The clip head visibly "slideshowed" through 17 pixel frames of three held keyframe stills before the model was free to denoise — worse visually than the soft-guide drift v1.11.3 tried to fix.
+
+Verified against real output: pixel frame 2 had RMSE 4.47 to kf1 (nearly identical, held) and RMSE 21.07 to kf0 (completely different). Pixel frame 15 had RMSE 8.98 to kf2 (held). See `docs/debug-v1.11.3-chain-conditioning.md` addendum for the full RMSE matrix.
+
+Revert: `_image_conds_for_keyframes` now unconditionally delegates to `combined_image_conditionings` (classical LTX semantic). Pixel frame 0 gets clean hard-pin via `VideoConditionByLatentIndex`; frames 1, 2 soft-guide via `VideoConditionByKeyframeIndex`. That's the best LTX can do with image-shaped keyframes; true multi-pixel-frame hard-pin requires encoding a **multi-frame video segment** (a v1.12 proper fix, scoped in the debug doc).
+
+Also in v1.11.5:
+- Promote the v1.11.4 `logger.info("a2v keyframes=...")` diagnostic to `logger.warning` so it actually emits. Default Python logging threshold is WARNING; info-level lines were silently dropped. Confirmed by inspecting journalctl — no `a2v keyframes` line for a real job that DID fire the dispatch code. Now emits.
+
+Unchanged from v1.11.4:
+- `ImageConditioningInput(..., crf=0)` — reference images not re-compressed at CRF 33 before VAE encode.
+
+### Why the hard problem deferred
+
+Hard-pinning consecutive pixel frames requires a multi-frame video-segment encoding as the conditioning source, not three single-image VAE encodings. Options:
+- Extend `KeyframeInput` to accept `video_uri + start_frame + end_frame` for segment conditioning.
+- New `/v2/video/extract-segment` endpoint returning a storage URI for a short MP4 clip.
+- FE sends a segment reference instead of 3 PNG frames.
+
+Backend changes are ~40 LOC but require FE coordination on the contract. Deferred to v1.12.
+
 ## v1.11.4 — 2026-04-20
 
 ### Fix: reference images no longer silently H.264-CRF33-compressed before VAE encode

@@ -289,26 +289,24 @@ def _image_conds_for_keyframes(
     dtype: torch.dtype,
     device: torch.device,
 ):
-    # v1.11.3: ltx-pipelines' `combined_image_conditionings` uses two different
-    # mechanisms — VideoConditionByLatentIndex (hard latent replacement) for
-    # frame 0 and VideoConditionByKeyframeIndex (auxiliary context tokens with
-    # soft attention guidance) for frames 1+. That's the classical LTX sparse-
-    # keyframes semantic (first/middle/last @ [0,24,48]) and it's correct there.
+    # v1.11.5: this helper used to route consecutive-from-0 keyframe patterns
+    # through `image_conditionings_by_replacing_latent` to hard-pin all three
+    # chain keyframes. That was a mistake — `VideoConditionByLatentIndex` takes
+    # a LATENT-frame index, not a pixel-frame index. LTX's causal VAE maps
+    # latent 0 → pixel 0, latent 1 → pixels 1..8, latent 2 → pixels 9..16, so
+    # pinning latents [0,1,2] with three single-image latents produces a
+    # 17-pixel-frame "slideshow" at the clip head (pixel frames 1-8 all held
+    # to kf[1], 9-16 all held to kf[2]). Verified against real output at RMSE
+    # 4.47 of pixel frame 2 vs kf[1] and 9.27 of pixel frame 15 vs kf[2].
     #
-    # For chain conditioning — 3 consecutive head frames at [0,1,2] meant to be
-    # exact reproductions of the previous clip's tail — we need hard pinning on
-    # all 3, not just frame 0. Route consecutive-from-0 patterns through
-    # `image_conditionings_by_replacing_latent`, which uses LatentIndex for
-    # every frame. Sparse patterns fall through to the classical helper.
-    #
-    # See docs/debug-v1.11.3-chain-conditioning.md for the investigation trail.
-    if images:
-        indices = [img.frame_idx for img in images]
-        if indices == list(range(len(indices))):
-            return image_conditionings_by_replacing_latent(
-                images=images, height=height, width=width,
-                video_encoder=video_encoder, dtype=dtype, device=device,
-            )
+    # Correct hard-pin for consecutive pixel frames requires encoding a
+    # multi-frame video segment (not three separate images) and pinning via a
+    # single `VideoConditionByLatentIndex` with a multi-frame latent. That's a
+    # bigger architectural change — see docs/debug-v1.11.3-chain-conditioning.md
+    # follow-ups. Until then, fall through to `combined_image_conditionings`
+    # (LatentIndex pin at frame 0 + KeyframeIndex soft-guide at frames 1, 2) —
+    # the classical LTX semantic, which gives clean pixel-frame-0 pinning and
+    # accepts soft-guide drift on frames 1, 2 as the known trade-off.
     return combined_image_conditionings(
         images=images, height=height, width=width,
         video_encoder=video_encoder, dtype=dtype, device=device,
@@ -1506,7 +1504,7 @@ class SplitModelManager:
             for kf in keyframes
         ]
 
-        logger.info(
+        logger.warning(
             "i2v keyframes=%s model=%s frames=%d",
             [(kf["frame_index"], float(kf["strength"])) for kf in keyframes],
             model, num_frames,
@@ -1687,7 +1685,7 @@ class SplitModelManager:
         else:
             effective_keyframes = []
 
-        logger.info(
+        logger.warning(
             "a2v keyframes=%s model=%s frames=%d",
             [(kf["frame_index"], float(kf["strength"])) for kf in effective_keyframes],
             model, num_frames,
