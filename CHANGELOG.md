@@ -2,6 +2,21 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.8 — 2026-04-19
+
+### Fix: video seam glitches on composition export
+
+The concat filter in `export_handler.py` passed `[0:v][1:v]...concat=n=N:v=1:a=0[vout]` with no per-input normalization. Two problems showed up at every seam:
+
+- **PTS discontinuity** — each clip's re-encoded intermediate had its own PTS timeline (not guaranteed to start at 0). concat stitches PTS through, so a clip that started at PTS=0.05 would cause a visible single-frame freeze or jump at the join.
+- **Pixel-format drift** — if two adjacent clips had different pixel formats (yuv420p vs yuv444p, subtly different after different encode paths), concat would stall at the change.
+
+Fix: prepend each input with `setpts=PTS-STARTPTS,format=yuv420p` before the concat/xfade chain. The video side now has an equivalent to the audio-side `asetpts=N/SR/TB` reset that v1.9.3 shipped.
+
+Verified: synthetic 3-clip export and real-world MusicVideo export (3 × LTX video + 15-second song, beat-gap audio slicing) both show strictly monotonic PTS at exactly 1/24 s across all seams. Before the fix, frame deltas at clip boundaries could be anywhere from 0 ms (duplicate) to 80 ms (gap).
+
+Paths normalized: simple concat, xfade chain, and single-clip-with-audio. Single-clip-no-audio still short-circuits to raw bytes (no ffmpeg invocation). No API shape change.
+
 ## v1.9.7 — 2026-04-19
 
 ### Performance pass — HTTP cache headers, conditional GETs, gzip, preview hygiene

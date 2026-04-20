@@ -96,21 +96,46 @@ def export_composition(
         for t in transitions
     )
 
+    # v1.9.8: per-input video normalization before concat/xfade. The concat
+    # filter assumes all inputs have identical parameters AND monotonic PTS
+    # across the boundary — with no setpts reset, any clip that doesn't start
+    # at PTS=0 (common for re-encoded intermediates) produces a visible seam
+    # glitch (single-frame freeze or jump) at every join.
+    #
+    #   setpts=PTS-STARTPTS — reset each input's timeline to 0 so concat sees
+    #                         a monotonic stream across the join.
+    #   format=yuv420p       — normalize pixel format for libopenh264 + MP4,
+    #                         preventing format-change stalls at the seam.
+    #
+    # LTX clips come out at matching resolutions for a given composition so
+    # no scale/setsar is needed here. Frame rate is left alone so the first
+    # clip's fps wins (concat filter's default behavior) — don't force a
+    # target fps because it'd stutter if the user mixes sources.
+    def _norm(i: int, out_label: str) -> str:
+        return f"[{i}:v]setpts=PTS-STARTPTS,format=yuv420p{out_label}"
+
     if not has_xfade:
         if len(clip_paths) == 1:
-            # Single clip + audio overlay — pass video through unchanged.
-            filter_complex = "[0:v]null[vout]"
+            # Single clip + audio overlay — still normalize format so the
+            # output's stream params are stable regardless of source codec.
+            filter_complex = _norm(0, "[vout]")
         else:
-            # Simple concat — no xfade needed
-            filter_parts = []
-            for i in range(len(clip_paths)):
-                filter_parts.append(f"[{i}:v]")
-            filter_complex = f"{''.join(filter_parts)}concat=n={len(clip_paths)}:v=1:a=0[vout]"
+            # Simple concat — no xfade needed. Normalize each input, then
+            # concat the normalized streams.
+            norm_parts = [_norm(i, f"[v{i:02d}n]") for i in range(len(clip_paths))]
+            concat_inputs = "".join(f"[v{i:02d}n]" for i in range(len(clip_paths)))
+            filter_complex = ";".join([
+                *norm_parts,
+                f"{concat_inputs}concat=n={len(clip_paths)}:v=1:a=0[vout]",
+            ])
     else:
-        # xfade chain
+        # xfade chain — also normalize each input before xfade chains them.
+        # xfade requires identical parameters on both sides of the transition
+        # too, so the pre-normalization is equally important here.
+        norm_parts: list[str] = [_norm(i, f"[v{i:02d}n]") for i in range(len(clip_paths))]
         filter_parts: list[str] = []
         cumulative_offset = 0.0
-        prev_label = "[0:v]"
+        prev_label = "[v00n]"
 
         for i in range(1, len(clip_paths)):
             trans = next(
@@ -127,12 +152,12 @@ def export_composition(
             out_label = f"[v{i:02d}]" if i < len(clip_paths) - 1 else "[vout]"
 
             filter_parts.append(
-                f"{prev_label}[{i}:v]xfade=transition={ffmpeg_transition}"
+                f"{prev_label}[v{i:02d}n]xfade=transition={ffmpeg_transition}"
                 f":duration={trans_duration}:offset={cumulative_offset}{out_label}"
             )
             prev_label = out_label
 
-        filter_complex = ";".join(filter_parts)
+        filter_complex = ";".join([*norm_parts, *filter_parts])
 
     # v1.9.3: per-clip audio segmentation trigger. When every clip carries a
     # numeric audioStart (bools rejected — isinstance(True, int) is True in
