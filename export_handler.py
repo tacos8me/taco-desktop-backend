@@ -232,6 +232,35 @@ def export_composition(
         audio_map = []
         audio_codec = []
 
+    # v1.9.9: force IDR frames at seam positions so each clip starts from a
+    # clean intra frame rather than being P-predicted from the previous clip's
+    # last frame. Without this, libopenh264 produces a single long GOP (1 IDR
+    # for the whole output) and the first frame of each downstream clip is a
+    # motion-vector interpolation from unrelated source content — visible as
+    # a "smeared" / "bled" seam glitch at every cut.
+    #
+    # v1.9.8's `setpts=PTS-STARTPTS` made this worse by also eliminating the
+    # implicit PTS-gap scene-change signal the encoder was getting. Keep the
+    # setpts reset (correct for timing) and add `-force_key_frames` to make
+    # scene boundaries explicit.
+    #
+    # Seam times are the cumulative sum of clip_durations, excluding the
+    # final total (which IS the end of stream — no seam there).
+    force_keyframe_args: list[str] = []
+    if len(clip_paths) > 1:
+        seam_times: list[float] = []
+        acc = 0.0
+        for dur in clip_durations[:-1]:
+            acc += float(dur)
+            seam_times.append(acc)
+        if seam_times:
+            # Format with enough precision to avoid rounding onto the wrong
+            # side of an output frame boundary.
+            force_keyframe_args = [
+                "-force_key_frames",
+                ",".join(f"{t:.6f}" for t in seam_times),
+            ]
+
     cmd = [
         "ffmpeg", "-y",
         *inputs,
@@ -239,6 +268,7 @@ def export_composition(
         "-map", "[vout]",
         *audio_map,
         "-c:v", "libopenh264",
+        *force_keyframe_args,
         *audio_codec,
         str(output_path),
     ]

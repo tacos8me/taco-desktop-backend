@@ -2,6 +2,22 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.9.9 — 2026-04-20
+
+### Fix: REAL cause of video seam glitches — force IDR at seams
+
+The v1.9.8 fix (`setpts=PTS-STARTPTS,format=yuv420p`) addressed PTS monotonicity but didn't solve the perceived seam problem. Frame-by-frame inspection of the v1.9.8 output revealed:
+- **1 IDR frame** for the entire 533-frame output (just at t=0).
+- libopenh264 was doing cross-clip P-frame prediction at every seam — the first frame of each downstream clip was motion-vector-interpolated from the previous clip's last frame.
+- Measured RMSE at seam 249→250: **12.60** (LOWER than the ~15 within-clip delta). The encoder was averaging/smoothing between two unrelated clips, producing a single "bled" frame at every cut. That was the visible glitch.
+- Ironically, v1.9.8's `setpts` reset made this WORSE by erasing the only scene-change hint libopenh264 was getting (PTS gaps).
+
+Fix: explicit `-force_key_frames "<t1>,<t2>,..."` with seam timestamps computed from `clip_durations` cumulative sum. libopenh264 inserts a fresh IDR at each seam, so every downstream clip starts from a clean intra frame with zero cross-clip prediction.
+
+After: 6 IDRs in the same output (1 start + 1 per seam), seam RMSE = **65.19** (clean hard cut, 5× higher than within-clip motion). Output bytes grew ~7 % from the extra IDRs — cheap price.
+
+Kept v1.9.8's `setpts=PTS-STARTPTS,format=yuv420p` normalization (still correct for timing + pixel-format safety). This release stacks on top of it.
+
 ## v1.9.8 — 2026-04-19
 
 ### Fix: video seam glitches on composition export
