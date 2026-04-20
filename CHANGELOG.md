@@ -2,6 +2,26 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.10.1 — 2026-04-20
+
+### Fix: a2v keyframe regression — `image_strength` default 0.85 → 1.0
+
+User report after v1.10.0: a2v keyframes feel weaker ("acts almost like t2v"). Traced — effective image-conditioning strength on the default a2v path:
+
+| Version | effective strength |
+|---|---|
+| pre-v1.9.5 | `1.0` — hardcoded in `_run_a2v`, Pydantic field didn't exist |
+| v1.9.5 – v1.9.9 | `1.0` — Pydantic field accepted but `_submit_job` popped/discarded; `_run_a2v` still hardcoded `1.0` |
+| **v1.10.0** | **`0.85`** — Unit A's refactor routed `body.image_strength` through `_resolve_keyframes` to `_run_a2v` for the first time, at the Pydantic default of 0.85 — silently weakening every default-path a2v call |
+
+LTX's conditioning blend `output = denoised * (1 - strength) + clean * strength` is applied at **every sigma step**. A 15 %-per-step leak compounds over 8–30 steps: the image latent dilutes, the audio+prompt take over, the image anchor fades mid-clip. Matches the reported symptom exactly.
+
+Fix (minimal):
+
+- `AudioToVideoRequest.image_strength` Pydantic default `0.85 → 1.0`. Default-path clients get pre-v1.10.0 effective behavior (keyframe pinned at every sigma step). Clients who explicitly set `image_strength` to a lower value now get what they asked for — new capability first working in v1.10.1 (the field was silently ignored in every prior version).
+- `model_validator` switched from literal-default comparison to `self.model_fields_set`, so "keyframes + image_strength" conflict detection is robust to default changes and correctly identifies client-explicit values.
+- No change to i2v (its 0.85 default has been end-to-end effective since v1.1 — image is i2v's primary anchor). No change to multi-keyframe a2v (keyframe strengths come from the per-keyframe dict).
+
 ## v1.10.0 — 2026-04-20
 
 ### Feat: multi-frame chain conditioning for seamless MusicVideo export

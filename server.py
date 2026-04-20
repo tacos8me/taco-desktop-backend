@@ -788,10 +788,15 @@ class AudioToVideoRequest(BaseModel):
     prompt: str = Field(max_length=10000)
     audio_uri: str
     image_uri: str | None = None
-    # v1.9.5: was silently stripped by Pydantic (extra="ignore"). Used as the
-    # first-keyframe strength when `image_uri` is set. Matches the field on
-    # ImageToVideoRequest so clients can tune a2v's intro frame intensity.
-    image_strength: float = Field(default=0.85, ge=0.0, le=1.0)
+    # v1.9.5 added the field to the Pydantic model. v1.9.5–v1.9.9 still silently
+    # dropped it in _submit_job — effective a2v strength was hardcoded 1.0 in
+    # _run_a2v. v1.10.0 refactor wired the field through end-to-end but kept
+    # the old 0.85 default, causing a perceivable regression (keyframes
+    # "fading" mid-clip). v1.10.1 restores default=1.0 so default-path a2v
+    # matches pre-v1.10.0 effective behavior (keyframe pinned at every
+    # sigma step); clients that explicitly set a lower value now get what
+    # they asked for (new capability, first working in v1.10.1).
+    image_strength: float = Field(default=1.0, ge=0.0, le=1.0)
     # v1.10.0: multi-keyframe support for seamless MusicVideo chain mode.
     # Mutually exclusive with image_uri / image_strength in practice — the
     # model_validator below rejects mixed specifications with 422.
@@ -808,9 +813,9 @@ class AudioToVideoRequest(BaseModel):
         if self.keyframes is not None:
             if self.image_uri is not None:
                 raise ValueError("Cannot specify both image_uri and keyframes")
-            # image_strength default is 0.85; reject explicit non-default when
-            # keyframes is set (it would be silently ignored otherwise).
-            if self.image_strength != 0.85:
+            # v1.10.1: use model_fields_set so the check is robust to future
+            # default changes and correctly detects client-explicit values.
+            if "image_strength" in self.model_fields_set:
                 raise ValueError("Cannot specify image_strength together with keyframes")
         return self
 
