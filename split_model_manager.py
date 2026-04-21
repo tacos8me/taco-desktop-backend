@@ -1536,7 +1536,7 @@ class SplitModelManager:
         dtype = torch.bfloat16
         is_fast = model == "ltx-2-3-fast"
         images = [
-            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"], crf=0)
+            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"])
             for kf in (keyframes or [])
         ]
 
@@ -1760,7 +1760,7 @@ class SplitModelManager:
             encoded_audio_latent = torch.cat([encoded_audio_latent, pad], dim=2)
 
         images: list[ImageConditioningInput] = [
-            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"], crf=0)
+            ImageConditioningInput(path=kf["image_path"], frame_idx=kf["frame_index"], strength=kf["strength"])
             for kf in effective_keyframes
         ]
 

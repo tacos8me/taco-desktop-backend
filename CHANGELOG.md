@@ -2,6 +2,40 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.12.2 — 2026-04-21
+
+### Fix: revert v1.11.4's `crf=0` on conditioning images — restores motion + 1440p quality
+
+Client reports since v1.11.4 deploy: motionless a2v outputs (prompts explicitly ask for motion; output freezes around reference), degraded 1440p quality, "hard time with a2v generation". One client was observed dialing `image_strength` down to 0.80-0.95 trying to reclaim motion — the right instinct, wrong knob.
+
+Root cause: v1.11.4 set `ImageConditioningInput(..., crf=0)` on every conditioning image across `_run_a2v` and `_run_i2v`. LTX was trained with `DEFAULT_IMAGE_CRF=33` (H.264 preprocessing of every conditioning image) so the VAE encoder expects compressed-video-like input statistics. Feeding uncompressed `crf=0` images is out-of-distribution; the resulting latent is "too clean" and at `strength=1.0` pins too hard — temporal attention propagates the pin across all frames, suppressing motion generation. Effect scales with resolution: at 1440p the reference image produces ~1.78× the latent tokens of 1080p, so proportionally more of the video is "frozen" around the reference.
+
+v1.11.4 was intended to fix a different complaint ("reference vaguely resembles my input" — CRF 33 compression artifacts were visible at frame 0). We traded subject-pin fidelity for motion dynamics and didn't realize it.
+
+Fix: remove `crf=0` from both `ImageConditioningInput` constructions in `split_model_manager.py`. Falls back to `DEFAULT_IMAGE_CRF=33` which matches LTX's training distribution. Restores pre-v1.11.4 quality — motion-rich outputs, stable across resolutions.
+
+Trade-off accepted: frame 0's output has a slight CRF-33 compression artifact (barely-visible blur vs the input image). That's the v1.11.3-and-earlier baseline that shipped without complaint for months.
+
+Scope: 2 lines removed (the `, crf=0` parameter on two call sites). No Pydantic changes, no API shape changes, no composition changes. Byte-identical v1.12.0 behavior for everything except the reference-image preprocessing step.
+
+### Not changed
+
+- v1.12.0 segment-mode chain conditioning (experimental): unaffected — segment VAE encoding is a separate path. `_build_segment_conditioning_latent` doesn't construct `ImageConditioningInput`.
+- v1.10.1 `image_strength` default of 1.0: unchanged (matches pre-v1.10.0 effective behavior).
+- All other v1.11.x and v1.12.0 work (composition audio timing, chain debug, experimental segment endpoint, dispatch diagnostics) remains.
+
+### Known outstanding
+
+Turbo-mode deadlock reported mid-day 2026-04-21: a2v at 2560×1440 under turbo hung 4+ min with both GPUs idle, threads sleeping, progress=0. Hard restart cleared it. Root cause traced (3-agent investigation): sidecar `_lock` held during torch.cuda.synchronize() that never returns + HTTP client 600 s timeout = 10-min visible hang. Full task list and observability + timeout fixes scoped for v1.12.3+. Until then, **leave turbo OFF for stable service**.
+
+### Ops
+
+Service restarted on v1.12.2 code; turbo remains off.
+
+## v1.12.1 — 2026-04-21
+
+Pure docs-patch release. No code changes. Comprehensive v1.12 documentation push across `docs/API.md`, `CLAUDE.md`, `README.md`, `docs/QUICKSTART.md`, and supporting docs, so client Claude sessions reading the repo get consistent v1.12-current context from every surface. GitHub release v1.12.0 body also rewritten for clarity + working curl/JSON example. See commit `95317e3`.
+
 ## v1.12.0 — 2026-04-20
 
 ### Feat: multi-frame video-segment chain conditioning (the proper fix) — EXPERIMENTAL / opt-in
