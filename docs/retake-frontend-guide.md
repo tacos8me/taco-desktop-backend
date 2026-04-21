@@ -114,9 +114,11 @@ es.onmessage = (e) => {
 - FPS: matches source video
 - The source `video_uri` must be a valid `storage://` URI (from upload or previous gen)
 - Retake is single-stage (no upsampling) — quality matches the source
+- **Does not compose with MusicVideo chain mode.** Retake produces a standalone clip with no `segment_uri` / `keyframes` input; chain conditioning (v1.12 seamless-segment or v1.11.5 seamless) is applied at MusicVideo composition export time, not inside a retake. If you retake a clip in the middle of a chain, the follower clip's chain input is unchanged (it still references the pre-retake tail). Regenerate the followers downstream if you need the chain to re-track the retaken clip's new tail.
 
 ## See also
 
 - **[outpaint-frontend-guide.md](./outpaint-frontend-guide.md)** — expand a video's canvas rather than replace a window (v1.7.0)
+- **[handover-frontend-v1.10-chain.md](./handover-frontend-v1.10-chain.md)** — MusicVideo chain conditioning (v1.12 seamless-segment). Retake and chain are orthogonal; retake produces a single clip, chain stitches multiple clips.
 - **[QUICKSTART.md](./QUICKSTART.md)** — base SSE / upload / auth flow shared across all v2 endpoints
 - **[API.md](./API.md)** — canonical reference for every endpoint, status code, and pydantic shape

@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.10.0 (2026-04-20). See [CHANGELOG](../CHANGELOG.md) for full release notes.
+**Current version:** v1.12.0 (2026-04-20). See [CHANGELOG](../CHANGELOG.md) for full release notes.
 
 ## LTX Video Models (cuda:0)
 
@@ -22,12 +22,14 @@ LTX-2.3 powers all video generation -- text-to-video, image-to-video, audio-to-v
 **Sampler:** CFG++ (Euler ancestral CFG++) is the default sampler for all LTX models. Uses alpha=(1-sigma) rescaling for improved motion quality. Togglable at runtime via `GET/POST /v1/system/sampler` or the dashboard.
 
 **Common constraints:**
-- Frame count snapped to `8k+1` (9, 17, 25, 33, 41, 49...)
+- Frame count snapped to `8k+1` (9, 17, 25, 33, 41, 49...). This is LTX's causal-VAE contract: 1 latent temporal frame ≈ 8 pixel frames plus a single static base frame. Every clip length and chain-segment length must satisfy it; v1.12's `extract-segment` enforces `num_frames ∈ {9, 17, 25, 33}` for the same reason.
 - Resolution must be multiples of 64
 - Duration: 0-30 seconds
 - All models support LoRA (fusion mode -- different strengths require full transformer reload)
 - VAE decode uses `TilingConfig.default()` (upstream cosine tiling)
 - All transformer calls wrapped in `BatchSplitAdapter(max_batch_size=1)`
+
+**Chain conditioning (v1.12):** multi-clip "seamless" composition uses a single 9-frame video segment, not 3 PNG keyframes. The segment is VAE-encoded and hard-pins 9 consecutive pixel frames of the follower clip. See [handover-frontend-v1.10-chain.md](./handover-frontend-v1.10-chain.md) (v1.12 section) for the full FE spec. The legacy v1.11.5 3-keyframes path is still supported.
 
 ## Flux Image Models (cuda:0)
 

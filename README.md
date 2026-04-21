@@ -8,6 +8,7 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 ## Features
 
 - **Video generation** -- LTX-2.3 (22B transformer, v1.1 distilled models) with text-to-video, image-to-video, audio-to-video, and temporal retake
+  - **Chain conditioning** *(v1.12.0, Experimental)* -- multi-frame video-segment conditioning for seamless MusicVideo composition. `POST /v2/video/extract-segment` returns an MP4 of a contiguous 9-frame tail; pass as `segment_uri` on the next i2v/a2v clip and backend hard-pins 9 consecutive target pixel frames via a single VAE-encoded multi-frame latent. Eliminates subject drift across seams. Gated behind FE `flags.v112_seamless_segment`; legacy v1.11.5 keyframes path fully supported.
 - **Video outpaint** *(v1.7.0)* -- IC-LoRA expands a source video's canvas to a larger target resolution; LoRA fills the black padding with temporally-consistent content. 9 placement positions, optional stage-2 skip for fast previews
 - **CFG++ sampler** -- ported from ComfyUI's `euler_ancestral_cfg_pp`, default ON, togglable via `/v1/system/sampler` and dashboard
 - **Image generation** -- Flux 2 Dev and Klein KV for text-to-image, image-to-image, and multi-reference editing
@@ -84,6 +85,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | POST | `/v1/system/pool/remote-workers/{provider}` | Scale one provider (modal\|runpod) *(v1.9.0)* |
 | GET | `/uploads/get/{upload_id}` | Read back an upload *(v1.9.1)* |
 | POST | `/v2/video/extract-frames` | Extract N frames from a video as storage:// PNGs (v1.10.0) |
+| POST | `/v2/video/extract-segment` *(v1.12.0)* | Extract a contiguous 9/17/25/33-frame MP4 segment for chain conditioning |
 | GET/POST | `/v1/system/sampler` | Get/toggle CFG++ vs Euler sampler |
 | GET/POST | `/v1/system/config` | Get/update all generation parameters |
 | POST | `/v1/system/pause` | Evict all models, free VRAM |

@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.10.0 (2026-04-20). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. v1.10.0 adds seamless MusicVideo export via multi-frame chain conditioning (no GPU-topology changes). See [CHANGELOG](../CHANGELOG.md).
+**Current version:** v1.12.0 (2026-04-20). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. v1.10.0 added seamless MusicVideo export via multi-frame chain conditioning; v1.12.0 replaced the 3-keyframes chain with a single video-segment conditioning (no GPU-topology changes). See [CHANGELOG](../CHANGELOG.md).
 
 ## Dual-GPU Layout
 
@@ -108,7 +108,7 @@ Optional extra workers dispatch to HTTP sidecars on remote hardware. v1.9.0 supp
 - **Turbo-scoped**: workers only run while turbo is active, so non-video jobs queued outside turbo aren't stolen by remote workers that can only serve video.
 - **Failure isolation**: remote transport failures do NOT auto-exit turbo — any remote is optional extra capacity; jobs on that provider fail individually but main + local-sidecar + other-provider workers keep serving.
 - **State query**: `GET /v1/system/pool` returns `{turbo_active, providers: {modal: {configured, url, target, active, max}, runpod: {...}}, remote_*: <legacy aliases to modal>}`.
-- **Media inlining**: `_dispatch_job_turbo_remote(job, *, provider)` base64-encodes local media (`image_path`, `audio_path`, `video_path`, keyframes) into the request body — neither Modal nor RunPod can see the host's `uploads/` filesystem (`v1.6.1`). v1.7.0 outpaint follows the same pattern for `video_path`.
+- **Media inlining**: `_dispatch_job_turbo_remote(job, *, provider)` base64-encodes local media (`image_path`, `audio_path`, `video_path`, keyframes) into the request body — neither Modal nor RunPod can see the host's `uploads/` filesystem (`v1.6.1`). v1.7.0 outpaint follows the same pattern for `video_path`. v1.12.0 adds `segment_b64` inlining for the new chain-conditioning segment MP4 (same mechanism as `video_b64`).
 - **Per-provider LoRA paths**: `config.LTX_PROVIDER_LORAS_MOUNT` maps `"modal" → /mnt/nvme-1/huggingface/loras/`, `"runpod" → /runpod-volume/loras/`. The outpaint dispatch path rewrites the local `LORAS_DIR` prefix to the provider's mount before sending.
 - **RunPod sidecar repo**: `/mnt/nvme-1/servers/ltx-sidecar-runpod/` — Dockerfile, `runpod_app.py` (FastAPI + `/ping` health probe), `download_weights.py`, `endpoint.yaml`. Mirrors `ltx-sidecar-modal/` shape.
 

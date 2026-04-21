@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.10.0 (2026-04-20)
+**Server version:** v1.12.0 (2026-04-20)
 **Public base URL:** `https://api.noodlefinger.io` *(canonical; Cloudflare-proxied via the shared `noodle` tunnel)*
 **LAN / dev base URL:** `http://<host>:8090` (uvicorn direct)
 
@@ -9,6 +9,28 @@
 
 > **New to the API?** Start with [docs/QUICKSTART.md](./QUICKSTART.md). This doc is the exhaustive spec.
 > **See also:** [GPU architecture](./gpu-architecture.md) · [Model specs](./models.md) · [Configuration](./configuration.md)
+
+---
+
+## Experimental — v1.12 segment chain conditioning
+
+> **Status:** experimental, opt-in. Ships in v1.12.0 (2026-04-20). Recommended for new MusicVideo compositions; gate FE UI behind `flags.v112_seamless_segment` until visually regression-tested in production. The v1.11.5 3-PNG-keyframes path is fully supported and remains the default for clients that do not opt in.
+
+v1.12 adds **multi-frame video-segment chain conditioning** — a proper fix for the "subject drift at seam 2+" artifact in the v1.10–v1.11.5 keyframes flow. The new surface is a *single optional field* on existing endpoints plus one new helper endpoint. Non-opted-in clients see no behavioral change.
+
+| Surface | What it is |
+|---|---|
+| [`POST /v2/video/extract-segment`](#post-v2videoextract-segment-v1120-experimental) | Extract a contiguous 9-pixel-frame (or 17/25/33) MP4 segment from a stored video upload. Mirrors the shape/security of `/v2/video/extract-frames`. |
+| `AudioToVideoRequest.segment_uri`, `ImageToVideoRequest.segment_uri` | Optional `string \| null`. 3-way mutually exclusive with `image_uri` and `keyframes`. Backend VAE-encodes the segment as a multi-latent-frame tensor and hard-pins 9 consecutive target pixel frames at every sigma step. |
+| Composition clip `segmentUri` | Audit/re-export trail on the clip that *produced* the tail segment. Backend does not re-extract from this field. |
+| Composition root `chainMode: "seamless-segment"` | New enum value. Distinguishes v1.12 compositions from legacy `"seamless"` (v1.11.5 keyframes) and `"hardcut"`. |
+| Composition clip `tailTrimFrames: 9` | Drop 9 frames off the end of each non-final clip (was 3/6 in v1.11.x). |
+
+**Why this exists.** v1.10–v1.11.5 attempted chain conditioning with 3 PNG frames at `frame_index=[0, 1, 2]` strength 1.0. LTX can only hard-pin pixel frame 0 that way (via `VideoConditionByLatentIndex`); frames 1–2 are soft-guided context tokens. Each new clip's "anchor" was a free-generated frame from the prior clip, so subject identity drifted cliff-wise past seam 2. v1.12 encodes a 9-frame video segment as a 2-latent-frame tensor, producing a single `VideoConditionByLatentIndex(latent=segment, latent_idx=0, strength=1.0)` that pins 9 consecutive target pixel frames (LTX causal VAE: latent 0 → pixel 0, latent 1 → pixels 1–8).
+
+**Known limitation.** The segment is re-encoded by LTX's causal VAE, which replicates frame 0 for causal padding — so the 9-frame-segment latents are not bit-identical to what the prior clip's full-length encoding produced. Expected residual RMSE: 1–3 on a 0–255 scale. Visually imperceptible in most content. The v1.13 candidate (re-use the prior clip's saved final latents) eliminates this entirely.
+
+**Full frontend spec:** [docs/handover-frontend-v1.10-chain.md](./handover-frontend-v1.10-chain.md) top section. Three-sentence summary of the flow: on clip N completion, call `/v2/video/extract-segment` with `start_frame = num_frames - 9` and `num_frames = 9`; submit clip N+1's a2v/i2v request with `segment_uri = <returned>` (omit `image_uri` and `keyframes`, the validator rejects mixed modes); on composition save, use `tailTrimFrames: 9` on non-final clips and `chainMode: "seamless-segment"` at the composition root.
 
 ---
 
@@ -41,6 +63,7 @@
 - [Chat & vision](#chat--vision) — [`POST /v1/chat/completions`](#post-v1chatcompletions) · [`POST /v2/char/rank`](#post-v2charrank)
 - [Approved images](#approved-images) — [`POST /v1/approved-images`](#post-v1approved-images) · [`GET /v1/approved-images`](#get-v1approved-images) · [`GET /v1/approved-images/events`](#get-v1approved-imagesevents) · [`GET /v1/approved-images/{id}/file`](#get-v1approved-imagesimage_idfile)
 - [Compositions](#compositions)
+- [Video utilities](#video-utilities) — [`POST /v2/video/extract-frames`](#post-v2videoextract-frames-v1100) · [`POST /v2/video/extract-segment`](#post-v2videoextract-segment-v1120-experimental)
 - [SSE session tokens](#sse-session-tokens)
 - [Error taxonomy](#error-taxonomy)
 - [Endpoint index](#endpoint-index)
@@ -156,6 +179,8 @@ Flux LoRAs run in adapter mode — strength changes are free (`pipe.set_adapters
 - Resolved index `< 0` or `>= num_frames` → `422 "Resolved frame_index ... is out of range"`
 
 Up to **8 keyframes per request**. `422 "At most 8 keyframes are allowed"` if exceeded.
+
+**v1.12 compatibility:** `keyframes` is now 3-way mutually exclusive with `image_uri` and the new `segment_uri` (see [experimental callout](#experimental--v112-segment-chain-conditioning)). Sending more than one triggers `422 "Specify at most one of: image_uri, keyframes, segment_uri"`. The classical 3-PNG keyframes flow is fully supported and is the default for clients that don't opt into segment mode; we recommend new MusicVideo compositions use `segment_uri` instead.
 
 ### `Resolution`
 
@@ -645,14 +670,15 @@ All v1 generation endpoints can return:
 
 ### `POST /v1/image-to-video`
 
-**Body:** `ImageToVideoRequest`. Accepts either `image_uri` (single start frame) OR `keyframes` (up to 8). Both → `422 "Cannot specify both image_uri and keyframes"`.
+**Body:** `ImageToVideoRequest`. Accepts **at most one** of: `image_uri` (single start frame), `keyframes` (up to 8), or `segment_uri` (v1.12 chain segment). Any two or more → `422 "Specify at most one of: image_uri, keyframes, segment_uri"`.
 
 | Field | Type | Default | Constraint |
 |---|---|---|---|
 | `prompt` | string | required | ≤ 10 000 chars |
 | `image_uri` | string \| null | `null` | `storage://<uuid>` (single keyframe at frame 0) |
-| `image_strength` | float | `0.85` | `0.0 ≤ x ≤ 1.0` |
-| `keyframes` | list\<[`KeyframeInput`](#keyframeinput)\> \| null | `null` | Max 8 |
+| `image_strength` | float | `0.85` | `0.0 ≤ x ≤ 1.0`. Ignored (422) when `segment_uri` is also set explicitly. |
+| `keyframes` | list\<[`KeyframeInput`](#keyframeinput)\> \| null | `null` | Max 8. v1.11.5 classical flow. |
+| `segment_uri` *(v1.12, experimental)* | string \| null | `null` | `storage://<uuid>` pointing at an extract-segment MP4. Hard-pins 9 consecutive target pixel frames via a multi-latent-frame `VideoConditionByLatentIndex`. See [Experimental callout](#experimental--v112-segment-chain-conditioning). |
 | `model` | [`ModelName`](#modelname-ltx-video) | required | |
 | `resolution` | [`Resolution`](#resolution) | required | |
 | `duration` | float | required | `0 < x ≤ 30` |
@@ -663,18 +689,20 @@ All v1 generation endpoints can return:
 
 **Response:** `200 video/mp4`.
 
-**Errors:** `422 "keyframes list must not be empty"`, `422 "At most 8 keyframes are allowed"`, `422 "Either image_uri or keyframes is required"`, `422 "Resolved frame_index N is out of range..."`, `422 "Duplicate frame_index values after resolution"`, `404` if any `storage://` URI fails to resolve.
+**Errors:** `422 "keyframes list must not be empty"`, `422 "At most 8 keyframes are allowed"`, `422 "Either image_uri or keyframes is required"` (when `allow_neither=False`, i.e. i2v requires at least one of the three conditioning modes), `422 "Specify at most one of: image_uri, keyframes, segment_uri"`, `422 "Cannot specify image_strength together with segment_uri"`, `422 "Resolved frame_index N is out of range..."`, `422 "Duplicate frame_index values after resolution"`, `404` if any `storage://` URI (including `segment_uri`) fails to resolve.
 
 ### `POST /v1/audio-to-video`
 
-**Body:** `AudioToVideoRequest`
+**Body:** `AudioToVideoRequest`. Conditioning input is optional (audio-only is allowed); at most **one** of `image_uri`, `keyframes`, `segment_uri` may be set.
 
 | Field | Type | Default | Constraint |
 |---|---|---|---|
 | `prompt` | string | required | ≤ 10 000 chars |
 | `audio_uri` | string | required | `storage://<uuid>` |
 | `image_uri` | string \| null | `null` | Optional conditioning image |
-| `image_strength` | float | `0.85` | `0.0 ≤ x ≤ 1.0`. First-keyframe strength when `image_uri` is set. Pre-v1.9.5 this field was silently stripped and the pipeline default was always used. |
+| `image_strength` | float | `1.0` | `0.0 ≤ x ≤ 1.0`. First-keyframe strength when `image_uri` is set. Default changed from `0.85` → `1.0` in v1.10.1 (v1.9.5–v1.9.9 silently dropped the field; v1.10.0 wired it through but kept the 0.85 default causing regression — v1.10.1 restored 1.0). Rejected (422) when `keyframes` or `segment_uri` is set and `image_strength` is explicitly provided. |
+| `keyframes` *(v1.10.0)* | list\<[`KeyframeInput`](#keyframeinput)\> \| null | `null` | Max 8. Multi-keyframe chain conditioning (v1.11.5 path). |
+| `segment_uri` *(v1.12, experimental)* | string \| null | `null` | `storage://<uuid>` from `/v2/video/extract-segment`. Recommended v1.12 chain flow — see [Experimental callout](#experimental--v112-segment-chain-conditioning). |
 | `model` | [`ModelName`](#modelname-ltx-video) | required | |
 | `resolution` | [`Resolution`](#resolution) | required | |
 | `duration` | float | `6.0` | `0 < x ≤ 30` |
@@ -683,6 +711,8 @@ All v1 generation endpoints can return:
 | `enhance_prompt` | bool | `false` | |
 
 **Response:** `200 video/mp4`.
+
+**Errors:** `422 "Specify at most one of: image_uri, keyframes, segment_uri"`, `422 "Cannot specify image_strength together with keyframes or segment_uri"`, other keyframe-resolution 422s identical to i2v, `404` on any unresolvable `storage://` URI.
 
 ### `POST /v1/retake`
 
@@ -1426,22 +1456,51 @@ When `audio_uri` is a valid `storage://` URI pointing at an audio file, the expo
 **Per-clip audio segmentation (v1.9.3, MusicVideo mode):** when every clip in the stored composition carries a numeric `audioStart` field (seconds into the source song where that clip's audio window begins), the exporter slices the song via `atrim` per clip and concatenates the slices 1:1 with the video — so audio stays beat-aligned even across LTX's `8k+1` frame-count quantization. Trigger requires: `audio_uri` set, **every** clip has `audioStart: <number>` (bools rejected), and the composition has no xfade transitions. Falls back to the legacy full-song overlay otherwise (no behavior change for timeline-mode compositions).
 
 Clip shape (stored in `POST /v2/compositions` body, read back at export time):
-```json
+```jsonc
 {
-  "historyId": "h_abc",
-  "sequenceIndex": 0,
-  "duration": 2.042,
-  "audioStart": 0.0,
-  "tailTrimFrames": 6,
-  "audioDurationSec": 2.0,
-  "fps": 24
+  "historyId":        "h_abc",
+  "sequenceIndex":    0,
+  "duration":         2.042,
+  "audioStart":       0.0,
+  "tailTrimFrames":   9,                   // v1.12 segment chain: 9 on non-final clips
+  "audioDurationSec": 2.0,                 // v1.11.2 (unchanged)
+  "segmentUri":       "storage://...",     // v1.12 NEW: segment extracted from this clip's tail
+  "fps":              24
 }
 ```
 
+Composition-root field (applies to the whole composition, not per-clip):
+
+```jsonc
+{ "chainMode": "seamless-segment" }        // v1.12 flag; new valid value added
+```
+
+Valid `chainMode` values (v1.12):
+- `"hardcut"` — no chain conditioning; full-clip cuts. Byte-identical export to v1.9.9. Unchanged.
+- `"seamless"` — v1.11.5 legacy 3-PNG-keyframes path. Fully supported — keep loading/saving existing compositions verbatim.
+- `"seamless-segment"` *(v1.12, experimental)* — segment chain conditioning. New compositions should emit this once the `flags.v112_seamless_segment` FE flag is on.
+
+Backend does NOT validate `chainMode` at write time — `POST /v2/compositions` passes the whole body through `data`. The value is inspected only by the FE during rechain / re-submit flows. Export (ffmpeg pipeline in `export_handler.py`) is abstract over `chainMode` — it sums `tailTrimFrames` per clip regardless of the flag value.
+
+Per-clip field semantics:
+
 - `duration` — used verbatim as the `atrim duration=` for beat-gap audio slicing **only when `audioDurationSec` is absent**. Keep it in sync with the actual generated clip length (LTX outputs 8k+1 frames).
 - `audioStart` — unvalidated (numeric range is the frontend's contract). Negative values or values past the song length will fail ffmpeg with a normal filter-graph error.
-- `tailTrimFrames` (v1.10.0+, default 0) — number of frames to drop from the END of this clip at export time. Used by MusicVideo chain mode: the last 3 frames (`N-3..N-1`, Stage-2 sigma-schedule artifact zone) are unreliable; the 3 frames before them (`N-6..N-4`, the "safe tail") are passed as head keyframes to clip N+1, which regenerates them. **Recommended value depends on whether `audioDurationSec` is also sent**: with `audioDurationSec` (v1.11.2+, FE-preferred) use `6` for a 0 ms visual seam AND full-song audio continuity. Without `audioDurationSec` (v1.11.1-style backward-compat), use `3` — the audio-side atrim clamps to `effective_duration`, so tail=6 would drop 208 ms of song per seam (audible), while tail=3 splits the artifact 83 ms audio / 83 ms visual (both sub-threshold). Ignored on the final clip, single-clip exports, and compositions using xfade transitions. Over-trim (`tailTrimFrames >= declared_frames`) clamps to `declared_frames - 1` with a WARN. Backward compat: field omitted or `0` → byte-identical export to v1.9.9.
-- `audioDurationSec` (v1.11.2+, optional) — explicit per-clip audio slice duration in seconds, decoupling the audio atrim from the video `effective_duration`. When present and `> 0`, the exporter uses it verbatim as the per-clip `atrim duration=`; when absent it falls back to `min(beat_gap, effective_duration)` (v1.11.1 clamp). Frontend computes this as `next.beatTime - this.beatTime` for non-final clips and `duration` for the final clip. Using this field with `tailTrimFrames=6` gives seamless chain video + full-song audio; the trade-off is a progressive video-cut-before-beat drift of `audioDurationSec - effective_duration` per seam (~208 ms per seam at 49 frames / 24 fps / 2.0 s beats, accumulating over N clips). When audio duration exceeds video duration, the exporter omits `-shortest` so the last video frame freezes briefly while the song tail completes (preferred over truncating the song).
+- `tailTrimFrames` (v1.10.0+, default 0) — number of frames to drop from the END of this clip at export time. The right value depends on which chain mode you're using:
+
+  | Mode | Recommended `tailTrimFrames` (non-final clips) | Why |
+  |---|---|---|
+  | `"hardcut"` | `0` | No chain conditioning; every frame is shown. |
+  | `"seamless"` (v1.11.5, keyframes) with `audioDurationSec` | `6` | Drops safe tail [N-6..N-4] + unsafe tail [N-3..N-1]. The 3 safe-tail frames are regenerated as the follower's head keyframes. `audioDurationSec` prevents the 208 ms audio dropout that tail=6 would cause with the v1.11.1 clamp. |
+  | `"seamless"` (v1.11.5, keyframes) without `audioDurationSec` | `3` | v1.11.1 legacy — the audio atrim clamps to `effective_duration`, so tail=6 would drop 208 ms of song; tail=3 splits the artifact 83 ms/83 ms. |
+  | `"seamless-segment"` *(v1.12)* | `9` | The follower regenerates pixel frames [N-9..N-1] via segment conditioning. All 9 frames are cleanly replaced in playback; no repeat, no backward jump. Requires `audioDurationSec` for the matching full-song-continuity export. |
+
+  Ignored on the final clip, single-clip exports, and compositions using xfade transitions. Over-trim (`tailTrimFrames >= declared_frames`) clamps to `declared_frames - 1` with a WARN. Backward compat: field omitted or `0` → byte-identical export to v1.9.9.
+
+- `audioDurationSec` (v1.11.2+, optional) — explicit per-clip audio slice duration in seconds, decoupling the audio atrim from the video `effective_duration`. When present and `> 0`, the exporter uses it verbatim as the per-clip `atrim duration=`; when absent it falls back to `min(beat_gap, effective_duration)` (v1.11.1 clamp). Frontend computes this as `next.beatTime - this.beatTime` for non-final clips and `duration` for the final clip. Using this field with `tailTrimFrames=6` (v1.11.5) or `tailTrimFrames=9` (v1.12) gives seamless chain video + full-song audio; the trade-off is a progressive video-cut-before-beat drift of `audioDurationSec - effective_duration` per seam, accumulating over N clips. When audio duration exceeds video duration, the exporter omits `-shortest` so the last video frame freezes briefly while the song tail completes (preferred over truncating the song). v1.12 `tailTrimFrames=9` increases the per-seam drift vs. v1.11.5 tail=6 (~333 ms per seam on 49-frame clips vs. ~208 ms); for 3+ clip compositions prefer 97-frame (4.04 s) clips, which keep the ratio under control.
+
+- `segmentUri` *(v1.12, experimental, optional)* — `storage://<uuid>` pointing at the MP4 segment that was extracted from THIS clip's tail (via [`POST /v2/video/extract-segment`](#post-v2videoextract-segment-v1120-experimental)) and passed to the **follower** clip's `segment_uri` for chain conditioning. Purely informational for audit / re-export — the backend does NOT re-extract from this field during export, and the export pipeline ignores it. FE uses it for re-chain operations or when re-exporting a saved composition from scratch. Absent on the final clip (no follower) and on `"hardcut"` / `"seamless"` compositions.
+
 - `fps` (v1.10.0+, default 24) — per-clip fps override for the `effective_durations` math above (backend cascades `tailTrimFrames / fps` into beat-gap atrim + force-IDR seam timestamps). LTX is 24 today; include this for future models at different rates.
 
 **Errors** (surfaced as the job's terminal `error` field):
@@ -1454,6 +1513,8 @@ Clip shape (stored in `POST /v2/compositions` body, read back at export time):
 ## Video utilities
 
 ### `POST /v2/video/extract-frames` (v1.10.0)
+
+> **v1.12 note:** this endpoint is the *legacy* chain helper — it extracts per-frame PNGs for the v1.11.5 3-keyframes path. New compositions should prefer [`POST /v2/video/extract-segment`](#post-v2videoextract-segment-v1120-experimental), which produces a single MP4 segment that conditions 9 consecutive target pixel frames (vs. pinning only pixel frame 0 with the PNG path).
 
 Server-side PyAV helper that extracts specific frame indices from a stored MP4 and re-saves each as a lossless PNG upload. Designed to power the multi-frame chain conditioning flow in noodle-v's MusicVideo export (the last N frames of clip i become the head keyframes of clip i+1, eliminating visible seams at composition boundaries).
 
@@ -1499,7 +1560,103 @@ Frames are returned in sorted-index order. The `storage_uri` values are freshly-
 
 **Security model:** Capability URL — bearer unlocks the endpoint and attributes quota, but the returned `storage_uri` values are not scoped to the caller's key. Any bearer holder who knows the upload id can fetch it via `GET /uploads/get/{id}`. Matches the v1.9.1 upload-get pattern. The 32-hex uuid4 id is the capability.
 
-**Use case (chain conditioning):** After clip N finishes, extract indices `[N_frames-6, N_frames-5, N_frames-4]` (safe zone, well clear of stage-2 tail-artifact region). Submit clip N+1 with `keyframes=[{image_uri:f0, frame_index:0, strength:1.0}, {image_uri:f1, frame_index:1, strength:1.0}, {image_uri:f2, frame_index:2, strength:1.0}]`. See the Unit C frontend handover spec for full orchestration flow.
+**Use case (v1.11.5 legacy chain conditioning):** After clip N finishes, extract indices `[N_frames-6, N_frames-5, N_frames-4]` (safe zone, well clear of stage-2 tail-artifact region). Submit clip N+1 with `keyframes=[{image_uri:f0, frame_index:0, strength:1.0}, {image_uri:f1, frame_index:1, strength:1.0}, {image_uri:f2, frame_index:2, strength:1.0}]`. Note that LTX only hard-pins pixel frame 0 via `VideoConditionByLatentIndex` — frames 1 and 2 are soft-guided context tokens, which drives the subject drift the v1.12 segment path addresses. See [`docs/handover-frontend-v1.10-chain.md`](./handover-frontend-v1.10-chain.md) v1.11.2 section for the legacy flow, or the v1.12 top section for the recommended segment flow.
+
+### `POST /v2/video/extract-segment` (v1.12.0, experimental)
+
+> **Experimental v1.12 feature.** See the [top-of-file callout](#experimental--v112-segment-chain-conditioning). Opt in via `flags.v112_seamless_segment`. The legacy [`POST /v2/video/extract-frames`](#post-v2videoextract-frames-v1100) stays fully supported.
+
+Server-side PyAV helper that extracts a contiguous range of pixel frames from a stored MP4 and re-encodes the range as a **standalone small H.264 MP4 upload**. Designed as the v1.12 chain-conditioning input: instead of three PNG frames (which only hard-pin pixel frame 0), a single segment MP4 is VAE-encoded as a multi-latent-frame tensor that hard-pins 9 consecutive target pixel frames at every sigma step.
+
+**Auth:** bearer required. Same capability-URL security model as [`/v2/video/extract-frames`](#post-v2videoextract-frames-v1100) and [`/uploads/get/{id}`](#get-uploadsgetupload_id-v191) — the 32-hex uuid4 in `segment_uri` is the capability; any bearer holder who knows the id can fetch it.
+
+**Body:**
+```json
+{
+  "video_uri": "storage://<32 hex>",
+  "start_frame": 40,
+  "num_frames": 9
+}
+```
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `video_uri` | string | required | `^storage://[0-9a-f]{32}$` (Pydantic enforced) |
+| `start_frame` | int | required | `>= 0`. `start_frame + num_frames` must fit within the source video's frame count |
+| `num_frames` | int | `9` | **Must be one of `{9, 17, 25, 33}`** — i.e. `8k+1` for `k ∈ {1, 2, 3, 4}`. Any other value → `422 "num_frames must be one of {9, 17, 25, 33} (8k+1 for k in 1..4)"` |
+
+**Why `num_frames=9` is the v1.12 default.** LTX's causal VAE scheme produces `k+1` latent frames from an `8k+1`-pixel-frame segment. At `num_frames=9` (k=1), the segment encodes to 2 latent frames — the minimum needed for a "real" multi-frame hard-pin (vs. a single-latent pin which collapses to single-frame semantics). Latent 0 pins target pixel 0; latent 1 pins target pixel frames 1–8, giving 9 hard-pinned pixel frames total. Larger values (17 / 25 / 33) pin proportionally more frames at the cost of wider audio–video drift per seam and larger segment uploads. 9 is the sweet spot for 49-frame (2.04 s at 24 fps) and 97-frame (4.04 s) LTX clips — larger values will re-use a dispropriately large fraction of the prior clip.
+
+**Response (200):**
+```json
+{
+  "segment_uri": "storage://<32 hex>",
+  "width": 1920,
+  "height": 1080,
+  "num_frames": 9,
+  "fps": 24.0
+}
+```
+
+- `segment_uri` — freshly-minted upload; feed it into the next clip's `AudioToVideoRequest.segment_uri` or `ImageToVideoRequest.segment_uri`.
+- `width` / `height` — pixel dims of the encoded segment (matches source video).
+- `num_frames` — echoed back so clients don't need to track it separately.
+- `fps` — source MP4's stream fps as a float.
+
+**Output format:** H.264 MP4 (video-only, no audio track), encoded in a single PyAV pass. Typical size: 500 KB – 1.5 MB for a 9-frame 1920×1080 segment — considerably smaller than 9 lossless PNGs of the same content.
+
+**Errors:**
+
+| Status | Code / message | When |
+|---|---|---|
+| `404` | `"video_not_found"` | `video_uri` doesn't resolve (unknown id or evicted) |
+| `422` | `"segment_out_of_range: <detail>"` | `start_frame + num_frames` exceeds source stream length (PyAV raised `IndexError` during decode) |
+| `422` | `"num_frames must be one of {9, 17, 25, 33} ..."` | Pydantic validator rejection |
+| `504` | `"pyav_timeout"` | Decode + encode exceeded 30 s (malformed / very long source file) |
+| `500` | `"extract_failed"` | PyAV raised during decode or encode |
+| `429` | `"upload_quota_exceeded"` | Emitted MP4 bytes would push the caller past `PER_KEY_UPLOAD_BYTES_PER_DAY` |
+| `401` | `"Invalid or missing API key"` | Middleware |
+
+**Quota:** Emitted MP4 bytes count against the per-key 24 h rolling upload-byte budget (same pool as `PUT /uploads/put/{upload_id}`, `POST /v1/loras`, and `POST /v2/video/extract-frames`).
+
+**Concurrency:** Shares `_FRAME_EXTRACT_SEMAPHORE(2)` with `/v2/video/extract-frames`. Extra callers queue until a slot is free; both endpoints together cap at 2 concurrent decodes.
+
+**Idempotence:** Each call mints a *fresh* `segment_uri`. Calling twice with identical inputs produces two distinct uploads that each count against quota. Clients should cache the URI they receive rather than re-extract.
+
+**Worked example — canonical chain-tail extraction.** Clip N finished with `num_frames = 49` (2.04 s at 24 fps). Extract its tail 9 frames to seed clip N+1:
+
+```bash
+# Assume CLIP_N_STORAGE_URI = "storage://<clip N final MP4>"; NUM_FRAMES = 49.
+START=$((49 - 9))   # 40
+
+SEG=$(curl -s -X POST "$API/v2/video/extract-segment" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"video_uri\":\"$CLIP_N_STORAGE_URI\",\"start_frame\":$START,\"num_frames\":9}")
+
+# SEG = {"segment_uri":"storage://abcd...","width":1920,"height":1080,"num_frames":9,"fps":24}
+SEGMENT_URI=$(echo "$SEG" | jq -r '.segment_uri')
+
+# Submit clip N+1, conditioning on the segment. Do NOT set image_uri or keyframes.
+curl -X POST "$API/v2/audio-to-video" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d @- <<EOF
+{
+  "prompt": "...continues scene...",
+  "audio_uri": "storage://<song-slice-or-full>",
+  "segment_uri": "$SEGMENT_URI",
+  "model": "ltx-2-3-fast",
+  "resolution": "1920x1080",
+  "duration": 2.04,
+  "fps": 24
+}
+EOF
+```
+
+The resulting clip's first 9 pixel frames are hard-pinned to clip N's frames 40–48, visually seamless. On composition save, set `tailTrimFrames: 9` on clip N (non-final) so the export drops those 9 frames from clip N (they're regenerated as the head of clip N+1) and `chainMode: "seamless-segment"` at the composition root.
+
+**Preconditions and postconditions:**
+- **Precondition:** caller holds a valid bearer; `video_uri` resolves to a video MP4 in the upload store; `start_frame + num_frames ≤ source frame count`.
+- **Postcondition on 200:** a new `storage://<id>` entry exists, attributable to the caller via quota accounting; the file is a valid H.264 MP4 with exactly `num_frames` frames.
 
 ---
 
@@ -1594,12 +1751,21 @@ All error responses follow the shape described in [Error shape](#error-shape) (`
 
 | Status | Error string | When |
 |---|---|---|
-| `422` | `"Cannot specify both image_uri and keyframes"` | i2v with both fields set |
+| `422` | `"Specify at most one of: image_uri, keyframes, segment_uri"` | v1.12 — i2v/a2v with ≥ 2 of the three conditioning inputs set |
+| `422` | `"Cannot specify image_strength together with segment_uri"` | v1.12 — i2v with explicit `image_strength` + `segment_uri` |
+| `422` | `"Cannot specify image_strength together with keyframes or segment_uri"` | v1.12 — a2v with explicit `image_strength` + `keyframes` or `segment_uri` |
 | `422` | `"keyframes list must not be empty"` | i2v empty keyframes array |
 | `422` | `"At most 8 keyframes are allowed"` | i2v keyframes > 8 |
-| `422` | `"Either image_uri or keyframes is required"` | i2v no image input |
+| `422` | `"Either image_uri or keyframes is required"` | i2v with none of `image_uri` / `keyframes` / `segment_uri` set |
 | `422` | `"Resolved frame_index N is out of range for M frames"` | Keyframe bounds violation |
 | `422` | `"Duplicate frame_index values after resolution"` | Two keyframes resolve to same index |
+| `422` | `"num_frames must be one of {9, 17, 25, 33} (8k+1 for k in 1..4)"` | v1.12 — `POST /v2/video/extract-segment` with invalid `num_frames` |
+| `404` | `"segment_uri not found"` | v1.12 — i2v/a2v references a `segment_uri` that doesn't resolve |
+| `404` | `"video_not_found"` | `POST /v2/video/{extract-frames,extract-segment}` source MP4 unresolvable |
+| `422` | `"segment_out_of_range: <detail>"` | `POST /v2/video/extract-segment` — `start_frame + num_frames` exceeds source length |
+| `422` | `"frame_index_out_of_range: <detail>"` | `POST /v2/video/extract-frames` — requested index exceeds source length |
+| `504` | `"pyav_timeout"` | Extract-frames or extract-segment decode exceeded 30 s |
+| `500` | `"extract_failed"` | Extract-frames or extract-segment decode/encode raised |
 | `422` | `"joyai-edit requires exactly one image_uri"` | `joyai-edit` with `image_uris.length != 1` |
 | `422` | `"task_type '<t>' requires source_audio_uri"` | Music task-type missing `source_audio_uri` |
 | `422` | `"task_type '<t>' requires track_name"` | extract/lego/complete missing `track_name` |
@@ -1722,7 +1888,8 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | POST | `/v2/audio-to-video` | yes | Async a2v |
 | POST | `/v2/retake` | yes | Async retake |
 | POST | `/v2/video-outpaint` | yes | **v1.7.0** Async IC-LoRA outpaint |
-| POST | `/v2/video/extract-frames` | yes | **v1.10.0** PyAV frame extractor (chain conditioning) |
+| POST | `/v2/video/extract-frames` | yes | **v1.10.0** PyAV frame extractor (v1.11.5 legacy chain conditioning) |
+| POST | `/v2/video/extract-segment` | yes | **v1.12.0** PyAV segment extractor (experimental v1.12 chain conditioning) |
 | POST | `/v2/text-to-image` | yes | Async t2i |
 | POST | `/v2/image-to-image` | yes | Async i2i |
 | POST | `/v2/image-edit` | yes | Async edit |
@@ -1749,7 +1916,7 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue export job |
 
-**Total: 72 routes.**
+**Total: 73 routes.**
 
 ---
 
@@ -1857,6 +2024,25 @@ curl -X POST "$API/v2/batch" \
 
 ## Changelog
 
+- **v1.12.0** (2026-04-20)
+  - **NEW (experimental):** `POST /v2/video/extract-segment` — extract a contiguous `8k+1` pixel-frame range (`k ∈ {1..4}`; default 9) from a stored MP4 and re-encode as a standalone H.264 MP4 upload. Same capability-URL / quota / semaphore pattern as `/v2/video/extract-frames`.
+  - **NEW (experimental):** `segment_uri: string | null` field on `AudioToVideoRequest` and `ImageToVideoRequest`. 3-way mutually exclusive with `image_uri` and `keyframes` (422 on mixed specifications). Backend VAE-encodes the segment as a multi-latent-frame tensor and hard-pins 9 consecutive target pixel frames via a single `VideoConditionByLatentIndex` — replacing v1.11.5's single-pixel-frame-0 hard-pin, which drifted past seam 2.
+  - **Composition:** new `chainMode` value `"seamless-segment"` (in addition to `"seamless"` / `"hardcut"`); new optional per-clip `segmentUri` audit field; recommended `tailTrimFrames: 9` on non-final clips in seamless-segment mode.
+  - Opt in behind FE flag `flags.v112_seamless_segment`. Legacy `"seamless"` (v1.11.5 keyframes) and `"hardcut"` paths remain byte-identical.
+  - See [Experimental callout](#experimental--v112-segment-chain-conditioning) and [`docs/handover-frontend-v1.10-chain.md`](./handover-frontend-v1.10-chain.md) v1.12 section.
+- **v1.11.5** (2026-04-20) — Revert v1.11.3's chain-keyframes routing (was pinning at latent-frame granularity, produced visible "slideshow" through pixel frames 1–16). Unconditional delegation to `combined_image_conditionings`. Promoted the `a2v keyframes=` diagnostic to `WARNING` so it actually emits.
+- **v1.11.4** (2026-04-20) — `ImageConditioningInput(..., crf=0)` so user-provided reference images are no longer silently H.264-CRF33-compressed before VAE encode. Promoted dispatch diagnostic log level.
+- **v1.11.3** (2026-04-20) — Attempted fix for multi-keyframe chain conditioning by routing through `image_conditionings_by_replacing_latent`. Wrong granularity (latent-frame vs pixel-frame) — reverted in v1.11.5.
+- **v1.11.2** (2026-04-20) — Composition clip gains optional `audioDurationSec: float | null` — decouples per-clip audio atrim from video `effective_duration`. Enables `tailTrimFrames=6` with zero visual seam AND full-song audio continuity. Frontend-preferred export path.
+- **v1.11.1** (2026-04-20) — Reverts the v1.11.0 `tailTrimFrames=6` recommendation back to `tailTrimFrames=3` as the minimum-total-perception config under the pre-v1.11.2 audio clamp. Both 3 and 6 continue to work.
+- **v1.11.0** (2026-04-19) — Briefly recommended `tailTrimFrames=6` to eliminate a visual stutter; traded for 208 ms of audible per-seam audio dropout. Superseded by v1.11.2's `audioDurationSec` decoupling.
+- **v1.10.1** (2026-04-18) — `AudioToVideoRequest.image_strength` default changed from `0.85` to `1.0`. v1.9.5 added the field to the model but v1.9.5–v1.9.9 silently dropped it in `_submit_job` (hardcoded 1.0 in `_run_a2v`). v1.10.0 wired the field end-to-end but kept the 0.85 default, regressing default-path a2v. v1.10.1 restores 1.0 so default behavior matches pre-v1.10.0.
+- **v1.10.0** (2026-04-18)
+  - `POST /v2/video/extract-frames` — PyAV multi-frame extractor, lossless PNG output, bounded concurrency via `_FRAME_EXTRACT_SEMAPHORE(2)`, 30 s timeout, per-key quota accounting.
+  - `AudioToVideoRequest.keyframes: list[KeyframeInput] | None` — multi-keyframe support now matches i2v. Legacy `image_uri` + `image_strength` single-keyframe path is unchanged.
+  - Composition clip schema: optional `tailTrimFrames: int` (default 0), optional per-clip `fps` override.
+- **v1.9.x** — Per-provider remote pool (Modal + RunPod dict-keyed), `POST /v1/system/pool/remote-workers/{provider}`, `GET /uploads/get/{id}`, composition `audio_uri` persistence, per-clip `audioStart` beat-synced audio, per-key queue/upload/LoRA caps.
+- **v1.8.x** — Admin gate on mutation endpoints (`.admin_keys`, `403 admin_required`); tenancy enforcement on `/v2/jobs/*` and `/v2/batch/*`; identity preservation hooks on Klein edit (`preserve_identity`, `identity_strength`, `identity_mode`).
 - **v1.7.0** (2026-04-17)
   - `POST /v2/video-outpaint` — IC-LoRA Outpaint (`oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint`, registered id `ic-lora-outpaint`). Silent MP4 output; black-sentinel LoRA fills padded regions; `skip_stage_2` fast path.
   - `JobType.VIDEO_OUTPAINT` added.

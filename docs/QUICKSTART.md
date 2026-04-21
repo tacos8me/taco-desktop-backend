@@ -2,9 +2,9 @@
 
 Everything you need to ship a working client in 5 minutes. For everything else → [docs/API.md](./API.md).
 
-## What's new in v1.10.0 (2026-04-20)
+## What's new in v1.12.0 (2026-04-20)
 
-- **Seamless MusicVideo chain conditioning** (v1.10.0) — non-first clips are conditioned on the last 3 safe frames of their predecessor so motion and visual state flow continuously across cuts. Composition export trims the duplicated tail so the 3 chain frames appear exactly once. Result: no visible seam at clip boundaries. Full FE orchestration spec in [docs/handover-frontend-v1.10-chain.md](./handover-frontend-v1.10-chain.md).
+- **Multi-frame chain conditioning for seamless MusicVideo** *(v1.12.0, Experimental)* — new `POST /v2/video/extract-segment` returns an MP4 of a contiguous 9-frame tail; pass as `segment_uri` on the next i2v/a2v clip and backend VAE-encodes it as a multi-latent-frame tensor and hard-pins 9 consecutive target pixel frames. Replaces the v1.11.5 3-PNG-keyframes path (which pinned only pixel frame 0 via `VideoConditionByLatentIndex` and soft-guided the rest via `VideoConditionByKeyframeIndex`, drifting at seam 2+). See "Chain conditioning for MusicVideo" below. Gate behind `flags.v112_seamless_segment`; legacy v1.11.5 keyframes path still fully supported.
 - **`POST /v2/video/extract-frames`** (v1.10.0) — server-side PyAV helper. Body `{video_uri, frame_indices: [int]}` (1–16, sorted+deduped). Returns lossless PNGs as `storage://` URIs. Bearer + capability-URL security. Bounded concurrency (semaphore 2 + 30 s timeout). Output bytes count against `PER_KEY_UPLOAD_BYTES_PER_DAY`.
 - **`AudioToVideoRequest.keyframes`** (v1.10.0) — a2v now accepts the same `keyframes: list[KeyframeInput]` shape as i2v (mutually exclusive with `image_uri`+`image_strength`; 422 on conflict). Legacy single-keyframe path unchanged.
 - **`tailTrimFrames: int` per-clip composition field** (v1.10.0, default 0) — backend trims the last N frames of each input at export time. Cascades into beat-gap atrim + force-IDR seam math.
@@ -209,7 +209,40 @@ Valid `resolution`: `1920x1080`, `1080x1920`, `2560x1440`, `1440x2560`, `3840x21
   "fps": 24
 }
 ```
-`frame_index` accepts `int | "first" | "middle" | "last"` plus negative ints (Python-style: `-1` = last, `-12` = 12 frames before end). Up to 8 keyframes. Mutually exclusive with `image_uri`.
+`frame_index` accepts `int | "first" | "middle" | "last"` plus negative ints (Python-style: `-1` = last, `-12` = 12 frames before end). Up to 8 keyframes. Mutually exclusive with `image_uri` and `segment_uri`.
+
+## Chain conditioning for MusicVideo (v1.12 experimental)
+
+Chain conditioning lets you generate a sequence of video clips whose subject and motion flow continuously across cuts — no visible seam, no drift. After generating clip N, extract its last 9 frames as a short MP4, then pass the resulting `segment_uri` on clip N+1 so the backend pins clip N+1's first 9 pixel frames to exact reproductions of clip N's tail.
+
+**Flow**: generate clip 0 → `POST /v2/video/extract-segment` → generate clip 1 with `segment_uri`:
+
+```bash
+# 1. Generate clip 0 (image-to-video or audio-to-video; any standard submission)
+CLIP0=$(curl -s -X POST "$API/v2/image-to-video" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"prompt": "a dancer spins", "image_uri": "storage://abc", "model": "ltx-2-3-pro", "resolution": "1920x1080", "duration": 2.04, "fps": 24}' | jq -r .job_id)
+# … stream /v2/jobs/$CLIP0/stream until completed, read result video_uri from history …
+CLIP0_VIDEO_URI="storage://..."   # clip 0's result
+CLIP0_NUM_FRAMES=49                # 8k+1 from duration*fps
+
+# 2. Extract the final 9 frames of clip 0 as an MP4 segment
+SEGMENT=$(curl -s -X POST "$API/v2/video/extract-segment" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"video_uri\": \"$CLIP0_VIDEO_URI\", \"start_frame\": $((CLIP0_NUM_FRAMES - 9)), \"num_frames\": 9}")
+SEGMENT_URI=$(echo "$SEGMENT" | jq -r .segment_uri)
+
+# 3. Generate clip 1 with segment_uri — backend hard-pins its first 9 pixel frames
+curl -X POST "$API/v2/audio-to-video" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d "{\"prompt\": \"she keeps dancing\", \"audio_uri\": \"storage://xyz\", \"segment_uri\": \"$SEGMENT_URI\", \"model\": \"ltx-2-3-pro\", \"resolution\": \"1920x1080\", \"duration\": 2.04, \"fps\": 24}"
+```
+
+- `num_frames` must be 8k+1 and one of `{9, 17, 25, 33}`. v1.12 ships with **9** as the recommended/default.
+- `segment_uri` is mutually exclusive with `image_uri` and `keyframes` (3-way mutex, 422 on conflict).
+- On composition save: set `tailTrimFrames=9` on every non-final clip (the 9 pinned head frames re-show the prior clip's tail — trim so it appears exactly once) and `chainMode="seamless-segment"` at the composition root.
+- Gate UI behind FE flag `flags.v112_seamless_segment`. Legacy v1.11.5 3-PNG-keyframes path (`extract-frames` → 3 keyframes) is still supported as the fallback.
+- Full FE spec + error handling + migration notes: **[docs/handover-frontend-v1.10-chain.md](./handover-frontend-v1.10-chain.md)** (v1.12 section at top).
 
 ### `POST /v2/video-outpaint` (v1.7.0)
 ```json

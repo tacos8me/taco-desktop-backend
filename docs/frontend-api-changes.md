@@ -1,12 +1,27 @@
 # Frontend API Changes
 
-> ⚠️ **SUPERSEDED (2026-04-11)** — the canonical frontend references are now **[QUICKSTART.md](./QUICKSTART.md)** (5-minute onboarding) and **[API.md](./API.md)** (full 47-route spec). This doc is preserved for historical context of the v1.1–v1.1.4 migration; new features from **v1.1.5+ (video thumbnails, phase field, SSE stream, JoyAI edit)** are documented in the canonical files.
+> ⚠️ **SUPERSEDED (2026-04-11)** — the canonical frontend references are now **[QUICKSTART.md](./QUICKSTART.md)** (5-minute onboarding) and **[API.md](./API.md)** (full spec). This doc is preserved as version history; features from **v1.1.5+ (video thumbnails, phase field, SSE stream, JoyAI edit, etc.)** are documented in the canonical files. The v1.12 section below is kept as a pointer to the dedicated handover doc.
 
 > **Audience**: taco-desktop frontend team
-> **Date**: 2026-03-07 (original) · 2026-04-09 (Flux 2 LoRA added) · 2026-04-11 (v1.1.4 single-GPU swap mode)
+> **Date**: 2026-03-07 (original) · 2026-04-09 (Flux 2 LoRA added) · 2026-04-11 (v1.1.4 single-GPU swap mode) · 2026-04-20 (v1.12 chain-segment pointer added)
 > **Server**: `http://<host>:8090`
 
 This document covers all recent backend changes that affect the frontend. Read it top to bottom before starting migration work.
+
+---
+
+## v1.12 (2026-04-20) — MusicVideo seamless-segment chain conditioning
+
+Pointer only. Full spec: **[handover-frontend-v1.10-chain.md § v1.12](./handover-frontend-v1.10-chain.md)** (top of file, canonical).
+
+Summary of the API surface change:
+
+- **New endpoint**: `POST /v2/video/extract-segment` — body `{video_uri, start_frame, num_frames}` → `{segment_uri, width, height, num_frames, fps}`. Returns a silent MP4 storage URI for a 9-frame (or other `8k+1 ∈ {9,17,25,33}`) tail segment. Mirrors the existing `/v2/video/extract-frames` security model (bearer + capability URL + per-key daily byte quota).
+- **New request field**: `segment_uri: string | null` on `AudioToVideoRequest` and `ImageToVideoRequest`. Mutually exclusive with `image_uri` and `keyframes` (3-way exclusion, 422 on mix).
+- **Composition schema**: per-clip `segmentUri: string | null` (informational) and root-level `chainMode: "seamless-segment"` (alongside existing `"seamless"` / `"hardcut"`). `tailTrimFrames=9` on non-final clips when chaining via segment.
+- **Experimental, flagged**: gate FE behind `flags.v112_seamless_segment`. Legacy v1.11.5 3-PNG-keyframes path (`extract-frames` + `keyframes`) stays fully supported — do not remove.
+
+No other endpoint shapes changed in v1.12.
 
 ---
 

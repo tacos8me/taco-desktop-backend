@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.10.0 (2026-04-20). See [CHANGELOG](../CHANGELOG.md).
+**Current version:** v1.12.0 (2026-04-20). See [CHANGELOG](../CHANGELOG.md).
 
 ## Environment Variables
 

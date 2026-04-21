@@ -4,9 +4,11 @@ All notable changes to taco-backend. Format loosely follows [Keep a Changelog](h
 
 ## v1.12.0 — 2026-04-20
 
-### Feat: multi-frame video-segment chain conditioning (the proper fix)
+### Feat: multi-frame video-segment chain conditioning (the proper fix) — EXPERIMENTAL / opt-in
 
-v1.10.0 through v1.11.5 tried to chain-condition clips by sending 3 extracted PNG frames as keyframes at `frame_index=[0, 1, 2]`, strength 1.0. Empirical testing at v1.11.5 proved this architecture can only hard-pin pixel frame 0 (via `VideoConditionByLatentIndex`); frames 1-2 are soft-guided via `VideoConditionByKeyframeIndex` (appended context tokens, main video latent still free-denoised). Subject identity drifted cliff-wise at seam 2+ because each chain hop's anchor was itself a free-generated frame from the prior clip's tail.
+> **Experimental**: backend-complete and smoke-tested, but FE migration and visual regression testing have not yet completed. Gate FE behind `flags.v112_seamless_segment`; legacy v1.11.5 `keyframes` path remains fully supported as the default. Do not flip on for prod users until the `flags.v112_seamless_segment` rollout is verified.
+
+v1.10.0 through v1.11.5 tried to chain-condition clips by sending 3 extracted PNG frames as keyframes at `frame_index=[0, 1, 2]`, strength 1.0. Empirical testing at v1.11.5 proved this architecture can only hard-pin pixel frame 0 (via `VideoConditionByLatentIndex`); frames 1-2 are soft-guided via `VideoConditionByKeyframeIndex` (appended context tokens, main video latent still free-denoised). Subject identity drifted cliff-wise at seam 2+ because each chain hop's anchor was itself a free-generated frame from the prior clip's tail. v1.11.3 attempted to route those frames through `image_conditionings_by_replacing_latent` to hard-pin all three, but the replace path operates at latent-frame granularity (1 latent ≈ 8 pixel frames under LTX's causal 8k+1 VAE), which produced a "slideshow" of held stills in pixel frames 1–16 — reverted in v1.11.5. v1.12 is the architecturally correct fix. See commit `c45449f`.
 
 v1.12 fixes this architecturally. FE extracts a contiguous 9-pixel-frame MP4 segment from the prior clip's tail via new `/v2/video/extract-segment` endpoint. Backend VAE-encodes the segment as a 2-latent-frame tensor and pins target's latents [0, 1] via a single `VideoConditionByLatentIndex(latent=multi_frame_latent, latent_idx=0, strength=1.0)`. LTX's causal VAE maps latent 0 → pixel 0, latent 1 → pixel frames 1-8 — so 9 consecutive target pixel frames are hard-pinned at every sigma step, with real continuous motion content from the prior clip (not held stills as in the v1.11.3 slideshow regression).
 
@@ -46,7 +48,8 @@ FE flow: generate clip 0 → on completion, `POST /v2/video/extract-segment {vid
 
 - 120/120 pytest green
 - `/v2/video/extract-segment` smoke-tested: correctly rejects single-frame inputs as `segment_out_of_range`, emits valid MP4 uploads on valid ranges.
-- Service restarted on Unit A+B+C code.
+- Service restarted on v1.12.0 code.
+- End-to-end visual regression of a seamless-segment composition against the v1.11.5 baseline is **pending** — blocker for flipping `flags.v112_seamless_segment` on.
 
 ## v1.11.5 — 2026-04-20
 
