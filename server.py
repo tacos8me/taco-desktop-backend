@@ -1891,13 +1891,17 @@ async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> by
                 new_kf["image_b64"] = _read_b64(new_kf.pop("image_path"))
             remote_keyframes.append(new_kf)
 
-    # v1.7.0 + v1.9.0: for outpaint, each remote provider has the IC-LoRA
-    # pre-staged on its own network volume at a provider-specific mount.
-    # Rewrite the local LORAS_DIR prefix to the provider's mount so fused-
-    # transformer cache keys match across requests on that provider (avoids
-    # per-request LoRA file re-staging).
+    # v1.7.0 + v1.9.0: remote providers have LoRAs pre-staged at a provider-
+    # specific network volume mount. Rewrite the local LORAS_DIR prefix to
+    # that mount so fused-transformer cache keys match across requests on
+    # that provider (avoids per-request LoRA file re-staging + prevents a
+    # 404 when the remote worker tries to open our local filesystem path).
+    # v1.12.3: rewrite applies to ALL video job types with a lora_path — was
+    # previously gated on VIDEO_OUTPAINT which silently broke t2v/i2v/a2v
+    # with custom user LoRAs on Modal/RunPod. Local turbo (cuda:1 sidecar)
+    # didn't trip this because filesystem is shared.
     remote_lora_path = p.get("lora_path")
-    if job.type == JobType.VIDEO_OUTPAINT and remote_lora_path:
+    if remote_lora_path:
         local_loras_dir = str(config.LORAS_DIR).rstrip("/") + "/"
         if remote_lora_path.startswith(local_loras_dir):
             provider_mount = config.LTX_PROVIDER_LORAS_MOUNT.get(provider)

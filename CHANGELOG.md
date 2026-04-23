@@ -2,6 +2,25 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.12.3 — 2026-04-23
+
+### Fix: LoRA path rewriting applies to all remote video jobs, not just outpaint
+
+Swarm audit of the Modal/RunPod dispatch path found that `_dispatch_job_turbo_remote` (server.py) only rewrote the `lora_path` prefix from `LORAS_DIR` to the provider's network-volume mount **when `job.type == JobType.VIDEO_OUTPAINT`**. Any other video job (t2v, i2v, a2v) with a custom user LoRA routed to Modal or RunPod sent the LOCAL filesystem path to the remote worker, which then failed at LoRA file open.
+
+Local turbo (cuda:1 sidecar) didn't trip this because the filesystem is shared. Remote-only silent failure path — hadn't triggered in production because most LoRA traffic was outpaint (IC-LoRA, correctly rewritten).
+
+Fix: drop the `VIDEO_OUTPAINT` gate. Rewrite for every video job type with a `lora_path`. One-line change.
+
+### Not changed
+
+- Remote dispatch field coverage: audit confirmed 100% parity between `ltx_sidecar_client.generate()`, Modal's `GenerateRequest`, RunPod's `GenerateRequest`, and the manager call dispatch. segment_b64 staging works correctly on both remote sidecars.
+- 8-concurrency backend soundness: verified via lock inventory. No backend serialization on the dispatch hot path. `_inference_lock` bypassed by all 7 turbo workers; `asyncio.Queue` multi-consumer safe; ThreadPoolExecutor has ample headroom at 8 concurrent jobs.
+
+### Ops
+
+Service restart to load v1.12.3 code. Modal scaling up to 4 workers immediately after.
+
 ## v1.12.2 — 2026-04-21
 
 ### Fix: revert v1.11.4's `crf=0` on conditioning images — restores motion + 1440p quality
