@@ -70,7 +70,7 @@ class LtxSidecarClient:
         url = f"{self._base_url}{path}"
         t0 = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self._mgmt_timeout) as client:
+            async with httpx.AsyncClient(timeout=self._mgmt_timeout, follow_redirects=True) as client:
                 resp = await client.request(method, url, headers=self._headers())
         except httpx.TimeoutException as exc:
             logger.info("LTX sidecar[%s] %s %s TIMEOUT in %.2fs", self.label, method, path, time.perf_counter() - t0)
@@ -201,7 +201,7 @@ class LtxSidecarClient:
         url = f"{self._base_url}/generate"
         t0 = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self._generate_timeout) as client:
+            async with httpx.AsyncClient(timeout=self._generate_timeout, follow_redirects=True) as client:
                 resp = await client.post(url, json=payload, headers=self._headers())
         except httpx.TimeoutException as exc:
             logger.info("LTX sidecar[%s] POST /generate TIMEOUT in %.2fs", self.label, time.perf_counter() - t0)

@@ -2,6 +2,23 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.12.4 — 2026-04-23
+
+### Fix: Modal/RunPod sidecar dispatch now follows HTTP 303 redirects
+
+First Modal dispatch attempt after scaling the pool returned `LtxSidecarError: http_303`. Root cause: `httpx.AsyncClient` defaults to `follow_redirects=False`, and Modal's web-endpoint protocol returns `303 See Other` on cold-start (container spawn) with a Location header pointing to a result URL that blocks until the container is warm.
+
+Fix: pass `follow_redirects=True` to the `httpx.AsyncClient` constructor on both the management (`_mgmt_request`) and generate paths in `ltx_sidecar_client.py`. Two-line change. After this, Modal cold-start calls resolve transparently.
+
+### Bundles v1.12.3 LoRA rewrite fix
+
+v1.12.3 shipped the one-line fix in `_dispatch_job_turbo_remote` for non-outpaint video jobs with custom LoRAs on Modal/RunPod (was gated on `VIDEO_OUTPAINT`, now applies to all video job types). That fix had not yet been loaded into the running process (awaiting restart). This restart loads both fixes together.
+
+### Not changed
+
+- All other v1.12 work (segment conditioning, crf revert, composition export, dispatch diagnostics) unchanged.
+- Remote-sidecar container images (Modal + RunPod) not touched — only the main taco-backend HTTP client was patched.
+
 ## v1.12.3 — 2026-04-23
 
 ### Fix: LoRA path rewriting applies to all remote video jobs, not just outpaint
