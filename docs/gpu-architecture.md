@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.12.0 (2026-04-20). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. v1.10.0 added seamless MusicVideo export via multi-frame chain conditioning; v1.12.0 replaced the 3-keyframes chain with a single video-segment conditioning (no GPU-topology changes). See [CHANGELOG](../CHANGELOG.md).
+**Current version:** v1.13.0 (2026-04-23). Turbo-mode entry/exit hardened in v1.5; remote-sidecar pool added in v1.6; expanded to multi-provider (Modal + RunPod) in v1.9.0. v1.10.0 added seamless MusicVideo export via multi-frame chain conditioning; v1.12.0 replaced the 3-keyframes chain with a single video-segment conditioning. v1.13.0 raises the Modal pool cap from 4 → 10 and adds `GET /v1/system/workers` for live per-worker introspection (no GPU-topology changes). See [CHANGELOG](../CHANGELOG.md).
 
 ## Dual-GPU Layout
 
@@ -69,7 +69,7 @@ Prior to v1.1.4, `DenoiserWorker` held strong refs to source model builders that
 
 ## Turbo Mode (v1.2, hardened v1.5)
 
-Turbo mode temporarily claims **both** GPUs for LTX, enabling 2 concurrent local denoiser workers. Combined with the optional multi-provider remote-sidecar pool (v1.6 Modal, v1.9 RunPod) it scales up to **8 concurrent video workers** (2 local + 4 Modal + 2 RunPod).
+Turbo mode temporarily claims **both** GPUs for LTX, enabling 2 concurrent local denoiser workers. Combined with the optional multi-provider remote-sidecar pool (v1.6 Modal, v1.9 RunPod; v1.13 Modal max raised to 10) it scales up to **14 concurrent video workers** (2 local + 10 Modal + 2 RunPod).
 
 Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 
@@ -98,7 +98,7 @@ Toggle via `POST /v1/system/turbo` with body `{"enable": true/false}`.
 Optional extra workers dispatch to HTTP sidecars on remote hardware. v1.9.0 supports multiple providers side-by-side: Modal (RTX Pro 6000, $3.03/hr) and RunPod Load-Balancing Serverless (RTX PRO 6000 Blackwell, ~$2.66/hr). Each provider has its own URL, token, and max-worker cap; operators scale them independently via the dashboard or API.
 
 - **Config per provider** in `.env` (all optional):
-  - Modal: `LTX_MODAL_SIDECAR_URL`, `LTX_MODAL_SIDECAR_TOKEN`, `LTX_MODAL_MAX_WORKERS` (default 4). Falls back to the legacy `LTX_REMOTE_SIDECAR_*` env vars if unset.
+  - Modal: `LTX_MODAL_SIDECAR_URL`, `LTX_MODAL_SIDECAR_TOKEN`, `LTX_MODAL_MAX_WORKERS` (default 10 since v1.13.0; was 4 in v1.6–v1.12). Falls back to the legacy `LTX_REMOTE_SIDECAR_*` env vars if unset.
   - RunPod: `LTX_RUNPOD_SIDECAR_URL`, `LTX_RUNPOD_SIDECAR_TOKEN`, `LTX_RUNPOD_MAX_WORKERS` (default 2).
 - **Scaling**:
   - Legacy `POST /v1/system/pool/remote-workers {"count": N}` — scales **modal only** (backwards compat).
@@ -163,5 +163,6 @@ For operators who want explicit control (all require Bearer auth):
 | `/v1/system/config/reset` | POST | Reset generation config to defaults |
 | `/v1/system/pool` | GET | Remote-sidecar pool state (v1.6) |
 | `/v1/system/pool/remote-workers` | POST | Scale remote worker count 0..MAX (v1.6) |
+| `/v1/system/workers` | GET | Live per-worker state (local + modal + runpod) (v1.13.0) |
 | `/v1/system/gpu` | GET | nvidia-smi telemetry (2 s cache) |
 | `/dashboard` | GET | GPU management dashboard (no auth) |

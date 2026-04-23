@@ -161,6 +161,11 @@ class Job:
     enhanced_prompt: str | None = None
     gen_config_snapshot: dict | None = None
     raw_request: dict | None = None
+    # v1.13.0: which worker is/was running this job. Set in worker_loop at claim
+    # time (before status flips to PROCESSING) and preserved through completion.
+    # Values: "queue-worker" (cuda:0 main), "turbo-worker" (cuda:1 sidecar),
+    # "modal-<N>" (Modal slot N), "runpod-<N>" (RunPod slot N).
+    worker_id: str | None = None
 
 
 class JobStore:
@@ -232,6 +237,7 @@ async def worker_loop(
     turbo_check: Callable[[Job], bool] | Callable[[], bool] | None = None,
     on_complete: Callable[[Job], None] | None = None,
     accept_check: Callable[[Job], bool] | None = None,
+    worker_id: str = "queue-worker",
 ) -> None:
     """Background worker that processes jobs from the queue.
 
@@ -251,7 +257,7 @@ async def worker_loop(
     that only the main worker knows how to dispatch. A short sleep prevents
     a hot-spin when the main worker is temporarily busy.
     """
-    logger.info("Queue worker started")
+    logger.info("Queue worker started (id=%s)", worker_id)
     while True:
         job_id = await queue.get()
         job = job_store.get(job_id)
@@ -269,10 +275,11 @@ async def worker_loop(
             await asyncio.sleep(0.05)  # avoid tight spin if main is busy
             continue
 
+        job.worker_id = worker_id
         job.status = JobStatus.PROCESSING
         job.started_at = time.monotonic()
         job.phase = "denoising"
-        logger.info("Processing job %s (%s)", job.id, job.type)
+        logger.info("Processing job %s (%s) on %s", job.id, job.type, worker_id)
 
         result_bytes: bytes | None = None
         try:

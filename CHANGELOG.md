@@ -2,6 +2,46 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.13.0 — 2026-04-23
+
+### Feat: Live Workers dashboard panel + raise Modal max to 10
+
+Dashboard gains a new Live Workers section between Job Queue and Controls. One card per active worker (cuda:0 main, cuda:1 turbo sidecar, each remote provider slot) with live status, current job id (click-to-copy), job type + resolution + frames, phase (`denoising` / `decoding` / `encoding` / `saving`), elapsed time, and a per-worker progress bar. 2 s poll cadence, zero external API calls — inferred entirely from our own task tracking via a new `job.worker_id` field and the `_remote_worker_tasks` registry.
+
+Remote-pool ceiling raised: `LTX_REMOTE_SIDECAR_MAX_WORKERS` default `4 → 10`, bringing the Modal button grid from 0..4 to 0..10. Bigger fan-out for batch-heavy workloads. RunPod cap unchanged (`LTX_RUNPOD_MAX_WORKERS=2`).
+
+### New API surface
+
+- **`GET /v1/system/workers`** — returns live per-worker state. Used by the dashboard's Live Workers panel; useful for any client that wants real-time visibility into the pool. Response shape documented in `docs/API.md`. Bearer required; no admin gate.
+
+### Backend plumbing
+
+- `Job.worker_id: str | None` field on the Job dataclass. Set in `worker_loop` at claim time (before status flips to `PROCESSING`). Values: `queue-worker` (cuda:0 main), `turbo-worker` (cuda:1 sidecar), `modal-<N>`, `runpod-<N>`.
+- `worker_loop(..., worker_id=<name>)` kwarg. All 4 spawn points pass an explicit worker id.
+- `/v1/system/workers` reverse-looks-up the job store for each worker id, joins with task-liveness from `_remote_worker_tasks` + `_turbo_worker_task`.
+
+### Dashboard changes
+
+- New "Live Workers" section (dashboard.html). Reuses existing `.badge-dot`, `.gpu-tenant`-style pills. `.worker-card` CSS added. Polls `/v1/system/workers` every 2 s.
+- Modal pool button grid widened from 5 columns to 11 (0..10).
+- Worker count header: `N busy / M idle · T total`.
+
+### Why
+
+With turbo + 4 Modal + 2 RunPod = up to 8 concurrent video workers, the aggregate pool counts in the old UI didn't answer "which worker is doing what right now?" The new panel surfaces per-worker state so you can see instantly whether local workers are saturating first and remote is idle, whether a specific worker is hung, and what each is processing.
+
+### Back-compat
+
+- `/v1/system/pool` response unchanged — legacy clients keep working.
+- `Job.worker_id` additive; existing code that reads Job fields ignores it.
+- Modal max raised from 4 to 10 — any operator relying on the old cap should pin `LTX_MODAL_MAX_WORKERS=4` in `.env`. No FE change required; pool buttons simply render more options.
+
+### Verification
+
+- 120/120 pytest green
+- Imports clean
+- Local-only live test (no Modal warmup): endpoint returns idle workers at rest, live-updates during a single local job, `worker_id` agrees between `/v1/system/workers` and `/v2/jobs/{id}`.
+
 ## v1.12.4 — 2026-04-23
 
 ### Fix: Modal/RunPod sidecar dispatch now follows HTTP 303 redirects

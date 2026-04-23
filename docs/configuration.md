@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-**Current version:** v1.12.0 (2026-04-20). See [CHANGELOG](../CHANGELOG.md).
+**Current version:** v1.13.0 (2026-04-23). See [CHANGELOG](../CHANGELOG.md).
 
 ## Environment Variables
 
@@ -47,10 +47,10 @@ Optional HTTP sidecar(s) on remote hardware. v1.9.0 supports **multiple provider
 |----------|---------|-------------|
 | `LTX_REMOTE_SIDECAR_URL` | `""` | **Legacy alias** — points at the `modal` provider when set. Prefer `LTX_MODAL_SIDECAR_URL` in new deployments. |
 | `LTX_REMOTE_SIDECAR_TOKEN` | `""` | Legacy alias. Bearer token value (not env-var name). |
-| `LTX_REMOTE_SIDECAR_MAX_WORKERS` | `4` | Legacy alias. Upper bound on the modal pool. |
+| `LTX_REMOTE_SIDECAR_MAX_WORKERS` | `10` | Legacy alias. Upper bound on the modal pool. *(default raised from 4 → 10 in v1.13.0)* |
 | `LTX_MODAL_SIDECAR_URL` | legacy | Modal-specific base URL. Falls back to `LTX_REMOTE_SIDECAR_URL` if unset. |
 | `LTX_MODAL_SIDECAR_TOKEN` | legacy | Modal Bearer token. |
-| `LTX_MODAL_MAX_WORKERS` | `LTX_REMOTE_SIDECAR_MAX_WORKERS` | Modal pool cap. Must NOT exceed the Modal app's `max_containers` (default 4 in `modal_app.py`). |
+| `LTX_MODAL_MAX_WORKERS` | `LTX_REMOTE_SIDECAR_MAX_WORKERS` (default `10` in v1.13.0) | Modal pool cap. Must NOT exceed the Modal app's `max_containers` in `modal_app.py`. |
 | `LTX_RUNPOD_SIDECAR_URL` | `""` (disabled) | RunPod Load-Balancing Serverless base URL — typically `https://api.runpod.ai/v2/<endpoint_id>/lb`. |
 | `LTX_RUNPOD_SIDECAR_TOKEN` | `""` | Bearer token matching the endpoint's `SIDECAR_AUTH_TOKEN` secret. |
 | `LTX_RUNPOD_MAX_WORKERS` | `2` | RunPod pool cap. Must match or be ≤ the endpoint's `workers.max`. |
@@ -90,11 +90,11 @@ MAX_BATCH_ITEMS=50
 # Legacy single-provider (still works, aliases to modal):
 # LTX_REMOTE_SIDECAR_URL=https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run
 # LTX_REMOTE_SIDECAR_TOKEN=your-modal-bearer-token
-# LTX_REMOTE_SIDECAR_MAX_WORKERS=4
+# LTX_REMOTE_SIDECAR_MAX_WORKERS=10
 # v1.9.0 per-provider form:
 # LTX_MODAL_SIDECAR_URL=https://tacos8me--taco-ltx-sidecar-ltxsidecar-fastapi-app.modal.run
 # LTX_MODAL_SIDECAR_TOKEN=your-modal-bearer-token
-# LTX_MODAL_MAX_WORKERS=4
+# LTX_MODAL_MAX_WORKERS=10
 # LTX_RUNPOD_SIDECAR_URL=https://api.runpod.ai/v2/<endpoint_id>/lb
 # LTX_RUNPOD_SIDECAR_TOKEN=your-runpod-bearer-token
 # LTX_RUNPOD_MAX_WORKERS=2

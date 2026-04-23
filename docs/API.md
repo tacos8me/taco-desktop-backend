@@ -396,6 +396,57 @@ Inspect the LTX remote-sidecar pool. **v1.9.0 multi-provider** — each provider
 
 Total concurrent video workers when turbo is on: `2 local + sum(providers[*].active)`.
 
+### `GET /v1/system/workers` (v1.13.0)
+
+Live per-worker state for dashboards. One entry per active worker task: local cuda:0 main, local cuda:1 turbo sidecar (when turbo is on), and one per active remote provider slot.
+
+```json
+{
+  "turbo_active": true,
+  "providers": {
+    "local":  {"count": 2},
+    "modal":  {"target": 4, "active": 4, "max": 10},
+    "runpod": {"target": 0, "active": 0, "max": 2}
+  },
+  "workers": [
+    {
+      "id": "queue-worker",
+      "provider": "local-main",
+      "slot": 0,
+      "status": "busy",
+      "current_job": {
+        "id": "op6B5rCryVy2hd423pycuA",
+        "type": "audio-to-video",
+        "model": "ltx-2-3-fast",
+        "width": 2560, "height": 1472,
+        "num_frames": 145, "fps": 24.0,
+        "phase": "denoising",
+        "progress": 0.62,
+        "started_at": 1776796257.1,
+        "elapsed_sec": 34.2,
+        "current_step": 18, "total_steps": 30
+      }
+    },
+    { "id": "turbo-worker", "provider": "local-sidecar", "slot": 0, "status": "idle", "current_job": null },
+    { "id": "modal-0", "provider": "modal", "slot": 0, "status": "busy", "current_job": { ... } },
+    { "id": "modal-1", "provider": "modal", "slot": 1, "status": "idle", "current_job": null }
+  ]
+}
+```
+
+**Worker IDs:**
+- `queue-worker` — cuda:0 main worker (always present).
+- `turbo-worker` — cuda:1 local sidecar (present when `turbo_active=true`).
+- `modal-<N>` / `runpod-<N>` — one per spawned remote slot (`<N>` is 0-indexed position in the provider's worker-task list).
+
+**Status:** `"busy"` when a job is currently dispatched to this worker; `"idle"` otherwise. Inferred from `job.worker_id` on in-flight jobs in the store — zero external calls to Modal/RunPod.
+
+**`current_job`** is null when idle; when busy, live-updated via the denoiser callbacks (progress + current_step update every sigma step; phase transitions from `denoising` → `decoding` → `encoding` → `saving`).
+
+**Typical dashboard poll cadence:** 2 s. Response size is small (~200 B per worker × 6-10 workers = ~2 KB).
+
+Auth: bearer required. No admin gate — read-only.
+
 ### `POST /v1/system/pool/remote-workers`
 
 Set target remote-worker counts. Clamped per-provider to `[0, providers[p].max]`. Immediate if turbo is on; stored for next turbo-enable otherwise.

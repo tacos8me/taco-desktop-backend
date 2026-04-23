@@ -134,14 +134,16 @@ ACE Step (xl-base + LM) generates music from text prompts and lyrics.
 
 ## Turbo Mode Throughput
 
-When turbo mode is active (`POST /v1/system/turbo`), both GPUs are assigned to LTX with 2 concurrent denoiser workers. This doubles video generation throughput:
+When turbo mode is active (`POST /v1/system/turbo`), both GPUs are assigned to LTX with 2 concurrent denoiser workers. This doubles local video throughput, and the optional multi-provider remote pool stacks on top:
 
 | Mode | Video workers | Video throughput | Image/Music |
 |------|--------------|-----------------|-------------|
 | Normal | 1 (cuda:0) | 1x | Available |
-| Turbo | 2 (cuda:0 + cuda:1) | 2x | Unavailable (503) |
+| Turbo (local only) | 2 (cuda:0 + cuda:1) | 2x | Unavailable (503) |
+| Turbo + Modal pool (v1.13.0 max 10) | 2 local + up to 10 Modal | up to 12x | Unavailable (503) |
+| Turbo + Modal + RunPod (peak) | 2 local + 10 Modal + 2 RunPod = 14 | up to 14x | Unavailable (503) |
 
-Turbo mode is intended for batch video processing. Entry takes ~20 s, exit ~15 s.
+Turbo mode is intended for batch video processing. Entry takes ~20 s, exit ~15 s. Inspect live per-worker state via `GET /v1/system/workers` (v1.13.0).
 
 ## Model Selection Guide
 

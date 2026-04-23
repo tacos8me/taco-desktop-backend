@@ -92,7 +92,7 @@ LTX_SIDECAR_URL = os.environ.get("LTX_SIDECAR_URL", "http://127.0.0.1:8093")
 # is still honored and aliased to the `modal` provider for backwards compat.
 LTX_REMOTE_SIDECAR_URL = os.environ.get("LTX_REMOTE_SIDECAR_URL", "").strip()
 LTX_REMOTE_SIDECAR_TOKEN = os.environ.get("LTX_REMOTE_SIDECAR_TOKEN", "").strip()
-LTX_REMOTE_SIDECAR_MAX_WORKERS = int(os.environ.get("LTX_REMOTE_SIDECAR_MAX_WORKERS", "4"))
+LTX_REMOTE_SIDECAR_MAX_WORKERS = int(os.environ.get("LTX_REMOTE_SIDECAR_MAX_WORKERS", "10"))
 
 # Modal provider — explicit per-provider env, falls back to legacy LTX_REMOTE_SIDECAR_*.
 LTX_MODAL_SIDECAR_URL = os.environ.get("LTX_MODAL_SIDECAR_URL", LTX_REMOTE_SIDECAR_URL).strip()

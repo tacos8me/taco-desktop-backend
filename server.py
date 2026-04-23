@@ -583,7 +583,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     worker_task = asyncio.create_task(
         worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job, uploads, history,
                     turbo_check=lambda job: _turbo_active and job.type in _VIDEO_JOB_TYPES,
-                    on_complete=_decr_queue_on_complete),
+                    on_complete=_decr_queue_on_complete,
+                    worker_id="local-0"),
         name="queue-worker",
     )
     cleanup_task = asyncio.create_task(
@@ -610,7 +611,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             dual_worker_task = asyncio.create_task(
                 worker_loop(job_store, _job_queue, _inference_lock, _dispatch_job_turbo,
                             uploads, history, turbo_check=lambda job: True,
-                            on_complete=_decr_queue_on_complete),
+                            on_complete=_decr_queue_on_complete,
+                            worker_id="local-1"),
                 name="queue-worker-gpu1",
             )
             logger.info("Dual-GPU LTX: sidecar on cuda:1, 2 concurrent video workers active")
@@ -1990,6 +1992,7 @@ async def _scale_remote_pool() -> None:
                             # worker (export-composition, char-rank, etc.).
                             accept_check=lambda job: job.type in _VIDEO_JOB_TYPES,
                             on_complete=_decr_queue_on_complete,
+                            worker_id=f"{provider}-{i}",
                         ),
                         name=f"remote-worker-{provider}-{i}",
                     )
@@ -2134,7 +2137,8 @@ async def _enter_turbo_mode() -> None:
                     # v1.9.6: video-only — export-composition, char-rank, etc.
                     # get re-queued for the main worker to pick up.
                     accept_check=lambda job: job.type in _VIDEO_JOB_TYPES,
-                    on_complete=_decr_queue_on_complete),
+                    on_complete=_decr_queue_on_complete,
+                    worker_id="local-1"),
         name="turbo-worker",
     )
 
@@ -2296,6 +2300,86 @@ async def get_pool_state() -> JSONResponse:
       - Legacy flat ``remote_*`` fields aliased to the modal provider
     """
     return JSONResponse(content=_pool_state_payload())
+
+
+@app.get("/v1/system/workers")
+async def get_workers_state() -> JSONResponse:
+    """v1.13.0 — live per-worker state. One entry per active worker task
+    (local main, local turbo sidecar, each remote provider slot). Each entry
+    includes the worker's current in-flight job (if any) with live progress,
+    phase, elapsed time, and key request dims for dashboard rendering.
+
+    The workers list is reconstructed on each call from ``_turbo_worker_task``,
+    ``_remote_worker_tasks``, and the main queue-worker — plus a reverse lookup
+    from ``job_store._jobs`` into workers by ``job.worker_id``. Zero external
+    calls (no Modal/RunPod API), zero new persistence. Purely inferred from
+    our own task tracking.
+    """
+    now = time.monotonic()
+
+    # Reverse lookup: worker_id -> current processing job
+    busy: dict[str, Job] = {}
+    for j in job_store._jobs.values():
+        if j.status == JobStatus.PROCESSING and j.worker_id:
+            busy[j.worker_id] = j
+
+    def _job_payload(j: Job) -> dict:
+        p = j.params or {}
+        return {
+            "id": j.id,
+            "type": j.type.value if hasattr(j.type, "value") else str(j.type),
+            "width": p.get("width"),
+            "height": p.get("height"),
+            "num_frames": p.get("num_frames"),
+            "fps": p.get("fps"),
+            "model": p.get("model"),
+            "phase": j.phase,
+            "progress": round(j.progress, 3),
+            "started_at": j.started_at,
+            "elapsed_sec": round(now - j.started_at, 1) if j.started_at else None,
+            "current_step": j.current_step,
+            "total_steps": j.total_steps,
+        }
+
+    def _worker_entry(wid: str, provider: str, slot: int) -> dict:
+        job = busy.get(wid)
+        return {
+            "id": wid,
+            "provider": provider,
+            "slot": slot,
+            "status": "busy" if job else "idle",
+            "current_job": _job_payload(job) if job else None,
+        }
+
+    workers: list[dict] = []
+    # Local cuda:0 main worker — always present
+    workers.append(_worker_entry("local-0", "local", 0))
+    # Local cuda:1 turbo sidecar — present when _turbo_worker_task is live
+    if _turbo_worker_task is not None and not _turbo_worker_task.done():
+        workers.append(_worker_entry("local-1", "local", 1))
+    # Remote providers — one entry per live task (order matches spawn index)
+    for provider in _PROVIDERS:
+        tasks = _remote_worker_tasks.get(provider, [])
+        for i, task in enumerate(tasks):
+            if task.done():
+                continue
+            workers.append(_worker_entry(f"{provider}-{i}", provider, i))
+
+    return JSONResponse(content={
+        "workers": workers,
+        "providers": {
+            "local": {"count": 1 + (1 if _turbo_worker_task and not _turbo_worker_task.done() else 0)},
+            **{
+                p: {
+                    "target": _remote_worker_targets.get(p, 0),
+                    "active": len([t for t in _remote_worker_tasks.get(p, []) if not t.done()]),
+                    "max": _provider_max(p),
+                }
+                for p in _PROVIDERS
+            },
+        },
+        "turbo_active": _turbo_active,
+    })
 
 
 @app.post("/v1/system/pool/remote-workers")

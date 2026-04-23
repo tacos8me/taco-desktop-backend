@@ -2,7 +2,7 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.12.4 (2026-04-23)
+**Version**: v1.13.0 (2026-04-23) — Live Workers dashboard panel + `GET /v1/system/workers` introspection; Modal pool max raised 4 → 10.
 **Public API base URL**: `https://api.noodlefinger.io` *(Cloudflare-proxied — `taco.noodlefinger.io` was retired 2026-04-18, DNS no longer resolves)*
 
 ## Features
@@ -17,10 +17,11 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 - **ERNIE-Image** -- baidu/ERNIE-Image 8B DiT text-to-image via sidecar on cuda:1, ~11 s at turbo steps
 - **Music generation** -- ACE Step xl-base+LM for text-to-music, covers, repainting, and stem extraction
 - **Dual-GPU architecture** -- 2-tenant auto-swap on cuda:0 (LTX and Flux), ACE + JoyAI/ERNIE swap on cuda:1
-- **Turbo mode + multi-provider pool** -- runtime toggle claims both GPUs for LTX (2 concurrent local workers); optional Modal-backed pool *(v1.6)* adds up to 4 remote workers; v1.9.0 adds RunPod as a second provider alongside Modal (up to 2 more) for **up to 8 concurrent video workers** (2 local + 4 Modal + 2 RunPod), tunable live from the dashboard
+- **Turbo mode + multi-provider pool** -- runtime toggle claims both GPUs for LTX (2 concurrent local workers); optional Modal-backed pool *(v1.6)* adds up to 10 remote workers *(max raised 4 → 10 in v1.13.0)*; v1.9.0 adds RunPod as a second provider alongside Modal (up to 2 more) for **up to 14 concurrent video workers** (2 local + 10 Modal + 2 RunPod), tunable live from the dashboard
 - **Batch scheduler** -- submit up to 50 generation jobs in a single request, auto-sorted to minimize GPU swaps, per-item result download
 - **Generation history + reproducibility** *(v1.4)* -- every completed v2 job persists to SQLite with raw request body, gen-config snapshot, seed, and enhanced prompt; thumbnails auto-generated
 - **Dashboard** -- real-time GPU telemetry, sampler toggle, advanced generation controls (14 tunable params), remote-pool slider, management at `/dashboard`
+  - **Live Workers panel** *(v1.13.0)* -- per-worker busy/idle status (local + Modal + RunPod) with in-flight job summary, backed by `GET /v1/system/workers`
 
 ## Quick start
 
@@ -83,6 +84,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | POST | `/v1/system/turbo` | Toggle dual-GPU turbo mode |
 | GET/POST | `/v1/system/pool` | Get state + scale multi-provider remote pool *(v1.6 modal, v1.9 runpod)* |
 | POST | `/v1/system/pool/remote-workers/{provider}` | Scale one provider (modal\|runpod) *(v1.9.0)* |
+| GET | `/v1/system/workers` *(v1.13.0)* | Live per-worker status (local + modal + runpod) |
 | GET | `/uploads/get/{upload_id}` | Read back an upload *(v1.9.1)* |
 | POST | `/v2/video/extract-frames` | Extract N frames from a video as storage:// PNGs (v1.10.0) |
 | POST | `/v2/video/extract-segment` *(v1.12.0)* | Extract a contiguous 9/17/25/33-frame MP4 segment for chain conditioning |

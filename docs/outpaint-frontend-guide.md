@@ -143,7 +143,7 @@ Fall back to `GET /v2/jobs/{id}` every 1-2 s only if EventSource isn't available
 | 5 s @ 1440p, full 2-stage | ~55-75 s |
 | 5 s @ 4K, full 2-stage | ~2-3 min |
 
-Turbo mode (`POST /v1/system/turbo`) doubles throughput but does not reduce per-job latency. The multi-provider remote pool (v1.6 Modal up to 4 workers, v1.9.0 RunPod up to 2) adds concurrency, not speed.
+Turbo mode (`POST /v1/system/turbo`) doubles throughput but does not reduce per-job latency. The multi-provider remote pool (v1.6 Modal up to 10 workers *(raised from 4 in v1.13.0)*, v1.9.0 RunPod up to 2) adds concurrency, not speed.
 
 ## Known limitations
 

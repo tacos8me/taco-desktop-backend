@@ -2,6 +2,12 @@
 
 Everything you need to ship a working client in 5 minutes. For everything else → [docs/API.md](./API.md).
 
+## What's new in v1.13.0 (2026-04-23)
+
+- **`GET /v1/system/workers`** — live per-worker introspection. Returns `{turbo_active, workers: [{id, provider, slot, status, current_job}]}` with `id` like `local-0` / `modal-<N>` / `runpod-<N>`. Powers the dashboard's new Live Workers panel. Zero external calls to Modal/RunPod — status is inferred from `job.worker_id` on in-flight jobs. See [API.md](./API.md) for the full response shape.
+- **Modal pool max raised 4 → 10** — `LTX_REMOTE_SIDECAR_MAX_WORKERS` / `LTX_MODAL_MAX_WORKERS` default bumped, so peak capacity is now **2 local + 10 Modal + 2 RunPod = 14 concurrent video workers**. Pool-control dashboard row now shows 11 buttons (0..10) for Modal.
+- **`Job.worker_id` field** — exposed on the job/history detail endpoints; helpful for correlating which worker slot ran a given job.
+
 ## What's new in v1.12.0 (2026-04-20)
 
 - **Multi-frame chain conditioning for seamless MusicVideo** *(v1.12.0, Experimental)* — new `POST /v2/video/extract-segment` returns an MP4 of a contiguous 9-frame tail; pass as `segment_uri` on the next i2v/a2v clip and backend VAE-encodes it as a multi-latent-frame tensor and hard-pins 9 consecutive target pixel frames. Replaces the v1.11.5 3-PNG-keyframes path (which pinned only pixel frame 0 via `VideoConditionByLatentIndex` and soft-guided the rest via `VideoConditionByKeyframeIndex`, drifting at seam 2+). See "Chain conditioning for MusicVideo" below. Gate behind `flags.v112_seamless_segment`; legacy v1.11.5 keyframes path still fully supported.
@@ -10,7 +16,7 @@ Everything you need to ship a working client in 5 minutes. For everything else �
 - **`tailTrimFrames: int` per-clip composition field** (v1.10.0, default 0) — backend trims the last N frames of each input at export time. Cascades into beat-gap atrim + force-IDR seam math.
 - **`GET /uploads/get/{upload_id}`** (v1.9.1) — read back a previously-uploaded file. Content-Type inferred from magic bytes.
 - **Composition audio overlay** (v1.9.0) — `POST /v2/compositions/{id}/export` accepts optional `{"audio_uri": "storage://<id>"}`.
-- **Multi-provider remote pool** (v1.9.0) — up to 2 local + 4 Modal + 2 RunPod = **8 concurrent video jobs** at peak.
+- **Multi-provider remote pool** (v1.9.0, Modal max raised to 10 in v1.13.0) — up to 2 local + 10 Modal + 2 RunPod = **14 concurrent video jobs** at peak.
 - **Video outpaint** (v1.7.0) — `POST /v2/video-outpaint`. See [docs/outpaint-frontend-guide.md](./outpaint-frontend-guide.md).
 - **Turbo hardening** (v1.5) — `systemctl`-based cuda:1 tenant eviction on entry, 20 s drain deadline with automatic rollback on failure.
 - All changes additive. Legacy env vars (`LTX_REMOTE_SIDECAR_URL`), legacy pool body shape (`{"count": N}`), and the video-only export call keep working unchanged.

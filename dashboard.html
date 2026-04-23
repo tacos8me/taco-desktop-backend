@@ -659,6 +659,41 @@ input[type="range"]::-moz-range-track {
   header { flex-direction: column; align-items: flex-start; }
   .btn { padding: 8px 12px; font-size: 0.78rem; }
 }
+
+/* v1.13.0 — Live Workers panel */
+.workers-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.worker-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.worker-card.busy { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.worker-card.idle { opacity: 0.55; }
+.worker-card .wc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.worker-card .wc-id { font-family: var(--mono); font-size: 0.8rem; color: var(--text); }
+.worker-card .provider-pill {
+  font-size: 0.62rem;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-left: auto;
+}
+.worker-card .provider-pill.modal       { background: oklch(0.32 0.12 260); color: oklch(0.9  0.13 260); }
+.worker-card .provider-pill.runpod      { background: oklch(0.32 0.12 25);  color: oklch(0.9  0.13 25);  }
+.worker-card .provider-pill.local-main  { background: oklch(0.32 0.10 150); color: oklch(0.9  0.13 150); }
+.worker-card .provider-pill.local-sidecar { background: oklch(0.32 0.10 105); color: oklch(0.9 0.13 105); }
+.worker-card .wc-job-id { font-family: var(--mono); font-size: 0.72rem; color: var(--text); cursor: pointer; }
+.worker-card .wc-job-id:hover { color: var(--accent); }
+.worker-card .wc-meta { font-size: 0.7rem; color: var(--text-muted); margin: 2px 0; }
+.worker-card .wc-dim { color: var(--text-dim); }
+.worker-card .wc-idle { font-size: 0.72rem; color: var(--text-dim); font-style: italic; }
+.worker-card .wc-progress { height: 4px; background: var(--bg-hover); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+.worker-card .wc-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
 </style>
 </head>
 <body>
@@ -759,6 +794,12 @@ input[type="range"]::-moz-range-track {
   </div>
 </section>
 
+<!-- Section 3.5: Live Workers (v1.13.0) -->
+<section>
+  <h2>Live Workers <span id="workerCount" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+  <div id="workersGrid" class="workers-grid"></div>
+</section>
+
 <!-- Section 4: Controls -->
 <section>
   <h2>Controls</h2>
@@ -780,7 +821,7 @@ input[type="range"]::-moz-range-track {
     <button class="btn btn-danger" id="btnTurboOff" onclick="toggleTurbo(false)" title="Release cuda:1 back to ACE/JoyAI">Turbo Mode OFF</button>
   </div>
   <div class="btn-row-label">Modal Pool <span id="poolStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
-  <div class="btn-grid" id="poolBtnGrid" style="grid-template-columns:repeat(5,1fr)"></div>
+  <div class="btn-grid" id="poolBtnGrid" style="grid-template-columns:repeat(11,1fr)"></div>
   <div class="btn-row-label">RunPod Pool <span id="poolStatusRunpod" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
   <div class="btn-grid" id="poolBtnGridRunpod" style="grid-template-columns:repeat(5,1fr)"></div>
   <div class="btn-row-label">Sampler <span id="samplerStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(euler)</span></div>
@@ -1840,6 +1881,76 @@ function setSlider(sliderId, labelId, value, decimals) {
 // Init
 // ---------------------------------------------------------------------------
 
+// v1.13.0 — Live Workers panel
+async function pollWorkers() {
+  try {
+    const r = await fetch("/v1/system/workers", { headers: getAuthHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    renderWorkers(d);
+  } catch (e) { /* silent: endpoint may not exist pre-v1.13 */ }
+}
+
+function _fmtElapsed(s) {
+  if (s == null) return "";
+  if (s < 60) return s.toFixed(1) + "s";
+  const m = Math.floor(s / 60);
+  const rem = Math.floor(s - m * 60);
+  return `${m}m ${rem}s`;
+}
+
+function _escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderWorkerCard(w) {
+  const j = w.current_job;
+  const provider = w.provider || "unknown";
+  const providerLabel = provider.replace("local-", "").replace("-", " ");
+  const status = w.status || "idle";
+  let body;
+  if (j) {
+    const dims = (j.width && j.height) ? `${j.width}×${j.height}` : "";
+    const frames = j.num_frames ? ` · ${j.num_frames}f` : "";
+    const pct = Math.round((j.progress || 0) * 100);
+    const phase = _escapeHtml(j.phase || "…");
+    const jid = _escapeHtml(j.id || "");
+    const model = _escapeHtml(j.model || "");
+    const jtype = _escapeHtml(String(j.type || ""));
+    body = `
+      <div class="wc-job-id" title="click to copy: ${jid}" onclick="navigator.clipboard.writeText('${jid}').then(()=>toast('job id copied','ok'))">${jid.slice(0, 10)}…</div>
+      <div class="wc-meta">${jtype}<span class="wc-dim"> · ${model}${dims ? " · " + dims : ""}${frames}</span></div>
+      <div class="wc-meta"><span class="wc-dim">${phase} · ${_fmtElapsed(j.elapsed_sec)} · ${pct}%</span></div>
+      <div class="wc-progress"><div class="wc-progress-fill" style="width:${pct}%"></div></div>
+    `;
+  } else {
+    body = `<div class="wc-idle">idle</div>`;
+  }
+  return `
+    <div class="worker-card ${status}">
+      <div class="wc-head">
+        <span class="badge-dot ${status === 'busy' ? 'green' : 'gray'}"></span>
+        <span class="wc-id">${_escapeHtml(w.id || "")}</span>
+        <span class="provider-pill ${_escapeHtml(provider)}">${_escapeHtml(providerLabel)}</span>
+      </div>
+      ${body}
+    </div>
+  `;
+}
+
+function renderWorkers(d) {
+  const grid = document.getElementById("workersGrid");
+  const count = document.getElementById("workerCount");
+  const workers = d.workers || [];
+  const busy = workers.filter(w => w.status === "busy").length;
+  count.textContent = workers.length
+    ? `${busy} busy / ${workers.length - busy} idle · ${workers.length} total`
+    : "(none)";
+  grid.innerHTML = workers.length
+    ? workers.map(renderWorkerCard).join("")
+    : `<div class="wc-idle" style="padding:12px">No active workers. Enable turbo or scale the remote pool.</div>`;
+}
+
 // Start polling
 pollHealth();
 setInterval(pollHealth, 2000);
@@ -1849,6 +1960,10 @@ pollGpu();
 setInterval(pollGpu, 5000);
 pollPool();
 setInterval(pollPool, 5000);
+
+// v1.13.0 live workers (2s cadence — fast enough for phase transitions)
+pollWorkers();
+setInterval(pollWorkers, 2000);
 </script>
 </body>
 </html>
