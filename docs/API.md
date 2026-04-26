@@ -56,6 +56,7 @@ v1.12 adds **multi-frame video-segment chain conditioning** — a proper fix for
   - [Submission envelope](#submission-envelope)
   - [`POST /v2/text-to-video`](#post-v2text-to-video) · [`POST /v2/image-to-video`](#post-v2image-to-video) · [`POST /v2/audio-to-video`](#post-v2audio-to-video) · [`POST /v2/retake`](#post-v2retake)
   - [`POST /v2/video-outpaint`](#post-v2video-outpaint) **(v1.7.0)**
+  - [`POST /v2/video-hdr`](#post-v2video-hdr) **(v1.14.0)**
   - [`POST /v2/text-to-image`](#post-v2text-to-image) · [`POST /v2/image-to-image`](#post-v2image-to-image) · [`POST /v2/image-edit`](#post-v2image-edit) · [`POST /v2/music`](#post-v2music)
 - [Jobs lifecycle](#jobs-lifecycle) — [`GET /v2/jobs/{id}`](#get-v2jobsjob_id) · [`GET /v2/jobs/{id}/stream`](#get-v2jobsjob_idstream) · [`GET /v2/jobs/{id}/preview`](#get-v2jobsjob_idpreview) · [`GET /v2/jobs/{id}/result`](#get-v2jobsjob_idresult) · [`DELETE /v2/jobs/{id}`](#delete-v2jobsjob_id)
 - [Batch scheduler](#batch-scheduler) — [`POST /v2/batch`](#post-v2batch) · [`GET /v2/batch/{id}`](#get-v2batchbatch_id) · [`GET /v2/batch/{id}/result/{index}`](#get-v2batchbatch_idresultindex) · [`DELETE /v2/batch/{id}`](#delete-v2batchbatch_id)
@@ -954,6 +955,7 @@ All accept the **same bodies** as their v1 counterparts.
 | `POST /v2/audio-to-video` | `AudioToVideoRequest` | `AUDIO_TO_VIDEO` | `video/mp4` |
 | `POST /v2/retake` | `RetakeRequest` | `RETAKE` | `video/mp4` |
 | `POST /v2/video-outpaint` | `VideoOutpaintRequest` | `VIDEO_OUTPAINT` | `video/mp4` (silent) |
+| `POST /v2/video-hdr` | `VideoHdrRequest` | `VIDEO_HDR` | `video/mp4` (silent) |
 | `POST /v2/text-to-image` | `TextToImageRequest` | `TEXT_TO_IMAGE` | `image/webp` |
 | `POST /v2/image-to-image` | `ImageToImageRequest` | `IMAGE_TO_IMAGE` | `image/webp` |
 | `POST /v2/image-edit` | `ImageEditRequest` | `IMAGE_EDIT` | `image/webp` |
@@ -1011,6 +1013,67 @@ All accept the **same bodies** as their v1 counterparts.
 
 ---
 
+### `POST /v2/video-hdr`
+
+**NEW in v1.14.0.** Promotes an LDR source clip to expanded dynamic range using the **IC-LoRA HDR** LoRA (default id `ic-lora-hdr`, repo `Lightricks/LTX-2.3-22b-IC-LoRA-HDR`). Async only.
+
+Architecturally piggybacks on the outpaint pipeline with `target == source` and `position="center"` — the canvas is preserved, only pixel values change. The backend probes source video dims via PyAV and snaps to the nearest /64 multiple automatically; the client only supplies `duration` + `fps`.
+
+**Body:** `VideoHdrRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `video_uri` | string | required | `storage://<uuid>` — source LDR video |
+| `prompt` | string | required | ≤ 10 000 chars — describes the HDR look (e.g. "preserve natural skin tones, expand highlights") |
+| `duration` | float | required | `0 < x ≤ 30` seconds |
+| `fps` | float | required | `0 < x ≤ 60` |
+| `seed` | int | `0` | `≥ 0`; `0` → server picks a random 32-bit uint |
+| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter |
+| `lora` | [`LoRAInput`](#lorainput) \| null | `null` | `null` → defaults to `{"id": "ic-lora-hdr", "strength": 1.0}`. Override only when experimenting with alternate IC-LoRAs. |
+| `conditioning_strength` | float | `1.0` | `0.0 ≤ x ≤ 1.0` — scalar attention weight; lower → more LoRA-driven, less faithful to source |
+| `skip_stage_2` | bool | `false` | `true` → fast half-resolution preview; **also matches upstream's reference LoRA-active stage-1 behavior most closely** |
+
+**Response:** `202` + submission envelope. Output is **silent MP4** (no audio passthrough).
+
+**Server-side dim handling**
+
+The backend reads `(src_w, src_h)` from the MP4's video stream then snaps each axis to the nearest 64-multiple via `_snap64(x) = max(64, ((x+32)//64)*64)`. The output canvas is the snapped pair. Diff vs source is ≤32 px per axis — visually negligible. If you need exact source dims preserved, pre-encode the source at /64-aligned resolutions.
+
+**Known limitations**
+
+- **Stage-2 LoRA fusion deviation** — same as `/v2/video-outpaint`. The LoRA stays fused through stage 2, whereas upstream `ICLoraPipeline` drops it. The HDR LoRA was likely trained against upstream behavior; for the closest-to-canonical output, set `skip_stage_2: true` (returns at half-resolution).
+- **Output is SDR-encoded H.264** with expanded dynamic range baked into the pixel values. True HDR10 / PQ / BT.2020 metadata is **not** added to the MP4 — that's a separate ffmpeg post-step (out of scope).
+- **Audio passthrough not supported** — output is silent.
+- `lora` must resolve in the LTX registry — `404 "LoRA not found: <id>"` if missing. If the default id `ic-lora-hdr` isn't registered: `500 "HDR LoRA resolve returned None — registry misconfigured"` — run `bash scripts/register_hdr_lora.sh` on the host.
+- 422 `video_probe_failed` if the source MP4 has no video stream or is corrupted.
+
+**Example:**
+
+```json
+{
+  "video_uri": "storage://abc-123",
+  "prompt": "expand highlights and shadow detail, preserve natural skin tones",
+  "duration": 6.0,
+  "fps": 24,
+  "seed": 0,
+  "enhance_prompt": false,
+  "lora": null,
+  "conditioning_strength": 1.0,
+  "skip_stage_2": false
+}
+```
+
+**Curl smoke**
+
+```bash
+JOB=$(curl -s -X POST "$API/v2/video-hdr" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"video_uri":"storage://abc","prompt":"expand highlights","duration":6,"fps":24}' | jq -r .job_id)
+curl -s "$API/v2/jobs/$JOB/stream?token=$(curl -sX POST $API/v1/sse-token -H "Authorization: Bearer $KEY" | jq -r .token)"
+```
+
+---
+
 ## Jobs lifecycle
 
 ### `GET /v2/jobs/{job_id}`
@@ -1021,7 +1084,7 @@ Status poll snapshot.
 {
   "job_id": "job_...",
   "status": "queued" | "processing" | "completed" | "failed" | "cancelled",
-  "type": "text-to-video" | "image-to-video" | "audio-to-video" | "retake" | "video-outpaint" | "text-to-image" | "image-to-image" | "image-edit" | "music-generation" | "export-composition",
+  "type": "text-to-video" | "image-to-video" | "audio-to-video" | "retake" | "video-outpaint" | "video-hdr" | "text-to-image" | "image-to-image" | "image-edit" | "music-generation" | "export-composition",
   "progress": 0.42,
   "phase": "denoising" | "decoding" | "encoding" | "saving" | "generating" | null,
   "queue_position": 3,
@@ -1281,7 +1344,7 @@ Full record — includes raw request body (`params`), gen-config snapshot (`gen_
 - `enhanced_prompt` — text of the LTX-rewritten prompt when `enhance_prompt=true`. `null` for Flux/ERNIE/JoyAI/retake/outpaint and for any LTX request where `enhance_prompt=false`.
 - `params` — raw request body from `body.model_dump(mode="json")`. Preserves `storage://` URIs, `Resolution` enum string, `LoRAInput` `{id, strength}` shape, keyframe symbolic indices. Music jobs pass params through `_sanitize_params_for_history` to rewrite staged `/tmp/*` paths back to `storage://`.
 - `gen_config`:
-  - LTX jobs (`text-to-video`, `image-to-video`, `audio-to-video`, `retake`, `video-outpaint`) → snapshot of `_gen_config` at dispatch time (13 keys: sampler, etas, step counts, scheduler shifts, CFG/STG/rescale/modality scales, stg_blocks, stage2_sigmas).
+  - LTX jobs (`text-to-video`, `image-to-video`, `audio-to-video`, `retake`, `video-outpaint`, `video-hdr`) → snapshot of `_gen_config` at dispatch time (13 keys: sampler, etas, step counts, scheduler shifts, CFG/STG/rescale/modality scales, stg_blocks, stage2_sigmas).
   - Flux turbo jobs (`text-to-image`, `image-to-image`, `image-edit` with `turbo=true`) → `{"turbo_steps": 8, "turbo_guidance": 2.5}`.
   - Non-turbo Flux / ERNIE / JoyAI → `null`. Tunables live in `params`.
 
@@ -1939,6 +2002,7 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 | POST | `/v2/audio-to-video` | yes | Async a2v |
 | POST | `/v2/retake` | yes | Async retake |
 | POST | `/v2/video-outpaint` | yes | **v1.7.0** Async IC-LoRA outpaint |
+| POST | `/v2/video-hdr` | yes | **v1.14.0** Async IC-LoRA HDR (canvas preserved) |
 | POST | `/v2/video/extract-frames` | yes | **v1.10.0** PyAV frame extractor (v1.11.5 legacy chain conditioning) |
 | POST | `/v2/video/extract-segment` | yes | **v1.12.0** PyAV segment extractor (experimental v1.12 chain conditioning) |
 | POST | `/v2/text-to-image` | yes | Async t2i |
@@ -2096,6 +2160,7 @@ curl -X POST "$API/v2/batch" \
 - **v1.8.x** — Admin gate on mutation endpoints (`.admin_keys`, `403 admin_required`); tenancy enforcement on `/v2/jobs/*` and `/v2/batch/*`; identity preservation hooks on Klein edit (`preserve_identity`, `identity_strength`, `identity_mode`).
 - **v1.7.0** (2026-04-17)
   - `POST /v2/video-outpaint` — IC-LoRA Outpaint (`oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint`, registered id `ic-lora-outpaint`). Silent MP4 output; black-sentinel LoRA fills padded regions; `skip_stage_2` fast path.
+  - `POST /v2/video-hdr` — IC-LoRA HDR (`Lightricks/LTX-2.3-22b-IC-LoRA-HDR`, registered id `ic-lora-hdr`). Silent MP4 output; LDR→HDR transform with canvas preserved; reuses outpaint pipeline with `target == source, position="center"`; `skip_stage_2` produces the closest match to upstream's reference behavior.
   - `JobType.VIDEO_OUTPAINT` added.
   - New [`OutpaintPosition`](#outpaintposition-v170) enum (9 values).
 - **v1.6** (2026-04-15)

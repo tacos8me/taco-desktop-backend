@@ -2,7 +2,7 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.13.0 (2026-04-23) — Live Workers dashboard panel + `GET /v1/system/workers` introspection; Modal pool max raised 4 → 10.
+**Version**: v1.14.1 (2026-04-26) — CORS fix: allow `*.noodlefinger.io` origins; auth middleware now skips OPTIONS preflights so browsers can complete cross-origin requests. (v1.14.0 added IC-LoRA HDR endpoint `/v2/video-hdr` for video LDR→HDR transform via Lightricks `LTX-2.3-22b-IC-LoRA-HDR`.)
 **Public API base URL**: `https://api.noodlefinger.io` *(Cloudflare-proxied — `taco.noodlefinger.io` was retired 2026-04-18, DNS no longer resolves)*
 
 ## Features
@@ -10,6 +10,7 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 - **Video generation** -- LTX-2.3 (22B transformer, v1.1 distilled models) with text-to-video, image-to-video, audio-to-video, and temporal retake
   - **Chain conditioning** *(v1.12.0, Experimental)* -- multi-frame video-segment conditioning for seamless MusicVideo composition. `POST /v2/video/extract-segment` returns an MP4 of a contiguous 9-frame tail; pass as `segment_uri` on the next i2v/a2v clip and backend hard-pins 9 consecutive target pixel frames via a single VAE-encoded multi-frame latent. Eliminates subject drift across seams. Gated behind FE `flags.v112_seamless_segment`; legacy v1.11.5 keyframes path fully supported.
 - **Video outpaint** *(v1.7.0)* -- IC-LoRA expands a source video's canvas to a larger target resolution; LoRA fills the black padding with temporally-consistent content. 9 placement positions, optional stage-2 skip for fast previews
+- **Video HDR** *(v1.14.0)* -- IC-LoRA promotes an LDR clip to expanded dynamic range while preserving the source canvas. `POST /v2/video-hdr` reuses the outpaint pipeline (target == source, position center) with `Lightricks/LTX-2.3-22b-IC-LoRA-HDR`. Optional stage-2 skip for fast previews; backend snaps source dims to nearest /64 multiple automatically.
 - **CFG++ sampler** -- ported from ComfyUI's `euler_ancestral_cfg_pp`, default ON, togglable via `/v1/system/sampler` and dashboard
 - **Image generation** -- Flux 2 Dev and Klein KV for text-to-image, image-to-image, and multi-reference editing
 - **Identity preservation** *(v1.8.0)* -- optional `preserve_identity` flag on Klein image-edits; pulls denoised latents + attention features toward the first reference for subject/facial consistency under heavy prompt deviation. 3 presets (`balanced`, `faithful`, `loose`) + strength dial
@@ -74,6 +75,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | POST | `/v2/audio-to-video` | Async video synced to audio |
 | POST | `/v2/retake` | Async re-render video segment |
 | POST | `/v2/video-outpaint` *(v1.7.0)* | Async canvas expand via IC-LoRA |
+| POST | `/v2/video-hdr` *(v1.14.0)* | Async LDR→HDR transform via IC-LoRA (canvas preserved) |
 | POST | `/v2/text-to-image` | Async image from text |
 | POST | `/v2/image-to-image` | Async single-ref image edit |
 | POST | `/v2/image-edit` | Async multi-ref edit (Flux) or instruction edit (JoyAI) |
@@ -94,7 +96,7 @@ LTX and Flux share cuda:0 and are mutually exclusive (combined ~160 GB > 96 GB p
 | GET | `/v2/batch/{id}/result/{index}` | Download individual batch item result |
 | GET | `/v1/chat/completions` | Chat/vision proxy (OpenAI-compatible) |
 
-All endpoints except `/health` require `Authorization: Bearer <api-key>`. Every generation endpoint has both sync (`/v1/...`) and async (`/v2/...`) variants, except `/v2/video-outpaint` which is async-only. See [API Reference](docs/API.md) for the full spec.
+All endpoints except `/health` require `Authorization: Bearer <api-key>`. Every generation endpoint has both sync (`/v1/...`) and async (`/v2/...`) variants, except `/v2/video-outpaint` and `/v2/video-hdr` which are async-only. See [API Reference](docs/API.md) for the full spec.
 
 ## Documentation
 
@@ -103,6 +105,7 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`. Every 
 | [API Reference](docs/API.md) | Full 74-endpoint spec with request/response schemas, error taxonomy, common types |
 | [Quick Start Guide](docs/QUICKSTART.md) | 5-minute integration guide for frontend devs |
 | [Outpaint Frontend Guide](docs/outpaint-frontend-guide.md) | `/v2/video-outpaint` integration (v1.7.0) |
+| [HDR Frontend Guide](docs/hdr-frontend-guide.md) | `/v2/video-hdr` integration (v1.14.0) |
 | [Retake Frontend Guide](docs/retake-frontend-guide.md) | `/v2/retake` integration for noodle-v |
 | [GPU Architecture](docs/gpu-architecture.md) | Dual-GPU layout, swap mechanics, turbo mode, remote pool, latency tables |
 | [Models & Latency](docs/models.md) | All model specs (incl. LoRA registry), step counts, VRAM, speed benchmarks |

@@ -159,6 +159,7 @@ Turbo mode is intended for batch video processing. Entry takes ~20 s, exit ~15 s
 | Final render video | `ltx-2-3-hq` (20 steps, ~90 s) |
 | Music generation | ACE `text2music` (~2-10 s) |
 | Video canvas expansion | `/v2/video-outpaint` + `ic-lora-outpaint` (2-stage distilled, ~35-45 s @ 1080p/5 s) |
+| Video LDR→HDR transform | `/v2/video-hdr` + `ic-lora-hdr` (2-stage distilled, canvas preserved) |
 | Batch video processing | Enable turbo mode for 2x throughput |
 
 ## LTX LoRAs (registry.json)
@@ -174,11 +175,13 @@ Registered LoRAs live under `/mnt/nvme-1/servers/taco-backend/loras/` with a JSO
 | `audioreactivev1` | Audio Reactive V1 | `a2v` | 643 MB | Audio-reactive motion LoRA for LTX 2.3 |
 | `licon-vbvr-i2v` | Licon VBVR I2V | `i2v` | 528 MB | Licon VBVR image-to-video, 96K steps, rank 32 |
 | `ic-lora-outpaint` | IC-LoRA Outpaint | `ic_lora_outpaint` | 1.3 GB | Video outpaint IC-LoRA by oumoumad. Fills pure-black regions in a letterboxed source video with temporally consistent content. Used by `/v2/video-outpaint`. File: `ltx-2.3-22b-ic-lora-outpaint.safetensors` (960 tensors, metadata `reference_downscale_factor=1`). Registered 2026-04-17 for v1.7.0. |
+| `ic-lora-hdr` | IC-LoRA HDR | `ic_lora_hdr` | ~1.3 GB | Video HDR-expansion IC-LoRA by Lightricks. Promotes LDR clips to expanded dynamic range while preserving temporal coherence. Same `VideoConditionByReferenceLatent` architecture as outpaint; backend dispatches with `target == source, position="center"`. Used by `/v2/video-hdr`. File: `ltx-2.3-22b-ic-lora-hdr.safetensors`. Registered 2026-04-25 for v1.14.0. |
 
 **Strategy dispatch:**
 - `t2v` → text-to-video / image-to-video (generic style or subject LoRA)
 - `i2v` → image-to-video only
 - `a2v` → audio-to-video only
 - `ic_lora_outpaint` → `/v2/video-outpaint` canvas expansion (treated as a `VideoConditionByReferenceLatent` conditioning, not fused)
+- `ic_lora_hdr` → `/v2/video-hdr` LDR→HDR transform (same architecture as outpaint, target == source)
 
-Files referenced by `registry.json` must exist in `loras/`. To re-scan or edit the registry, use `scripts/register_outpaint_lora.sh` as an idempotent example or edit `registry.json` directly.
+Files referenced by `registry.json` must exist in `loras/`. To re-scan or edit the registry, use `scripts/register_outpaint_lora.sh` / `scripts/register_hdr_lora.sh` as idempotent examples or edit `registry.json` directly.

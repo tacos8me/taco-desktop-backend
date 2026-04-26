@@ -2,6 +2,83 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.14.1 — 2026-04-26
+
+### Fix: CORS preflight + production-origin allowlist
+
+Frontend (noodle-i, noodle-v, m.noodlefinger.io) was silently failing to load any cross-origin API call. Root-caused to two compounding bugs:
+
+1. **`allow_origin_regex` (server.py:669)** only matched `localhost` + `192.168.X.X` LAN. Browser requests from `i.noodlefinger.io` / `v.noodlefinger.io` / `m.noodlefinger.io` got 400 preflight responses with no `access-control-allow-origin` header. Widened the regex to also match `([a-zA-Z0-9-]+\.)?noodlefinger\.io` (covers apex + every subdomain).
+2. **`check_api_key` middleware (server.py:724)** intercepted **all** OPTIONS preflights with 401 because the browser doesn't send `Authorization` on preflights by spec. CORSMiddleware never ran — the FE saw a bare 401 with no CORS headers and the real request never fired. Added `if request.method == "OPTIONS": return await call_next(request)` at the top of the middleware so preflights flow through to CORS.
+
+Both fixes are additive — no other behavior changes. Verified end-to-end via Cloudflare:
+
+```
+OPTIONS https://api.noodlefinger.io/v2/history  Origin: https://i.noodlefinger.io
+→ HTTP/2 200 + access-control-allow-origin: https://i.noodlefinger.io
+OPTIONS …  Origin: https://evil.example.com
+→ HTTP/2 400 (rejected, no allow-origin header — correct)
+```
+
+129/129 pytest green.
+
+### Why this slipped past
+
+The CORS regex shipped that way at the time CORSMiddleware was added (before v1.7). FE-prod was likely using a same-origin proxy until very recently and never exercised cross-origin preflights against this backend; once the FE switched to direct `api.noodlefinger.io` calls, the latent bug surfaced.
+
+---
+
+## v1.14.0 — 2026-04-25
+
+### Feat: IC-LoRA HDR endpoint (`POST /v2/video-hdr`)
+
+New async endpoint that promotes an LDR source clip to expanded dynamic range using `Lightricks/LTX-2.3-22b-IC-LoRA-HDR` (registered as `ic-lora-hdr`, strategy `ic_lora_hdr`). Architecturally the second member of the IC-LoRA family alongside the v1.7.0 outpaint LoRA — same `VideoConditionByReferenceLatent` conditioning, same distilled 2-stage pipeline.
+
+The actual generation codepath is **unchanged** from v1.13.0. HDR is implemented by piggy-backing on `_run_outpaint` with `target == source` and `position="center"` (no canvas expansion). The dispatch chain treats HDR as a thin shim that pre-resolves dims and routes to the existing outpaint method. **Zero modifications** to `split_model_manager._run_outpaint`, `_build_outpaint_reference_latent`, `_read_lora_reference_downscale_factor`, or any `ltx-pipelines` code.
+
+### New API surface
+
+- **`POST /v2/video-hdr`** — `{video_uri, prompt, duration, fps, seed?, enhance_prompt?, lora?, conditioning_strength?, skip_stage_2?}`. Async; returns `{job_id, status: "queued"}`. Same status / preview / result / cancel / SSE-stream lifecycle as every other v2 video endpoint. `lora` defaults to `{id: "ic-lora-hdr", strength: 1.0}` when omitted. Backend probes source dims via PyAV (new `history_store._probe_video_dims` helper) and snaps to nearest /64 multiple before submission.
+
+### Backend additions (purely additive — no existing branches modified)
+
+- `JobType.VIDEO_HDR = "video-hdr"` + `_MEDIA_TYPES[JobType.VIDEO_HDR] = "video/mp4"` (`job_queue.py`).
+- `JobType.VIDEO_HDR` added to `_VIDEO_JOB_TYPES` — automatically participates in turbo + remote-pool dispatch.
+- New `case JobType.VIDEO_HDR:` in `_dispatch_job` calling existing `manager.generate_outpaint(...)`. Local + remote turbo dispatchers forward `position="center"` / `conditioning_strength` / `skip_stage_2` automatically (pre-existing `.get()` plumbing).
+- `DEFAULT_HDR_LORA_ID = "ic-lora-hdr"` constant alongside `DEFAULT_OUTPAINT_LORA_ID`.
+- `VideoHdrRequest` Pydantic model alongside `VideoOutpaintRequest`.
+- `history_store._probe_video_dims(video_bytes) -> (w, h, fps)` helper.
+
+### Sidecar updates (local cuda:1, Modal, RunPod)
+
+- `GenerateRequest.job_type: Literal[...]` widened to include `"video-hdr"`.
+- New `case "video-hdr":` branch routing to `manager.generate_outpaint(target_width=req.width, target_height=req.height, position="center", ...)`.
+- Modal `modal_app.py::download_weights` + RunPod `download_weights.py` add `hf_hub_download(repo="Lightricks/LTX-2.3-22b-IC-LoRA-HDR")` and the `ic-lora-hdr.safetensors` symlink. Local sidecar reads from the shared host LoRA dir (no separate stage step).
+
+### LoRA registration
+
+- New `scripts/register_hdr_lora.sh` (idempotent mirror of `register_outpaint_lora.sh`). Run once on the host before the first HDR request.
+
+### Tests
+
+- New `tests/test_video_hdr.py` (9 endpoint-level cases). **129/129 pytest green** (was 120/120).
+
+### Known asymmetry vs upstream (carried over from outpaint)
+
+Upstream `ICLoraPipeline` runs stage 2 LoRA-free (per April-13 ltx-pipelines/CLAUDE.md sync). Our `_run_outpaint` keeps the IC-LoRA fused through stage 2 — accepted deviation since v1.7.0. The HDR LoRA was likely trained against upstream behavior; `skip_stage_2: true` produces the closest-to-upstream output. Documented in `docs/hdr-frontend-guide.md`.
+
+### Rollout order
+
+1. `bash scripts/register_hdr_lora.sh` on the host.
+2. Deploy backend (additive — new endpoint).
+3. Restart `ltx-sidecar.service` (local cuda:1).
+4. Modal: `modal run modal_app.py::download_weights` then `modal deploy modal_app.py`.
+5. RunPod: `python download_weights.py` then container push.
+
+If any sidecar lags, HDR jobs dispatched to that provider 422 with `unknown job_type` until it's redeployed. Outpaint and other endpoints unaffected.
+
+---
+
 ## v1.13.0 — 2026-04-23
 
 ### Feat: Live Workers dashboard panel + raise Modal max to 10

@@ -112,7 +112,7 @@ batch_store = BatchStore()
 _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 
 # Turbo mode — dual-GPU LTX inference (2 concurrent video jobs)
-_VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE, JobType.VIDEO_OUTPAINT}
+_VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE, JobType.VIDEO_OUTPAINT, JobType.VIDEO_HDR}
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None         # local sidecar worker (cuda:1)
 
@@ -413,6 +413,18 @@ async def _dispatch_job(job: Job) -> bytes:
                 **op_params, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
                 on_cancel_check=_is_cancelled,
             )
+        case JobType.VIDEO_HDR:
+            # v1.14.0 — HDR is "outpaint with target == source, position center".
+            # The endpoint pre-resolves target_width/target_height by probing the
+            # source video, so by the time we reach here `p` is already a valid
+            # generate_outpaint kwargs dict (same shape as VIDEO_OUTPAINT above).
+            await _ensure_ltx_resident()
+            job.gen_config_snapshot = dict(split_model_manager._gen_config)
+            op_params = {k: v for k, v in p.items() if k not in ("width", "height", "model")}
+            return await manager.generate_outpaint(
+                **op_params, on_progress=on_progress, on_prompt_enhanced=_capture_enhanced,
+                on_cancel_check=_is_cancelled,
+            )
         case JobType.TEXT_TO_IMAGE:
             model = p.get("model", "flux2-klein")
             if model == "ernie-image":
@@ -654,7 +666,11 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|192\.168\.\d+\.\d+)(:\d+)?$",
+    # v1.14.1: noodlefinger production subdomains (i.*, v.*, m.*) + apex,
+    # plus existing localhost/LAN dev patterns. Without this, browsers reject
+    # the preflight response with no `access-control-allow-origin` header
+    # and the FE silently never makes the real request.
+    allow_origin_regex=r"^https?://(localhost(:\d+)?|192\.168\.\d+\.\d+(:\d+)?|([a-zA-Z0-9-]+\.)?noodlefinger\.io)$",
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -711,6 +727,12 @@ def _load_approved_manifest() -> list:
 
 @app.middleware("http")
 async def check_api_key(request: Request, call_next):
+    # v1.14.1: CORS preflights are unauthenticated by the browser spec — never
+    # carry Authorization headers. Pass them through so CORSMiddleware can
+    # respond with `access-control-allow-origin`. Without this, every cross-
+    # origin browser request from the FE was 401-blocked at preflight.
+    if request.method == "OPTIONS":
+        return await call_next(request)
     if not config.API_KEYS:
         return await call_next(request)
     # /health only — the others (dashboard, GPU telemetry) were moved to the
@@ -882,6 +904,32 @@ class VideoOutpaintRequest(BaseModel):
     prompt: str = Field(max_length=10000)
     target_resolution: Resolution
     position: OutpaintPosition = "center"
+    duration: float = Field(gt=0, le=30)
+    fps: float = Field(gt=0, le=60)
+    seed: int = Field(default=0, ge=0)
+    enhance_prompt: bool = False
+    lora: LoRAInput | None = None
+    conditioning_strength: float = Field(default=1.0, ge=0.0, le=1.0)
+    skip_stage_2: bool = False
+
+
+class VideoHdrRequest(BaseModel):
+    """v1.14.0 — IC-LoRA video HDR expansion.
+
+    Promotes an LDR source clip to expanded dynamic range using
+    ``Lightricks/LTX-2.3-22b-IC-LoRA-HDR`` (registered as LoRA id
+    ``ic-lora-hdr``). Architecturally this is the IC-LoRA outpaint
+    pipeline run with ``target == source`` and ``position="center"`` —
+    no canvas expansion, no letterboxing, just video-to-video transform
+    via the IC-LoRA. The handler probes the source video for width/height
+    automatically; the client only supplies duration + fps.
+
+    Output is silent (no audio). Set ``skip_stage_2=true`` for a faster
+    half-resolution preview that exactly matches upstream's reference
+    LoRA-active stage-1 behavior.
+    """
+    video_uri: str
+    prompt: str = Field(max_length=10000)
     duration: float = Field(gt=0, le=30)
     fps: float = Field(gt=0, le=60)
     seed: int = Field(default=0, ge=0)
@@ -3353,6 +3401,7 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
 
 
 DEFAULT_OUTPAINT_LORA_ID = "ic-lora-outpaint"
+DEFAULT_HDR_LORA_ID = "ic-lora-hdr"
 
 
 @app.post("/v2/video-outpaint")
@@ -3382,6 +3431,60 @@ async def v2_video_outpaint(body: VideoOutpaintRequest, request: Request) -> JSO
         width=width, height=height, model="ic-lora-outpaint",
     )
     return _submit_job(JobType.VIDEO_OUTPAINT, params, request, raw=body.model_dump(mode="json"))
+
+
+@app.post("/v2/video-hdr")
+async def v2_video_hdr(body: VideoHdrRequest, request: Request) -> JSONResponse:
+    """v1.14.0 — IC-LoRA HDR transform.
+
+    Architecturally piggybacks on the outpaint pipeline with
+    ``target == source`` and ``position="center"`` (no canvas expansion).
+    Source dims are probed server-side via PyAV so the client only supplies
+    duration + fps; target dims are snapped to the nearest /64 multiple
+    (LTX requirement). Submitted as :class:`JobType.VIDEO_HDR` so history
+    rows render cleanly.
+    """
+    if body.lora is None:
+        body = body.model_copy(update={"lora": LoRAInput(id=DEFAULT_HDR_LORA_ID, strength=1.0)})
+    lora_result = _resolve_lora(body)
+    if isinstance(lora_result, JSONResponse):
+        return lora_result
+    lora_path, lora_strength = lora_result
+    if lora_path is None:
+        return _error(500, "HDR LoRA resolve returned None — registry misconfigured")
+
+    try:
+        video_path_obj = uploads.resolve(body.video_uri)
+    except (ValueError, FileNotFoundError):
+        return _error(404, "video_not_found")
+    video_path = str(video_path_obj)
+
+    # Probe source dims so target == source (modulo /64 snap).
+    try:
+        from history_store import _probe_video_dims
+        src_w, src_h, _src_fps = _probe_video_dims(video_path_obj.read_bytes())
+    except (ValueError, OSError) as e:
+        return _error(422, f"video_probe_failed: {e}")
+
+    def _snap64(x: int) -> int:
+        return max(64, ((x + 32) // 64) * 64)
+
+    target_w, target_h = _snap64(src_w), _snap64(src_h)
+    num_frames = _duration_to_frames(body.duration, body.fps)
+    seed = body.seed if body.seed else random.randint(0, 2**32 - 1)
+
+    params = dict(
+        video_path=video_path, prompt=body.prompt,
+        target_width=target_w, target_height=target_h, position="center",
+        num_frames=num_frames, fps=body.fps, seed=seed,
+        conditioning_strength=body.conditioning_strength,
+        skip_stage_2=body.skip_stage_2,
+        lora_path=lora_path, lora_strength=lora_strength,
+        enhance_prompt=body.enhance_prompt,
+        # History-only fields (stripped before generate_outpaint call):
+        width=target_w, height=target_h, model="ic-lora-hdr",
+    )
+    return _submit_job(JobType.VIDEO_HDR, params, request, raw=body.model_dump(mode="json"))
 
 
 @app.post("/v2/video/extract-frames")

@@ -136,6 +136,26 @@ def _is_mp4_bytes(data: bytes) -> bool:
     return len(data) >= 12 and data[4:8] == b"ftyp"
 
 
+def _probe_video_dims(video_bytes: bytes) -> tuple[int, int, float]:
+    """Return ``(width, height, fps)`` from an MP4-like container via PyAV.
+
+    Used by the v1.14.0 ``/v2/video-hdr`` endpoint to size the IC-LoRA
+    reference latent to the exact source resolution (HDR transform preserves
+    canvas; outpaint expands it). Frame count is intentionally not returned
+    — callers must derive it from user-supplied ``duration * fps`` so the
+    LTX 8k+1 quantization still applies.
+
+    Raises:
+        ValueError: when the bytes don't decode or have no video stream.
+    """
+    import av
+    with av.open(io.BytesIO(video_bytes), mode="r") as container:
+        if not container.streams.video:
+            raise ValueError("no_video_stream")
+        s = container.streams.video[0]
+        return (int(s.width), int(s.height), float(s.average_rate or 24))
+
+
 def _first_video_frame_as_pil(video_bytes: bytes) -> Image.Image | None:
     """Decode the first video frame of an MP4 as a PIL.Image in RGB.
 

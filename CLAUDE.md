@@ -2,9 +2,13 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.13.0 (2026-04-23).
+**Version**: v1.14.1 (2026-04-26).
 
-v1.13.0 highlights: `GET /v1/system/workers` live-worker introspection endpoint; dashboard "Live Workers" panel; `Job.worker_id` tracking; Modal pool max raised from 4 → 10 via `LTX_REMOTE_SIDECAR_MAX_WORKERS` / `LTX_MODAL_MAX_WORKERS` default bump. Peak concurrent-video capacity is now 2 local + 10 Modal + 2 RunPod = **14 concurrent video workers**.
+v1.14.1 highlights: **CORS fix**. (a) `allow_origin_regex` in `server.py` widened from `localhost|192.168.X.X` to also include `([a-zA-Z0-9-]+\.)?noodlefinger\.io` — production FE origins (`i.noodlefinger.io`, `v.noodlefinger.io`, `m.noodlefinger.io`) now pass the CORS preflight check. (b) `check_api_key` middleware now short-circuits on `request.method == "OPTIONS"` so unauthenticated browser preflights flow through to `CORSMiddleware` and get a proper response with `access-control-allow-origin` header. Without (b), the auth middleware's 401 ate the preflight before CORS could ever respond, regardless of whether the origin was allowed. Symptom: FEs failed silently to load any cross-origin API call. Root-caused via missing `access-control-allow-origin` in the 400 preflight response.
+
+v1.14.0 highlights: `POST /v2/video-hdr` — IC-LoRA HDR-expansion endpoint for LDR→HDR video transform. Uses `Lightricks/LTX-2.3-22b-IC-LoRA-HDR` (registered as `ic-lora-hdr`, strategy `ic_lora_hdr`). Architecturally piggybacks on `_run_outpaint` with `target == source` and `position="center"` — the actual generation codepath is **unchanged from v1.13.0**, HDR is purely additive scaffolding (new endpoint + new `JobType.VIDEO_HDR` + new sidecar `case` branches). Backend snaps source dims to nearest /64 multiple via `history_store._probe_video_dims`. All three sidecars (local cuda:1, Modal, RunPod) gained a `case "video-hdr":` branch routing to the same `generate_outpaint(...)` they already used for outpaint.
+
+v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard "Live Workers" panel; `Job.worker_id` tracking; Modal pool max raised from 4 → 10. Peak concurrent-video capacity is 2 local + 10 Modal + 2 RunPod = **14 concurrent video workers**.
 
 ## Quick lookup
 
@@ -16,7 +20,7 @@ v1.13.0 highlights: `GET /v1/system/workers` live-worker introspection endpoint;
 | Touching LTX generation (denoising, stages, sampler) | [Conventions](#conventions) + [Critical patterns](#critical-patterns) + `split_model_manager.py` |
 | Chain conditioning (v1.12 segment mode) | `split_model_manager.py` entry in [Structure](#structure) + [Conventions](#conventions) + CHANGELOG v1.12.0 |
 | Touching Flux generation | [Flux pipeline details](#flux-pipeline-details) + `flux_manager.py` |
-| LoRA plumbing | [LTX LoRA](#conventions) / [Flux LoRA](#flux-lora-v11--folder-drop-discovery-adapter-mode) / [IC-LoRA outpaint](#ic-lora-video-outpaint-v170) |
+| LoRA plumbing | [LTX LoRA](#conventions) / [Flux LoRA](#flux-lora-v11--folder-drop-discovery-adapter-mode) / [IC-LoRA outpaint](#ic-lora-video-outpaint-v170) / [IC-LoRA HDR](#ic-lora-video-hdr-v1140) |
 | Async job queue, phases, SSE | [v2 job observability](#v2-job-observability-v116--v117) + `job_queue.py` |
 | History + reproducibility | [Generation history](#generation-history-history_storepy) |
 | Sidecars (ACE / JoyAI / ERNIE / LTX-remote) | [ACE](#ace-music-sidecar-v12) / [JoyAI](#joyai-image-edit-sidecar-v12-migrated-from-cuda0) / [ERNIE](#ernie-image-sidecar-v13) / [Remote pool](#remote-sidecar-pool-v16) |
@@ -144,6 +148,20 @@ New async endpoint `POST /v2/video-outpaint`. Expands a source video's canvas to
 - **LoRA cache key**: same as every other LTX flow — `(state_name="distilled", user_lora_tuple)`. Fusion is permanent; strength changes require full transformer reload.
 - **Turbo parity**: `JobType.VIDEO_OUTPAINT` is in `_VIDEO_JOB_TYPES` (server.py:111), so turbo workers handle it. Local cuda:1 sidecar and Modal both work. `ltx_sidecar_client.py::generate()` carries `position` / `conditioning_strength` / `skip_stage_2` kwargs.
 - **Modal staging**: `scripts/register_outpaint_lora.sh` installs the LoRA locally; `modal_app.py::download_weights` stages the same LoRA into the Modal HF volume at `/mnt/nvme-1/huggingface/loras/`.
+
+## IC-LoRA video HDR (v1.14.0)
+
+New async endpoint `POST /v2/video-hdr`. Promotes an LDR source clip to expanded dynamic range using `Lightricks/LTX-2.3-22b-IC-LoRA-HDR` (registered as LoRA id `ic-lora-hdr`, strategy `ic_lora_hdr`). **Architecturally piggybacks on the outpaint pipeline** with `target == source` and `position="center"` — no canvas expansion, no letterboxing of significance. The `_run_outpaint` codepath is reused **unchanged**; HDR is purely additive scaffolding.
+
+- **Request** (`VideoHdrRequest`, server.py:~894): `video_uri`, `prompt`, `duration`, `fps`, `seed`, `enhance_prompt`, `lora` (optional; defaults to `id="ic-lora-hdr"`), `conditioning_strength` ∈ [0, 1], `skip_stage_2`. **No** `target_resolution` or `position` — derived server-side.
+- **Handler** (server.py:~3425): if `lora=None`, substitutes `LoRAInput(id="ic-lora-hdr", strength=1.0)`. Probes source video via `history_store._probe_video_dims` (PyAV one-pass), snaps `(src_w, src_h)` to nearest /64 multiple via `_snap64`, builds the same params dict the outpaint endpoint produces but with `target_width=snap_w, target_height=snap_h, position="center"`, then submits `JobType.VIDEO_HDR` through `_submit_job`.
+- **Dispatch** (server.py `_dispatch_job` case `VIDEO_HDR`, `_dispatch_job_turbo`, `_dispatch_job_turbo_remote`): all three call `manager.generate_outpaint(...)` — the same method outpaint uses. The only difference vs outpaint dispatch is which LoRA path is in `params["lora_path"]`.
+- **Sidecars**: local cuda:1 (`/mnt/nvme-1/servers/ltx-sidecar/sidecar.py`), Modal (`modal_app.py`), and RunPod (`runpod_app.py`) each have a new `case "video-hdr":` branch that mirrors `case "video-outpaint":` and calls `_manager.generate_outpaint(...)`. The Pydantic `GenerateRequest.job_type: Literal[...]` was widened on all three to include `"video-hdr"`.
+- **LoRA staging**: `scripts/register_hdr_lora.sh` installs locally; `ltx-sidecar-modal/modal_app.py::download_weights` and `ltx-sidecar-runpod/download_weights.py` stage the HDR LoRA into each provider's volume next to the outpaint LoRA. Symlinks keep `ic-lora-hdr.safetensors` resolvable by the registry id.
+- **/64 snap rationale**: LTX requires width/height divisible by 64. Real-world source clips often aren't (e.g. 1920×1080 → 1920 OK, 1080 not). `_snap64(x) = max(64, ((x+32)//64)*64)` rounds to nearest /64 multiple. Diff vs source is ≤32 px per axis — not visually significant for HDR transform.
+- **Stage-2 LoRA fusion deviation persists** — same as outpaint, our `_run_outpaint` keeps the IC-LoRA fused through stage 2. Upstream `ICLoraPipeline` runs stage 2 LoRA-free (per `packages/ltx-pipelines/CLAUDE.md`). The HDR LoRA was likely trained against upstream behavior — `skip_stage_2: true` produces the closest-to-upstream output (stage-1-only at half-res).
+- **Output**: silent MP4 (no audio).
+- **Turbo parity**: `JobType.VIDEO_HDR` ∈ `_VIDEO_JOB_TYPES`, so turbo + remote-pool dispatch automatically work once sidecars are redeployed.
 
 ## Flux pipeline details
 
