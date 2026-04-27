@@ -25,6 +25,7 @@ v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard 
 | History + reproducibility | [Generation history](#generation-history-history_storepy) |
 | Sidecars (ACE / JoyAI / ERNIE / LTX-remote) | [ACE](#ace-music-sidecar-v12) / [JoyAI](#joyai-image-edit-sidecar-v12-migrated-from-cuda0) / [ERNIE](#ernie-image-sidecar-v13) / [Remote pool](#remote-sidecar-pool-v16) |
 | Video outpaint | [IC-LoRA video outpaint](#ic-lora-video-outpaint-v170) |
+| MV editing grammar / shot lists / beat-aligned cuts | `docs/MV_EDITING.md` (v1.15.0 — `/v1/music/analyze` + `clip.speed` + `transition.audioLeadFrames`) |
 | Dashboard + live tuning | [Dashboard](#dashboard-and-gpu-telemetry-v12-advanced-controls-v13) + [Generation config](#generation-config-v13) |
 | Client-facing API shape | `docs/API.md` (canonical) |
 | LLM-driven workflows | `docs/MCP.md` (noodlefinger-mcp tier-0 + tier-1) |
