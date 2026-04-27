@@ -394,17 +394,45 @@ async def worker_loop(
 
 
 async def cleanup_loop(job_store: JobStore, uploads: UploadStore) -> None:
-    """Periodically remove expired job metadata. Result files for completed jobs are kept (managed by history store)."""
+    """Periodically remove expired job metadata. Result files for completed jobs are kept (managed by history store).
+
+    v1.15.2 — also sweep zombie PROCESSING jobs. A job stuck in PROCESSING
+    longer than ZOMBIE_THRESHOLD_S without its worker reporting back is
+    almost certainly a leaked dispatch (Modal ``httpx.ReadError`` that
+    didn't propagate to mark FAILED, sidecar OOM with no traceback, etc.).
+    Surfacing a "queue.processing" count that doesn't match active workers
+    confused multi-session orchestration during the v0.3.x stress audit.
+    Mark stale PROCESSING jobs as FAILED with code ``zombie`` so callers
+    can distinguish them from legitimate failures.
+    """
     ttl = config.JOB_RESULT_TTL_SECONDS
-    logger.info("Cleanup loop started (TTL=%ds)", ttl)
+    # Hard ceiling well above any expected job duration (90s MV export + 4K
+    # outpaint stage 2 + retake worst-case all comfortably under 20 min).
+    ZOMBIE_THRESHOLD_S = 30 * 60
+    logger.info("Cleanup loop started (TTL=%ds, zombie=%ds)", ttl, ZOMBIE_THRESHOLD_S)
     while True:
         await asyncio.sleep(60)
         now = time.monotonic()
         to_remove: list[str] = []
+        zombies: list[Job] = []
         for job in list(job_store._jobs.values()):
             if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 if job.completed_at and (now - job.completed_at) > ttl:
                     to_remove.append(job.id)
+            elif job.status == JobStatus.PROCESSING:
+                anchor = job.started_at or job.created_at
+                if anchor and (now - anchor) > ZOMBIE_THRESHOLD_S:
+                    zombies.append(job)
+
+        for job in zombies:
+            elapsed = now - (job.started_at or job.created_at)
+            logger.warning(
+                "cleanup_loop: marking zombie job %s as FAILED (%s, elapsed=%.0fs, worker=%s)",
+                job.id, job.type, elapsed, job.worker_id,
+            )
+            job.status = JobStatus.FAILED
+            job.completed_at = now
+            job.error = {"code": "zombie", "message": f"Job stuck in PROCESSING > {ZOMBIE_THRESHOLD_S}s without worker checkpoint"}
 
         for job_id in to_remove:
             job = job_store.get(job_id)
@@ -417,3 +445,5 @@ async def cleanup_loop(job_store: JobStore, uploads: UploadStore) -> None:
 
         if to_remove:
             logger.info("Cleaned up %d expired jobs", len(to_remove))
+        if zombies:
+            logger.info("Marked %d zombie jobs FAILED", len(zombies))
