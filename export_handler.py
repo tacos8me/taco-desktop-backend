@@ -129,9 +129,18 @@ def export_composition(
         # if the file is missing — no redundant exists() check needed.
         audio_path = uploads.resolve(audio_uri)
 
-    # Single clip + no audio — return raw bytes, skip ffmpeg entirely.
-    # With audio we still need ffmpeg to mux the track.
-    if len(clip_paths) == 1 and audio_path is None:
+    # Single clip + no audio + no per-clip transforms — return raw bytes,
+    # skip ffmpeg entirely. With audio we still need ffmpeg to mux the track.
+    # v1.15.1 fix: also fall through to ffmpeg whenever any per-clip transform
+    # is requested (speed != 1.0, tailTrimFrames > 0). Previously the shortcut
+    # returned raw bytes regardless, silently dropping the transform — a
+    # speed=1000 export produced an MP4 byte-identical to speed=1.0.
+    if (
+        len(clip_paths) == 1
+        and audio_path is None
+        and clip_speed[0] == 1.0
+        and clip_tail_trim[0] == 0
+    ):
         return clip_paths[0].read_bytes()
 
     # Build ffmpeg command with xfade chain (or concat + audio overlay)

@@ -292,6 +292,38 @@ def test_speed_one_is_byte_identical_to_legacy(tmp_path, fake_resolve, monkeypat
     assert fc.count("setpts=PTS-STARTPTS") == 2, fc
 
 
+def test_single_clip_with_speed_falls_through_to_ffmpeg(tmp_path, fake_resolve, monkeypatch):
+    """v1.15.1 regression: single-clip + no-audio + speed != 1.0 must NOT take
+    the raw-bytes shortcut. Previously single-clip exports returned the source
+    file unchanged regardless of speed (silent corruption — speed=1000 emitted
+    a normal-paced MP4 byte-identical to speed=1.0).
+    """
+    uploads = _FakeUploads(tmp_path)
+    clips = [{"historyId": "solo", "duration": 2.0, "fps": 24.0, "speed": 0.5}]
+    cmd = _capture_export(clips, [], uploads, None, fake_resolve, monkeypatch)
+    fc = _filter_complex(cmd)
+    assert "(PTS-STARTPTS)/0.500000" in fc, fc
+
+
+def test_single_clip_with_tail_trim_falls_through_to_ffmpeg(tmp_path, fake_resolve, monkeypatch):
+    """Sibling regression: single-clip + tailTrimFrames > 0 also must NOT
+    shortcut — though the LAST-clip-zeros rule means tailTrimFrames is forced
+    to 0 here, so this asserts that a non-zero request renders an ffmpeg path
+    rather than silently returning raw bytes.
+    """
+    # Single clip + tail trim is force-zeroed (last clip rule), so even though
+    # the user passed tailTrimFrames=9 the actual trim is dropped — but the
+    # shortcut should now ONLY trigger when speed==1.0 AND tail==0 AND audio
+    # is None. Confirm we still fall through to ffmpeg when speed != 1.0
+    # alongside a force-zeroed trim.
+    uploads = _FakeUploads(tmp_path)
+    clips = [{"historyId": "solo", "duration": 2.0, "fps": 24.0,
+              "tailTrimFrames": 9, "speed": 2.0}]
+    cmd = _capture_export(clips, [], uploads, None, fake_resolve, monkeypatch)
+    fc = _filter_complex(cmd)
+    assert "(PTS-STARTPTS)/2.000000" in fc, fc
+
+
 def test_audio_lead_frames_zero_is_byte_identical_to_legacy(tmp_path, fake_resolve, monkeypatch):
     """Invariant: no audioLeadFrames → atrim emits the legacy raw audioStart."""
     uploads = _FakeUploads(tmp_path)
