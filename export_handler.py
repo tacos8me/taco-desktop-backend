@@ -61,6 +61,13 @@ def export_composition(
     clip_durations: list[float] = []
     clip_fps: list[float] = []
     clip_tail_trim: list[int] = []
+    # v1.15.0 B2: per-clip playback speed (default 1.0 = unchanged). Speed is
+    # video-only: slowing the picture does NOT slow the song. Audio decoupling
+    # in the beat_synced branch below uses pre-speed durations so the song
+    # stays the song. See docs/MV_EDITING.md §3.13 / §5.7. Speed ≤ 0 is
+    # invalid; we WARN + default to 1.0 instead of raising (forgiving FE
+    # contract — drift is visible, hard 422 mid-export is not).
+    clip_speed: list[float] = []
 
     for clip in clips:
         path = _resolve_clip_path(clip["historyId"], uploads)
@@ -70,6 +77,18 @@ def export_composition(
         fps = float(clip.get("fps", 24.0))
         clip_fps.append(fps)
         clip_tail_trim.append(int(clip.get("tailTrimFrames", 0) or 0))
+        speed_raw = clip.get("speed", 1.0)
+        try:
+            speed = float(speed_raw) if speed_raw is not None else 1.0
+        except (TypeError, ValueError):
+            speed = 1.0
+        if not (speed > 0):
+            logger.warning(
+                "export_composition: clip speed=%r invalid (must be > 0); defaulting to 1.0",
+                speed_raw,
+            )
+            speed = 1.0
+        clip_speed.append(speed)
 
     if not clip_paths:
         raise ValueError("No clips to export")
@@ -80,7 +99,12 @@ def export_composition(
     #   - Single-clip exports zero out unconditionally.
     #   - Over-trim (tail >= declared frames) clamps to declared-1 with WARN.
     # xfade path skips trim entirely — handled at filter-build time below.
+    # v1.15.0 B2: divide by speed so post-speed playback length is what every
+    # downstream consumer (xfade offset, force-keyframe seams, video-side
+    # beat_synced clamp) sees. Pre-speed length lives on at
+    # ``pre_speed_durations`` for audio-side decoupling below.
     effective_durations: list[float] = []
+    pre_speed_durations: list[float] = []  # = (clip_duration - tail/fps), no /speed
     for i in range(len(clip_paths)):
         tail = clip_tail_trim[i]
         fps = clip_fps[i]
@@ -95,7 +119,9 @@ def export_composition(
             )
             tail = declared_frames - 1
             clip_tail_trim[i] = tail
-        effective_durations.append(clip_durations[i] - tail / fps)
+        pre_speed = clip_durations[i] - tail / fps
+        pre_speed_durations.append(pre_speed)
+        effective_durations.append(pre_speed / clip_speed[i])
 
     audio_path: Path | None = None
     if audio_uri:
@@ -145,17 +171,28 @@ def export_composition(
     # on the input timeline), and setpts then rebases to zero. Reversing the
     # order would trim after rebasing, which drops the WRONG frames.
     # xfade path skips trim (xfade already overlaps — can't stack the two).
+    # v1.15.0 B2: per-clip speed support. setpts=(PTS-STARTPTS)/speed scales
+    # the playback rate (speed=2.0 → half-duration, speed=0.5 → double). The
+    # divisor must be applied AFTER trim+rebase so the rebased PTS=0 origin
+    # is preserved. When speed==1.0 the emitted filter is byte-identical to
+    # v1.10.0 (additive invariant — see CLAUDE.md and PR body).
     def _norm(i: int, out_label: str) -> str:
         tail = clip_tail_trim[i]
+        speed = clip_speed[i]
+        speed_clause = (
+            f"setpts=(PTS-STARTPTS)/{speed:.6f}"
+            if speed != 1.0
+            else "setpts=PTS-STARTPTS"
+        )
         if tail > 0 and not has_xfade:
             fps = clip_fps[i]
             declared_frames = max(1, int(round(clip_durations[i] * fps)))
             kept = max(1, declared_frames - tail)
             return (
-                f"[{i}:v]trim=end_frame={kept},setpts=PTS-STARTPTS,"
+                f"[{i}:v]trim=end_frame={kept},{speed_clause},"
                 f"format=yuv420p{out_label}"
             )
-        return f"[{i}:v]setpts=PTS-STARTPTS,format=yuv420p{out_label}"
+        return f"[{i}:v]{speed_clause},format=yuv420p{out_label}"
 
     if not has_xfade:
         if len(clip_paths) == 1:
@@ -191,7 +228,10 @@ def export_composition(
             trans_type_key = trans.get("type", "crossfade") if trans else "crossfade"
             ffmpeg_transition = TRANSITION_MAP.get(trans_type_key, "fade")
 
-            cumulative_offset += clip_durations[i - 1] - trans_duration
+            # v1.15.0 B2: xfade offset must track POST-speed playback length so
+            # a slow-mo clip's xfade seam lands at the correct rendered second.
+            # effective_durations[i-1] == clip_durations[i-1] when speed==1.0.
+            cumulative_offset += effective_durations[i - 1] - trans_duration
             out_label = f"[v{i:02d}]" if i < len(clip_paths) - 1 else "[vout]"
 
             filter_parts.append(
@@ -225,51 +265,101 @@ def export_composition(
         audio_idx = len(clip_paths)  # song is the last -i input
 
         # v1.9.6: slice duration must be the BEAT GAP (audioStart[i+1] -
-        # audioStart[i]), NOT the LTX-quantized clip_duration. Clip durations
-        # round up to 8k+1 frames (e.g. 2.04 s instead of 2.00 s), so using
-        # clip_duration as the atrim span overlaps adjacent slices by ~40 ms
-        # at every seam — audible repeat of the last fraction of each beat.
-        # The beat-gap approach pulls non-overlapping song ranges. For the
-        # LAST clip there is no next beat, so fall back to clip_duration[N-1].
-        # Zero / non-monotonic gaps fall back to clip_duration[i] — defensive
-        # against clients that pass garbage audioStart values.
+        # audioStart[i]), NOT the LTX-quantized clip_duration.
         # v1.10.0: non-last slice clamps to effective_durations[i] (defensive —
         # prevents atrim past the trimmed EOF when a clip's tail was cut).
-        # Last clip uses effective_durations[-1] (== clip_durations[-1] because
-        # last clip's tailTrimFrames is always zeroed above).
-        # v1.11.2: FE can pass explicit `audioDurationSec` per clip to decouple
-        # audio-side slice from video-side effective_duration — lets tail=6
-        # chain conditioning give a 0 ms visual seam AND full-song audio
-        # continuity (at the cost of a progressive video-cut-before-beat drift
-        # equal to `audioDurationSec - effective_duration` per seam). When the
-        # field is absent the v1.11.1 clamp behavior is preserved exactly.
+        # v1.11.2: explicit `audioDurationSec` overrides the clamp.
+        #
+        # v1.15.0 B1 — TWO-PASS refactor for transition.audioLeadFrames (J/L
+        # cuts). The single-pass loop CANNOT compute slice[i] correctly because
+        # clip i's slice end depends on `audio_lead[i+1]`. The math:
+        #
+        #   audio_lead_secs[i] = transition[i].audioLeadFrames / clip_fps[i]
+        #     (transition i = boundary INTO clip i; clip 0 has no boundary in
+        #      → lead 0)
+        #   audio_start_adj[i] = max(0, clip_audio_starts[i] - audio_lead_secs[i])
+        #   slice_durations[i] = original_gap + audio_lead_secs[i] - audio_lead_secs[i+1]
+        #
+        # Negative audioLeadFrames is L-cut (audio of A continues past picture
+        # cut); it's the same math with a negative sign — no special-casing.
+        #
+        # v1.15.0 B2 audio decoupling — clip.speed is video-only. The slice
+        # clamp must use PRE-speed durations (`pre_speed_durations[i]` =
+        # `clip_durations[i] - tail/fps`) so the song doesn't get clipped
+        # short when speed > 1.0. The video side already shrank via
+        # `effective_durations`; the audio side stays at song-time.
+        #
+        # Pass 1: gather per-boundary audio_lead_secs.
+        audio_lead_secs: list[float] = []
+        for i in range(len(clip_paths)):
+            if i == 0:
+                audio_lead_secs.append(0.0)
+                continue
+            trans = next(
+                (t for t in transitions if t.get("clipBIndex", t.get("clip_b_index")) == i),
+                None,
+            )
+            lead_frames_raw = trans.get("audioLeadFrames", 0) if trans else 0
+            try:
+                lead_frames = int(lead_frames_raw or 0)
+            except (TypeError, ValueError):
+                lead_frames = 0
+            audio_lead_secs.append(lead_frames / clip_fps[i] if lead_frames else 0.0)
+        # Sentinel for the i+1 lookup at the last clip: no follower → 0.0.
+        audio_lead_secs_with_sentinel = audio_lead_secs + [0.0]
+
+        # Pass 2: build adjusted starts + slice_durations cross-referencing
+        # leads on both sides of each slice.
+        audio_start_adj: list[float] = []
         slice_durations: list[float] = []
+        min_slice = 1.0 / max(clip_fps)  # sub-frame slice clamp (1/fps min)
         for i, start in enumerate(clip_audio_starts):
+            adj = max(0.0, float(start) - audio_lead_secs[i])
+            audio_start_adj.append(adj)
+
             explicit = clips[i].get("audioDurationSec")
             if (
                 isinstance(explicit, (int, float))
                 and not isinstance(explicit, bool)
                 and explicit > 0
             ):
+                # Caller-takes-the-wheel — no lead math, no clamp, no decouple.
                 slice_durations.append(float(explicit))
                 continue
             if i < len(clip_paths) - 1:
-                gap = clip_audio_starts[i + 1] - start
-                if gap <= 0:
-                    gap = clip_durations[i]
-                gap = min(float(gap), effective_durations[i])
-                slice_durations.append(float(gap))
+                original_gap = clip_audio_starts[i + 1] - float(start)
+                if original_gap <= 0:
+                    original_gap = clip_durations[i]
+                # B1 cross-boundary correction:
+                #   slice = original_gap + lead[i] - lead[i+1]
+                # When lead[i] > 0 (J-cut into i): slice grows so clip i's audio
+                # window fully covers the video-i picture window plus the lead.
+                # When lead[i+1] > 0 (J-cut into i+1): slice shrinks because
+                # clip (i+1) starts its audio earlier.
+                slice_dur = (
+                    original_gap
+                    + audio_lead_secs[i]
+                    - audio_lead_secs_with_sentinel[i + 1]
+                )
+                # B2 audio decoupling: clamp against PRE-speed video duration,
+                # not effective_durations[i] (which has been /=speed).
+                slice_dur = min(float(slice_dur), pre_speed_durations[i])
+                slice_dur = max(min_slice, slice_dur)
+                slice_durations.append(float(slice_dur))
             else:
-                slice_durations.append(float(effective_durations[i]))
+                # Last clip: no follower lead. Pre-speed duration + own lead.
+                slice_dur = pre_speed_durations[i] + audio_lead_secs[i]
+                slice_durations.append(max(min_slice, float(slice_dur)))
 
         audio_parts: list[str] = []
         audio_labels: list[str] = []
-        for i, (start, slice_dur) in enumerate(zip(clip_audio_starts, slice_durations)):
+        for i, slice_dur in enumerate(slice_durations):
             label = f"[a{i:02d}]"
+            # B1: emit atrim with the LEAD-ADJUSTED start, not raw audioStart.
             # asetpts=N/SR/TB resets timestamps so concat doesn't choke on
             # non-monotonic PTS across the sliced segments.
             audio_parts.append(
-                f"[{audio_idx}:a]atrim=start={start}:duration={slice_dur},asetpts=N/SR/TB{label}"
+                f"[{audio_idx}:a]atrim=start={audio_start_adj[i]}:duration={slice_dur},asetpts=N/SR/TB{label}"
             )
             audio_labels.append(label)
         audio_concat = (
