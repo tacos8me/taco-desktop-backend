@@ -370,6 +370,135 @@ ASSISTANT (tool: mcp__noodlefinger__resume_music_video,
 
 Capturing the `session_id` early (it's in the failure response too) lets you retry without losing the 4-5 minutes of completed clip work. Sessions are pruned after 7 days.
 
+### 4.5 Editing-grammar walkthrough (v0.3)
+
+`cut_music_video` v0.2 produces N uniform clips chained by segment-uri — competent assembly, **not editing**. v0.3 adds an editing-grammar layer: an audio-analysis primitive (`get_beat_grid`), a shot-list planner that consumes the beat grid (`plan_shot_list`), and a per-shot composition language with J/L cuts, palette swaps, transitions, speed ramps, B-roll inserts, and synthetic flash frames. The full theory + tool surface is in [`docs/MV_EDITING.md`](MV_EDITING.md); this section is the worked Claude Code transcript.
+
+The contract is locked across taco-backend v1.15.0 (PR 1, this repo — `/v1/music/analyze` + `clip.speed` + `transition.audioLeadFrames`) and noodlefinger-mcp v0.3.0 (PR 2 — `get_beat_grid` / `plan_shot_list` tools).
+
+```text
+USER: I have a 32-second hair-metal demo at storage://b3a1f0c4d8e7… —
+      cut a music video against it, hard cuts on the snare, smash into
+      the chorus, two flash inserts on the chorus bar 1.
+
+ASSISTANT (tool: mcp__noodlefinger__get_beat_grid,
+           args: {audio_uri: "storage://b3a1f0c4d8e7…"})
+  [calls POST /v1/music/analyze on taco-backend]
+  → {bpm: 124.5,
+     beats: [0.482, 0.964, 1.446, 1.928, …],   // 67 beats total
+     downbeats: [0.482, 2.410, 4.338, …],      // every 4th beat (4/4)
+     onsets: [0.482, 0.840, 0.964, 1.213, …],
+     rms_envelope: [[0.0, -28.4], [0.512, -22.1], …],
+     duration_s: 32.16,
+     confidence: 0.91}
+
+  [The high confidence (>0.7) means the beat track is solid — bar 1
+   downbeats are reliable. Lower confidence (<0.3) on swung / rubato
+   tracks means the LLM should fall back to manual shot durations.]
+
+ASSISTANT (tool: mcp__noodlefinger__plan_shot_list,
+           args: {audio_summary: <beat_grid above>,
+                  prompt: "lead singer with long black hair, white tank,
+                           silver cross, leather pants, smoke-filled stage",
+                  genre: "hair-metal",
+                  num_beats_per_shot: 8,
+                  sections: [{label: "intro", t_start_s: 0.0,  t_end_s: 8.0},
+                             {label: "verse", t_start_s: 8.0,  t_end_s: 16.0},
+                             {label: "chorus",t_start_s: 16.0, t_end_s: 32.0}]})
+  [pure helper — no HTTP. Runs the §4 cut-placement algorithm in
+   docs/MV_EDITING.md against the genre prior for hair-metal:
+   verse cpb=1.5, chorus cpb=2.5, match-cut budget 5%]
+  → {treatment: {vibe: "1987 Sunset Strip, magenta neon, dry-ice smoke",
+                 anchor_ref: "Mötley Crüe 'Wild Side' — hard cuts on snare",
+                 subject_lock: "Lead — long black hair, white tank, silver
+                                cross, leather pants",
+                 cadence: "8 shots × ~4s mean. Chorus = 1-beat cuts + flash."},
+     shots: [
+       {shot_n: 1, duration_s: 4.0, scale: "WS",  framing: "group",
+        camera: "locked-off", subject: "band on smoke-filled stage",
+        section: "intro", palette: "low-key + neon backlit",
+        transition_to_next: "cut",
+        prompt: "wide stage shot, four-piece band silhouetted in magenta haze"},
+       {shot_n: 2, duration_s: 4.0, scale: "ECU", framing: "insert",
+        camera: "locked-off", subject: "fingers on fretboard mid-bend",
+        section: "intro", palette: "hard top",
+        transition_to_next: "cut",
+        prompt: "extreme close-up of guitar fretboard, pick mid-strum"},
+       {shot_n: 3, duration_s: 4.0, scale: "MCU", framing: "single",
+        camera: "slow push", subject: "Lead [LOCK] mouths verse lyric",
+        section: "verse", palette: "rim + smoky",
+        transition_to_next: "cut",
+        prompt: "medium close-up of lead singer at mic, slow push"},
+       {shot_n: 4, duration_s: 4.0, scale: "MWS", framing: "two-shot",
+        camera: "handheld drift", subject: "Lead + bassist back-to-back",
+        section: "verse", palette: "neon + smoky",
+        transition_to_next: "smash",          // hits chorus on the 1
+        audio_lead_frames: 6,                  // J-cut into chorus
+        prompt: "lead and bassist back-to-back on stage, handheld drift"},
+       {shot_n: 5, duration_s: 0.083, scale: "flash", framing: null,
+        camera: null, subject: null, section: "chorus",
+        flash_color: "#FFFFFF",                // synthetic, no LTX
+        transition_to_next: "cut"},
+       {shot_n: 6, duration_s: 2.0, scale: "CU", framing: "single",
+        camera: "whip pan L", subject: "Lead [LOCK] at mic",
+        section: "chorus", palette: "low-key",
+        transition_to_next: "cut",
+        prompt: "close-up of lead singer screaming chorus, whip pan left"},
+       {shot_n: 7, duration_s: 0.083, scale: "flash", framing: null,
+        camera: null, subject: null, section: "chorus",
+        flash_color: "#FFFFFF",
+        transition_to_next: "cut"},
+       {shot_n: 8, duration_s: 8.0, scale: "WS", framing: "group",
+        camera: "crane up", subject: "band on stage, lighter wave",
+        section: "chorus", palette: "warm amber",
+        transition_to_next: "cut",
+        prompt: "wide crane shot, full band performing, audience cheering"}
+     ]}
+
+  [User reviews the shot list. They notice shot 4 has audio_lead_frames=6
+   which J-cuts the chorus. They like it — the chorus vocal pre-laps
+   into the last 0.25s of the verse. They tweak shot 6 to add speed
+   ramp slow-mo.]
+
+USER: Looks good — slow shot 6 down to 0.5x for that classic Mulcahy
+      slow-mo on the whip-pan. Ship it.
+
+ASSISTANT [edits shot_list[5].speed = 0.5 in the tool call args]
+ASSISTANT (tool: mcp__noodlefinger__cut_music_video,
+           args: {prompt: "...",
+                  duration_s: 32.0,
+                  num_clips: 6,                // flashes don't generate
+                  audio_uri: "storage://b3a1f0c4d8e7…",
+                  shot_list: <shot_list above with shot 6 speed=0.5>})
+
+  [internal — orchestrator threads each shot into a clip body:
+  ├─ Shots with flash_color → mint synthetic 9-frame solid-color MP4
+  │   via ffmpeg lavfi, register a synthetic-flash history row, no LTX.
+  ├─ Shots with prompt → submit to LTX as normal segment-chained clips.
+  ├─ shot.speed → composition.clips[i].speed (B2 backend cascade).
+  ├─ shot.audio_lead_frames → composition.transitions[i].audioLeadFrames
+  │   (B1 backend two-pass slice refactor).
+  ├─ shot.transition_to_next + transition_duration_s → composition.transitions[i].
+  └─ Export composition; backend's export_handler.py applies J/L cut
+     audio offsets, speed cascades through effective_durations, force-
+     keyframe seams land on post-speed positions.]
+
+  → {music_uri: "storage://…", composition_id: "comp_…",
+     final_uri: "storage://7c2…",
+     shots: [{shot_n, history_id, segment_uri, …}, …],
+     beat_grid_used: {bpm: 124.5, downbeats: [...], …}}
+```
+
+**What just happened**:
+
+- The LLM (Claude Code) authored the *creative* layer — treatment, subject lock, palette per section, transition types, speed ramp on shot 6.
+- The algorithm authored the *rhythmic* layer — cut placement on the metric grid, accent-snap onto the chorus downbeat, half-time ramp into chorus.
+- The backend rendered the result deterministically — flashes are synthetic (no model rolls), J-cut audio offset is exact (B1 two-pass math), speed ramp re-times via setpts (B2 cascade), xfade and beat-synced seams land on post-speed timestamps.
+
+The shot list is data the LLM can edit before submission. The user reviewed, tweaked, and shipped. That's the v0.3 editor-tier UX.
+
+For the full theory (Murch's Rule of Six, Goodwin's synaesthesia, the atomic-vs-content-bound split), the genre priors, the per-section density curves, the cut-placement pseudocode, and worked examples for power ballad / hair metal / hip-hop, see [`docs/MV_EDITING.md`](MV_EDITING.md).
+
 ---
 
 ## 5. Architecture
