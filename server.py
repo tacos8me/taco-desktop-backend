@@ -1108,6 +1108,11 @@ _AUDIO_MEDIA_TYPES = {
 }
 
 
+class MusicAnalyzeRequest(BaseModel):
+    """Body for /v1/music/analyze (v1.15.0). See docs/MV_EDITING.md §7."""
+    audio_uri: str = Field(description="storage://<upload_id> for the source audio")
+
+
 # ---------------------------------------------------------------------------
 # Batch request models
 # ---------------------------------------------------------------------------
@@ -3017,6 +3022,30 @@ async def generate_music(body: MusicGenerationRequest) -> Response:
     except Exception as exc:
         logger.exception("music generation failed")
         return _error(500, str(exc))
+
+
+@app.post("/v1/music/analyze")
+async def analyze_music(body: MusicAnalyzeRequest) -> JSONResponse:
+    """Librosa-only beat/onset/RMS analysis for the MV editing-grammar layer.
+
+    CPU-only, no GPU swap, no LTX/Flux interaction. Bearer-auth gated by the
+    middleware (no system-pause / turbo gating — read-only, cannot block
+    dispatch). See ``docs/MV_EDITING.md`` §7 for the response schema and
+    ``music_analyze.analyze`` for the librosa pipeline.
+    """
+    import music_analyze
+    try:
+        audio_path = uploads.resolve(body.audio_uri)
+    except FileNotFoundError:
+        return _error(404, "audio_uri not found")
+    if not audio_path.exists():
+        return _error(404, "audio_uri not found")
+    try:
+        result = await asyncio.to_thread(music_analyze.analyze, audio_path)
+    except Exception as exc:
+        logger.exception("music analyze failed: %s", body.audio_uri)
+        return _error(500, f"audio analysis failed: {exc}")
+    return JSONResponse(content=result)
 
 
 @app.post("/v1/chat/completions")
