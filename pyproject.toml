@@ -15,6 +15,7 @@ dependencies = [
     "torch>=2.11,<2.12",
     "torchaudio>=2.11,<2.12",
     "python-multipart>=0.0.22",
+    "librosa>=0.10.2",
 ]
 
 [[tool.uv.index]]
