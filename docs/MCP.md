@@ -1,6 +1,6 @@
 # noodlefinger-mcp — LLM-driven workflows over the taco-backend API
 
-**Server version:** v0.2 (2026-04-27) · **Catalog source:** [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal) (`mcp/` subdir)
+**Server version:** v0.2.1 (2026-04-27) · **Catalog source:** [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal) (`mcp/` subdir) · **Status:** end-to-end live-validated against `localhost:8090` (single MCP `cut_music_video` call → real 1.6 MB H.264+AAC MP4 in 82 s at draft quality)
 
 > **What this is:** an [MCP](https://modelcontextprotocol.io) server that wraps the entire `api.noodlefinger.io` surface so an LLM client (Claude Code, Cursor, Continue, Codex CLI, OpenCode, …) can discover endpoints, submit jobs, and orchestrate multi-step pipelines without re-reading `docs/API.md`. Two tiers: **tier-0** (anonymous, docs-only, 6 tools) is always available; **tier-1** (authenticated, 14 action tools) registers iff `NOODLEFINGER_API_KEY` is set.
 >
@@ -23,7 +23,7 @@
 
 A single `noodlefinger-mcp` binary, distributed as a Python wheel via `uvx --from git+...`, that speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio. It bundles:
 
-- The **endpoint catalog** (`endpoints.json`, 77 endpoints across 12 groups) — same data that powers `portal.noodlefinger.io/docs`.
+- The **endpoint catalog** (`endpoints.json`, 77 endpoints across 13 groups) — same data that powers `portal.noodlefinger.io/docs`.
 - The **flow walkthroughs** (`flows.json`, 16 step-by-step recipes) — `text-to-video`, `audio-to-video`, `video-hdr`, `cut-music-video`, …
 - The **CHANGELOG** for cross-referencing endpoint `since_version`.
 
@@ -38,8 +38,8 @@ When tier-1 is enabled (env var `NOODLEFINGER_API_KEY`), it additionally:
 | Surface | Count | Tier | Notes |
 |---|---|---|---|
 | Tools — discovery | 6 | tier-0 | `search_endpoints`, `get_endpoint`, `list_groups`, `list_flows`, `get_flow`, `get_changelog` |
-| Tools — actions | 13 | tier-1 | `submit_job`, `get_job`, `wait_for_job`, `cancel_job`, `download_job_result`, `download_storage_uri`, `upload_file`, `extract_segment`, `create_composition`, `export_composition`, `get_changelog_for_endpoint`, `cut_music_video`, `resume_music_video`, `list_sessions` |
-| Tools — total | **20** | — | 6 + 14 (the orchestrator splits into `cut_music_video` + `resume_music_video` + `list_sessions`) |
+| Tools — actions | 14 | tier-1 | `submit_job`, `get_job`, `wait_for_job`, `cancel_job`, `download_job_result`, `download_storage_uri`, `upload_file`, `extract_segment`, `create_composition`, `export_composition`, `get_changelog_for_endpoint`, `cut_music_video`, `resume_music_video`, `list_sessions` |
+| Tools — total | **20** | — | 6 + 14 |
 | Resources | 3 | tier-0 | `noodlefinger://endpoints`, `noodlefinger://flows`, `noodlefinger://changelog` |
 
 ---
@@ -112,7 +112,7 @@ Cursor: `Cmd-Shift-P → Cursor: Open MCP Settings`. Continue / Codex CLI: their
 After registering, restart your client and:
 
 1. Run `/mcp` (Claude Code) — `noodlefinger` should be `connected`.
-2. Call `mcp__noodlefinger__list_groups` — should return all 12 groups (`system`, `uploads`, `loras`, `v1-generation`, `v2-generation`, `jobs`, `batch`, `history`, `chat`, `approved-images`, `compositions`, `video-utilities`).
+2. Call `mcp__noodlefinger__list_groups` — should return all 13 groups (`video-generation`, `image-generation`, `music-generation`, `batch`, `jobs-lifecycle`, `history`, `uploads`, `compositions`, `approved-images`, `loras`, `chat`, `system`, `dashboard-meta`).
 3. With tier-1 enabled, call `mcp__noodlefinger__list_sessions` — returns `[]` on first run (no sessions yet).
 
 If `list_groups` returns "tool not found", check the server is connected — your client may have failed to launch `uvx`.
@@ -313,7 +313,7 @@ ASSISTANT (tool: mcp__noodlefinger__cut_music_video,
   │    POST /v2/audio-to-video             (clip submit, ~50s wait)
   │    [if clip > 0: segment_uri from prior tail]
   │    POST /v2/video/extract-segment      (~2s, only if clip < 4)
-  │    GET  /v2/history?type=video&limit=5 (resolve historyId)
+  │    [historyId = job_id — no /v2/history lookup needed]
   │    [checkpoint to ~/.cache/noodlefinger-mcp/sessions/<id>.json]
   ├─ POST /v2/compositions                 (timeline blob)
   └─ POST /v2/compositions/{id}/export
@@ -428,7 +428,7 @@ Capturing the `session_id` early (it's in the failure response too) lets you ret
 |---|---|---|---|
 | `search_endpoints` | 0 | `query: str`, `limit?: int`, `method?: str`, `group?: str` | Lexical search over the catalog. Returns top-N endpoint summaries. |
 | `get_endpoint` | 0 | `endpoint_id: str` | Full endpoint spec — body schema, response, errors, code in 3 langs. |
-| `list_groups` | 0 | — | All 12 endpoint groups (sidebar structure). |
+| `list_groups` | 0 | — | All 13 endpoint groups (sidebar structure). |
 | `list_flows` | 0 | — | 16 step-by-step generation walkthroughs. |
 | `get_flow` | 0 | `flow_id: str` | Full walkthrough with curl/python/node code per step + gotchas. |
 | `get_changelog` | 0 | `version?: str` | Latest CHANGELOG entry, or a specific `vX.Y.Z` section. |
