@@ -146,6 +146,32 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs, resolved 
 
 ---
 
+## MCP integration
+
+An [MCP](https://modelcontextprotocol.io) server wrapping this entire API ships at [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal) under the `mcp/` subdirectory. LLM clients (Claude Code, Cursor, Continue, Codex CLI) can call it directly as a stdio subprocess. See [docs/MCP.md](MCP.md) for the canonical reference — connection, security, usage transcripts, full tool list.
+
+### Install one-liner (Claude Code)
+
+```bash
+claude mcp add --scope user \
+  -e NOODLEFINGER_API_KEY=nf_live_sk_... \
+  noodlefinger uvx -- \
+  --from "git+https://github.com/tacos8me/noodle-portal#subdirectory=mcp" \
+  noodlefinger-mcp
+```
+
+### What you get
+
+- **Discovery (tier-0, anonymous):** `search_endpoints`, `get_endpoint`, `list_groups`, `list_flows`, `get_flow`, `get_changelog` — pure local JSON reads against the bundled catalog. Useful as an LLM-readable form of this very document.
+- **Single-job execution (tier-1, authenticated):** `submit_job` + `wait_for_job` + `download_job_result` collapses the upload → POST /v2/* → poll → GET result loop into three tool calls.
+- **`cut_music_video` orchestration (tier-1):** one tool call runs music gen + N a2v clips with seamless chain conditioning + composition + export, with checkpointed session resume on failure.
+
+Tier-1 tools are only registered when `NOODLEFINGER_API_KEY` is set; the same binary is safe to install anonymously for docs lookup.
+
+See [docs/MCP.md](MCP.md) for full setup, security model, and usage transcripts.
+
+---
+
 ## Common types
 
 ### `LoRAInput`
@@ -1952,84 +1978,86 @@ Any error message containing `/mnt/`, `/home/`, or `/tmp/` is truncated to 500 c
 
 ## Endpoint index
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/health` | no | Liveness + model status |
-| GET | `/dashboard` | no | GPU management SPA |
-| GET | `/v1/system/gpu` | no | `nvidia-smi` telemetry |
-| POST | `/v1/system/pause` | yes | Evict all + cancel queued |
-| POST | `/v1/system/resume` | yes | Reload all |
-| POST | `/v1/flux/unload` | yes | Unload Flux |
-| POST | `/v1/flux/reload` | yes | Reload Flux |
-| POST | `/v1/ltx/unload` | yes | Unload LTX |
-| POST | `/v1/ltx/reload` | yes | Reload LTX |
-| POST | `/v1/system/turbo` | yes | Toggle turbo mode |
-| GET | `/v1/system/pool` | yes | Remote-sidecar pool state (per-provider in v1.9.0) |
-| POST | `/v1/system/pool/remote-workers` | yes | Set target remote worker counts (legacy `{count}` or per-provider dict) |
-| POST | `/v1/system/pool/remote-workers/{provider}` | yes | Set target worker count for one provider (v1.9.0) |
-| GET | `/v1/system/sampler` | yes | Sampler subset of gen config |
-| POST | `/v1/system/sampler` | yes | Toggle CFG++ / Euler |
-| GET | `/v1/system/config` | yes | Full LTX gen config |
-| POST | `/v1/system/config` | yes | Merge-update LTX gen config |
-| POST | `/v1/system/config/reset` | yes | Reset LTX gen config |
-| GET | `/v1/system/flux-config` | yes | Full Flux gen config |
-| POST | `/v1/system/flux-config` | yes | Merge-update Flux gen config |
-| POST | `/v1/system/flux-config/reset` | yes | Reset Flux gen config |
-| POST | `/v1/text-to-video` | yes | Sync t2v |
-| POST | `/v1/image-to-video` | yes | Sync i2v / keyframe |
-| POST | `/v1/audio-to-video` | yes | Sync a2v |
-| POST | `/v1/retake` | yes | Sync retake |
-| POST | `/v1/text-to-image` | yes | Sync Flux t2i / ERNIE t2i |
-| POST | `/v1/image-to-image` | yes | Sync Flux i2i |
-| POST | `/v1/image-edit` | yes | Sync edit (Flux multi / JoyAI single) |
-| POST | `/v1/music` | yes | Sync music (ACE) |
-| POST | `/v1/chat/completions` | yes | llama-swap proxy |
-| POST | `/v1/upload` | yes | Get upload slot |
-| PUT | `/uploads/put/{upload_id}` | yes | Upload bytes |
-| GET | `/uploads/get/{upload_id}` | yes | Read back upload (v1.9.1) |
-| GET | `/v1/loras` | yes | List LTX LoRAs |
-| POST | `/v1/loras` | yes | Upload LTX LoRA (multipart) |
-| DELETE | `/v1/loras/{lora_id}` | yes | Delete LTX LoRA |
-| GET | `/v1/flux-loras` | yes | List Flux LoRAs |
-| POST | `/v1/flux-loras/rescan` | yes | Re-scan Flux LoRA folder |
-| POST | `/v1/sse-token` | yes | Issue 5-min SSE token |
-| POST | `/v1/approved-images` | yes | Approve an image |
-| GET | `/v1/approved-images` | yes | List approved images |
-| GET | `/v1/approved-images/events` | no | SSE feed (bearer OR `?token=`) |
-| GET | `/v1/approved-images/{id}/file` | yes | Fetch approved file |
-| POST | `/v2/text-to-video` | yes | Async t2v |
-| POST | `/v2/image-to-video` | yes | Async i2v |
-| POST | `/v2/audio-to-video` | yes | Async a2v |
-| POST | `/v2/retake` | yes | Async retake |
-| POST | `/v2/video-outpaint` | yes | **v1.7.0** Async IC-LoRA outpaint |
-| POST | `/v2/video-hdr` | yes | **v1.14.0** Async IC-LoRA HDR (canvas preserved) |
-| POST | `/v2/video/extract-frames` | yes | **v1.10.0** PyAV frame extractor (v1.11.5 legacy chain conditioning) |
-| POST | `/v2/video/extract-segment` | yes | **v1.12.0** PyAV segment extractor (experimental v1.12 chain conditioning) |
-| POST | `/v2/text-to-image` | yes | Async t2i |
-| POST | `/v2/image-to-image` | yes | Async i2i |
-| POST | `/v2/image-edit` | yes | Async edit |
-| POST | `/v2/music` | yes | Async music |
-| GET | `/v2/jobs/{id}` | yes | Poll status |
-| GET | `/v2/jobs/{id}/preview` | yes | Preview JPEG (204 when empty) |
-| GET | `/v2/jobs/{id}/result` | yes | Download final media |
-| GET | `/v2/jobs/{id}/stream` | no (bearer OR `?token=`) | SSE live status |
-| DELETE | `/v2/jobs/{id}` | yes | Cancel job |
-| POST | `/v2/batch` | yes | Submit batch |
-| GET | `/v2/batch/{id}` | yes | Poll batch status |
-| GET | `/v2/batch/{id}/result/{index}` | yes | Download batch item result |
-| DELETE | `/v2/batch/{id}` | yes | Cancel batch |
-| GET | `/v2/history` | yes | Per-key history list |
-| GET | `/v2/history/{id}` | yes | Full record with params + gen_config |
-| GET | `/v2/history/{id}/image` | yes | Full-size history media |
-| GET | `/v2/history/{id}/thumbnail` | yes | History thumbnail |
-| DELETE | `/v2/history/{id}` | yes | Delete history entry |
-| POST | `/v2/char/rank` | yes | Vision character consistency rank |
-| POST | `/v2/compositions` | yes | Create composition |
-| GET | `/v2/compositions` | yes | List compositions |
-| GET | `/v2/compositions/{id}` | yes | Get composition |
-| PUT | `/v2/compositions/{id}` | yes | Update composition |
-| DELETE | `/v2/compositions/{id}` | yes | Delete composition |
-| POST | `/v2/compositions/{id}/export` | yes | Enqueue export job |
+The **MCP** column lists the corresponding tier-1 wrapper tool from [docs/MCP.md](MCP.md). `submit_job` covers any v2 generation POST returning a `SubmissionEnvelope`; system-control endpoints (`/v1/system/*`, `/v1/{flux,ltx}/*`) are deliberately not wrapped — they stay on the dashboard.
+
+| Method | Path | Auth | Purpose | MCP |
+|---|---|---|---|---|
+| GET | `/health` | no | Liveness + model status | — |
+| GET | `/dashboard` | no | GPU management SPA | — |
+| GET | `/v1/system/gpu` | no | `nvidia-smi` telemetry | — |
+| POST | `/v1/system/pause` | yes | Evict all + cancel queued | — |
+| POST | `/v1/system/resume` | yes | Reload all | — |
+| POST | `/v1/flux/unload` | yes | Unload Flux | — |
+| POST | `/v1/flux/reload` | yes | Reload Flux | — |
+| POST | `/v1/ltx/unload` | yes | Unload LTX | — |
+| POST | `/v1/ltx/reload` | yes | Reload LTX | — |
+| POST | `/v1/system/turbo` | yes | Toggle turbo mode | — |
+| GET | `/v1/system/pool` | yes | Remote-sidecar pool state (per-provider in v1.9.0) | — |
+| POST | `/v1/system/pool/remote-workers` | yes | Set target remote worker counts (legacy `{count}` or per-provider dict) | — |
+| POST | `/v1/system/pool/remote-workers/{provider}` | yes | Set target worker count for one provider (v1.9.0) | — |
+| GET | `/v1/system/sampler` | yes | Sampler subset of gen config | — |
+| POST | `/v1/system/sampler` | yes | Toggle CFG++ / Euler | — |
+| GET | `/v1/system/config` | yes | Full LTX gen config | — |
+| POST | `/v1/system/config` | yes | Merge-update LTX gen config | — |
+| POST | `/v1/system/config/reset` | yes | Reset LTX gen config | — |
+| GET | `/v1/system/flux-config` | yes | Full Flux gen config | — |
+| POST | `/v1/system/flux-config` | yes | Merge-update Flux gen config | — |
+| POST | `/v1/system/flux-config/reset` | yes | Reset Flux gen config | — |
+| POST | `/v1/text-to-video` | yes | Sync t2v | — |
+| POST | `/v1/image-to-video` | yes | Sync i2v / keyframe | — |
+| POST | `/v1/audio-to-video` | yes | Sync a2v | — |
+| POST | `/v1/retake` | yes | Sync retake | — |
+| POST | `/v1/text-to-image` | yes | Sync Flux t2i / ERNIE t2i | — |
+| POST | `/v1/image-to-image` | yes | Sync Flux i2i | — |
+| POST | `/v1/image-edit` | yes | Sync edit (Flux multi / JoyAI single) | — |
+| POST | `/v1/music` | yes | Sync music (ACE) | — |
+| POST | `/v1/chat/completions` | yes | llama-swap proxy | — |
+| POST | `/v1/upload` | yes | Get upload slot | `upload_file` |
+| PUT | `/uploads/put/{upload_id}` | yes | Upload bytes | `upload_file` |
+| GET | `/uploads/get/{upload_id}` | yes | Read back upload (v1.9.1) | `download_storage_uri` |
+| GET | `/v1/loras` | yes | List LTX LoRAs | — |
+| POST | `/v1/loras` | yes | Upload LTX LoRA (multipart) | — |
+| DELETE | `/v1/loras/{lora_id}` | yes | Delete LTX LoRA | — |
+| GET | `/v1/flux-loras` | yes | List Flux LoRAs | — |
+| POST | `/v1/flux-loras/rescan` | yes | Re-scan Flux LoRA folder | — |
+| POST | `/v1/sse-token` | yes | Issue 5-min SSE token | — |
+| POST | `/v1/approved-images` | yes | Approve an image | — |
+| GET | `/v1/approved-images` | yes | List approved images | — |
+| GET | `/v1/approved-images/events` | no | SSE feed (bearer OR `?token=`) | — |
+| GET | `/v1/approved-images/{id}/file` | yes | Fetch approved file | — |
+| POST | `/v2/text-to-video` | yes | Async t2v | `submit_job` |
+| POST | `/v2/image-to-video` | yes | Async i2v | `submit_job` |
+| POST | `/v2/audio-to-video` | yes | Async a2v | `submit_job` / `cut_music_video` |
+| POST | `/v2/retake` | yes | Async retake | `submit_job` |
+| POST | `/v2/video-outpaint` | yes | **v1.7.0** Async IC-LoRA outpaint | `submit_job` |
+| POST | `/v2/video-hdr` | yes | **v1.14.0** Async IC-LoRA HDR (canvas preserved) | `submit_job` |
+| POST | `/v2/video/extract-frames` | yes | **v1.10.0** PyAV frame extractor (v1.11.5 legacy chain conditioning) | — |
+| POST | `/v2/video/extract-segment` | yes | **v1.12.0** PyAV segment extractor (experimental v1.12 chain conditioning) | `extract_segment` |
+| POST | `/v2/text-to-image` | yes | Async t2i | `submit_job` |
+| POST | `/v2/image-to-image` | yes | Async i2i | `submit_job` |
+| POST | `/v2/image-edit` | yes | Async edit | `submit_job` |
+| POST | `/v2/music` | yes | Async music | `submit_job` / `cut_music_video` |
+| GET | `/v2/jobs/{id}` | yes | Poll status | `get_job` / `wait_for_job` |
+| GET | `/v2/jobs/{id}/preview` | yes | Preview JPEG (204 when empty) | — |
+| GET | `/v2/jobs/{id}/result` | yes | Download final media | `download_job_result` |
+| GET | `/v2/jobs/{id}/stream` | no (bearer OR `?token=`) | SSE live status | — |
+| DELETE | `/v2/jobs/{id}` | yes | Cancel job | `cancel_job` |
+| POST | `/v2/batch` | yes | Submit batch | — |
+| GET | `/v2/batch/{id}` | yes | Poll batch status | — |
+| GET | `/v2/batch/{id}/result/{index}` | yes | Download batch item result | — |
+| DELETE | `/v2/batch/{id}` | yes | Cancel batch | — |
+| GET | `/v2/history` | yes | Per-key history list | — |
+| GET | `/v2/history/{id}` | yes | Full record with params + gen_config | — |
+| GET | `/v2/history/{id}/image` | yes | Full-size history media | — |
+| GET | `/v2/history/{id}/thumbnail` | yes | History thumbnail | — |
+| DELETE | `/v2/history/{id}` | yes | Delete history entry | — |
+| POST | `/v2/char/rank` | yes | Vision character consistency rank | — |
+| POST | `/v2/compositions` | yes | Create composition | `create_composition` |
+| GET | `/v2/compositions` | yes | List compositions | — |
+| GET | `/v2/compositions/{id}` | yes | Get composition | — |
+| PUT | `/v2/compositions/{id}` | yes | Update composition | — |
+| DELETE | `/v2/compositions/{id}` | yes | Delete composition | — |
+| POST | `/v2/compositions/{id}/export` | yes | Enqueue export job | `export_composition` |
 
 **Total: 73 routes.**
 

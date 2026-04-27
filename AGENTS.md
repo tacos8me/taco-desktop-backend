@@ -156,3 +156,20 @@ ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temp
 | 11 | split_model_manager.py:457,555,665,760,883 | evict_transformer already syncs+clears |
 | 13 | server.py lifespan or config.py | — |
 | 14 | split_model_manager.py:221-235 | Test av.open(BytesIO(), 'w', format='mp4') |
+
+---
+
+## When to invoke the noodlefinger MCP
+
+The taco-backend ships an MCP server at [noodle-portal `mcp/`](https://github.com/tacos8me/noodle-portal/tree/main/mcp) that wraps this entire API for LLM clients (Claude Code, Cursor, Continue, Codex CLI). Two tiers: tier-0 docs lookup is anonymous and always-on (6 tools); tier-1 actions register iff `NOODLEFINGER_API_KEY` is set (14 tools, including the `cut_music_video` orchestrator). When you, the agent, are working on a task that maps cleanly to one of the categories below, prefer calling the MCP tool over hand-rolling curl or writing a one-off Python script.
+
+| Category | When to use it | Tools |
+|---|---|---|
+| Endpoint discovery | "What does `POST /v2/foo` accept?" — instead of `Read`-ing `docs/API.md` for a single endpoint, call the MCP. | `mcp__noodlefinger__search_endpoints`, `mcp__noodlefinger__get_endpoint`, `mcp__noodlefinger__list_groups` |
+| Flow walkthroughs | "How do I chain two clips together?" — pre-vetted multi-step recipes in 3 langs. | `mcp__noodlefinger__list_flows`, `mcp__noodlefinger__get_flow` |
+| Changelog cross-reference | "What changed in this endpoint last release?" | `mcp__noodlefinger__get_changelog`, `mcp__noodlefinger__get_changelog_for_endpoint` |
+| Single-job execution | Submitting one v2 job + waiting + downloading. Three tool calls vs. an SSE-aware polling loop. | `mcp__noodlefinger__upload_file`, `mcp__noodlefinger__submit_job`, `mcp__noodlefinger__wait_for_job`, `mcp__noodlefinger__download_job_result` |
+| Multi-clip MV pipeline | Music gen + N a2v clips with chained segments + composition + export, all in one call with checkpointed resume. | `mcp__noodlefinger__cut_music_video`, `mcp__noodlefinger__resume_music_video`, `mcp__noodlefinger__list_sessions` |
+| Off-limits | System-control endpoints (`/v1/system/{turbo,pause,resume}`, `/v1/{flux,ltx}/{unload,reload}`) are deliberately not wrapped. Use the dashboard or call them directly. | — |
+
+Full setup, security model, and usage transcripts: [docs/MCP.md](docs/MCP.md).
