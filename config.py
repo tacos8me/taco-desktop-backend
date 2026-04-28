@@ -50,10 +50,21 @@ DISTILLED_LORA = str(CHECKPOINTS_DIR / "ltx-2.3-22b-distilled-lora-384-1.1.safet
 SPATIAL_UPSAMPLER = str(CHECKPOINTS_DIR / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
 
 # Text encoder — point to the HF snapshot directory containing model*.safetensors
-# Set GEMMA_VARIANT=sikaworld in .env to use the abliterated FP4 text encoder
+# Set GEMMA_VARIANT=sikaworld in .env to use the abliterated FP4 text encoder.
+# Set GEMMA_VARIANT=gemma-3-12b-it-nvfp4 for the IT-tuned NVFP4 variant
+# (instruction-tuned — required if `enhance_prompt=true` should produce useful
+# rewrites). The IT-NVFP4 path uses a glob because the HF snapshot commit sha
+# is staged at runtime — operator should pin to a concrete sha after the
+# download settles (resolves to the single snapshot directory under it).
+import glob as _glob
+_IT_NVFP4_GLOB = "/mnt/nvme-1/huggingface/hub/models--NeoChen1024--gemma-3-12b-it-NVFP4/snapshots/*"
+_it_nvfp4_matches = sorted(_glob.glob(_IT_NVFP4_GLOB))
+_IT_NVFP4_PATH = _it_nvfp4_matches[0] if _it_nvfp4_matches else _IT_NVFP4_GLOB
+
 _GEMMA_VARIANTS = {
     "default": "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f",
     "sikaworld": "/mnt/nvme-1/huggingface/gemma-3-12b-sikaworld",
+    "gemma-3-12b-it-nvfp4": _IT_NVFP4_PATH,
 }
 GEMMA_VARIANT = os.environ.get("GEMMA_VARIANT", "default")
 GEMMA_ROOT = _GEMMA_VARIANTS.get(GEMMA_VARIANT, _GEMMA_VARIANTS["default"])
@@ -119,6 +130,13 @@ LTX_PROVIDER_LORAS_MOUNT = {
 ACE_SIDECAR_URL = os.environ.get("ACE_SIDECAR_URL", "http://127.0.0.1:8001")
 LOAD_ACE = os.environ.get("LOAD_ACE", "").lower() in ("1", "true", "yes")
 MAX_MUSIC_PENDING = int(os.environ.get("MAX_MUSIC_PENDING", "5"))
+
+# madmom downbeat-detection sidecar (v1.16.0) — CPU-only FastAPI service,
+# port 8095, BSD-licensed. Opt-in per-request via `analyzer="madmom"` on
+# `POST /v1/music/analyze`. `LOAD_MADMOM=1` (default truthy) enables the
+# routing branch; the sidecar itself is managed via `systemctl --user`.
+MADMOM_SIDECAR_URL = os.environ.get("MADMOM_SIDECAR_URL", "http://127.0.0.1:8095")
+LOAD_MADMOM = os.environ.get("LOAD_MADMOM", "1").lower() in ("1", "true", "yes")
 
 CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server

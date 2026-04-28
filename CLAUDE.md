@@ -23,9 +23,10 @@ v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard 
 | LoRA plumbing | [LTX LoRA](#conventions) / [Flux LoRA](#flux-lora-v11--folder-drop-discovery-adapter-mode) / [IC-LoRA outpaint](#ic-lora-video-outpaint-v170) / [IC-LoRA HDR](#ic-lora-video-hdr-v1140) |
 | Async job queue, phases, SSE | [v2 job observability](#v2-job-observability-v116--v117) + `job_queue.py` |
 | History + reproducibility | [Generation history](#generation-history-history_storepy) |
-| Sidecars (ACE / JoyAI / ERNIE / LTX-remote) | [ACE](#ace-music-sidecar-v12) / [JoyAI](#joyai-image-edit-sidecar-v12-migrated-from-cuda0) / [ERNIE](#ernie-image-sidecar-v13) / [Remote pool](#remote-sidecar-pool-v16) |
+| Sidecars (ACE / JoyAI / ERNIE / madmom / LTX-remote) | [ACE](#ace-music-sidecar-v12) / [JoyAI](#joyai-image-edit-sidecar-v12-migrated-from-cuda0) / [ERNIE](#ernie-image-sidecar-v13) / [madmom](#madmom-downbeat-sidecar-v1160) / [Remote pool](#remote-sidecar-pool-v16) |
 | Video outpaint | [IC-LoRA video outpaint](#ic-lora-video-outpaint-v170) |
 | MV editing grammar / shot lists / beat-aligned cuts | `docs/MV_EDITING.md` (v1.15.0 — `/v1/music/analyze` + `clip.speed` + `transition.audioLeadFrames`) |
+| Music structure analyzer (madmom) | [madmom downbeat sidecar (v1.16.0)](#madmom-downbeat-sidecar-v1160) — `POST /v1/music/analyze` with `analyzer="madmom"` |
 | Dashboard + live tuning | [Dashboard](#dashboard-and-gpu-telemetry-v12-advanced-controls-v13) + [Generation config](#generation-config-v13) |
 | Client-facing API shape | `docs/API.md` (canonical) |
 | LLM-driven workflows | `docs/MCP.md` (noodlefinger-mcp tier-0 + tier-1) |
@@ -39,6 +40,7 @@ v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard 
 - `chat_manager.py` — Proxies /v1/chat/completions to llama-swap (supports per-request model override for vision ranking)
 - `ernie_client.py` — ERNIE-Image sidecar client (httpx → cuda:1:8094), swaps with JoyAI on cuda:1
 - `joyai_client.py` — JoyAI-Image-Edit sidecar client (httpx → cuda:1:8092)
+- `madmom_client.py` — madmom downbeat-detection sidecar client (httpx → CPU:8095, v1.16.0). Opt-in via `analyzer="madmom"` on `POST /v1/music/analyze`.
 - `ltx_sidecar_client.py` — LTX video sidecar client. One primary `ltx_sidecar` (local cuda:1:8093) + optional `ltx_remote_sidecar` (Modal, configured via `LTX_REMOTE_SIDECAR_URL`). `generate()` supports base64 media inlining (`audio_b64` / `image_b64` / `video_b64`) for remote sidecars that can't see the local `uploads/` filesystem, plus outpaint extras (`position`, `conditioning_strength`, `skip_stage_2`).
 - `job_queue.py` — Async job queue: submit (202), poll, result, cancel; saves to history on completion. `JobType` enum includes `VIDEO_OUTPAINT` (v1.7.0). v1.13.0 adds `Job.worker_id: str | None` — set by each dispatch path (`local-0`, `local-1`, `modal-<N>`, `runpod-<N>`) and read by `GET /v1/system/workers` to infer per-worker busy/idle state.
 - `upload_store.py` — UUID file storage for uploads and job results
@@ -126,6 +128,30 @@ baidu/ERNIE-Image (8B DiT text-to-image, Apache 2.0) runs on cuda:1 at `127.0.0.
 - Latency: ~11 s at 8 turbo steps (1024x1024).
 - Fallback: `503 ernie_disabled` / `503 sidecar_unreachable`.
 - Env: `ERNIE_SIDECAR_URL` (default `http://127.0.0.1:8094`).
+
+### madmom downbeat sidecar (v1.16.0)
+
+CPU-only FastAPI service at `127.0.0.1:8095` for higher-accuracy beat + downbeat
+detection (~+8% accent-cut accuracy on cross-genre pop vs librosa). BSD-licensed.
+Lives in its own venv at `/mnt/nvme-1/servers/madmom-sidecar/` because madmom
+needs `numpy<1.24` + `scipy<1.13` (binary-compat ceiling), incompatible with the
+main taco-backend venv.
+
+- Activation: `LOAD_MADMOM=1` (default truthy in `config.py`) and the sidecar
+  service must be running.
+- Dispatch: `POST /v1/music/analyze` with body `{"audio_uri": ..., "analyzer": "madmom"}`
+  routes to `madmom_client.analyze()`. Default `analyzer="librosa"` keeps the
+  v1.15.x in-process path byte-identical for existing callers.
+- Service: `systemctl --user {start,stop,restart,status} madmom-sidecar`.
+- Setup: `bash /mnt/nvme-1/servers/madmom-sidecar/setup.sh` — creates the venv,
+  installs deps, registers + starts the unit, blocks on `/health`.
+- Pre-warming: RNN/DBN processors load once at startup (~20-40 s on CPU); the
+  first request after that returns in seconds. `TimeoutStartSec=120` in the
+  unit accommodates this.
+- Failure semantics: **no silent fallback** — a sidecar timeout / 5xx /
+  unreachable returns `503` from `/v1/music/analyze` so callers know they
+  didn't get the analyzer they asked for.
+- Env: `MADMOM_SIDECAR_URL` (default `http://127.0.0.1:8095`).
 
 ### Dashboard and GPU telemetry (v1.2, advanced controls v1.3)
 
@@ -364,8 +390,10 @@ All LTX generation parameters stored in `.gen_config.json` (project root). Chang
 ## Text encoder variants
 - `GEMMA_VARIANT=default` — Google Gemma 3 12B PT (standard, BF16)
 - `GEMMA_VARIANT=sikaworld` — Sikaworld abliterated FP4 (uncensored, NVFP4 quantized)
+- `GEMMA_VARIANT=gemma-3-12b-it-nvfp4` — IT-tuned NVFP4 (instruction-tuned for prompt enhancement; required if `enhance_prompt=true` should produce useful rewrites). v1.16.0+. The PT (default) variant produces literal continuations of the seed prompt rather than rewritten prompts; the IT variant follows instructions cleanly.
 - Set via `.env` or environment variable, requires server restart
 - Sikaworld path: `/mnt/nvme-1/huggingface/gemma-3-12b-sikaworld/`
+- IT-NVFP4 path: `/mnt/nvme-1/huggingface/hub/models--NeoChen1024--gemma-3-12b-it-NVFP4/snapshots/<commit_sha>` — staged via `hf download NeoChen1024/gemma-3-12b-it-NVFP4`. `config.py` resolves the snapshot via glob; pin to a concrete sha after the download settles.
 
 ## Dependencies
 - **PyTorch 2.11.0+cu130** — FlexAttention/FA4 on Blackwell sm_120, SDPA auto-selects cuDNN FlashAttention
