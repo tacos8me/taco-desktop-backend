@@ -1140,9 +1140,38 @@ class SplitModelManager:
             text_encoder = self._encoder_ledger.text_encoder()
             if enhance_first_prompt:
                 prompts = list(prompts)
-                prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], image_path=enhance_prompt_image, seed=enhance_prompt_seed)
-                if on_enhanced is not None:
-                    on_enhanced(prompts[0])
+                # v1.15.3 defensive fallback. generate_enhanced_prompt calls
+                # tokenizer.apply_chat_template (ltx-core base_encoder.py:58)
+                # which fails on PT-variant Gemma tokenizers — they ship no
+                # chat_template (Gemma 3 12B PT and our `sikaworld` variant
+                # both symlink the same PT tokenizer_config.json). Symptoms:
+                # "Cannot use chat template functions because tokenizer.chat_template
+                # is not set" or "tuple index out of range" from the template's
+                # internal jinja fallback path. Previously this crashed the
+                # whole job. Now: log a warning, keep the raw prompt, and let
+                # the run continue. Callers who actually want enhancement need
+                # GEMMA_VARIANT pointed at an instruction-tuned snapshot
+                # (`-it` / `-it-NVFP4` / similar) whose tokenizer_config.json
+                # carries a chat_template.
+                try:
+                    prompts[0] = generate_enhanced_prompt(
+                        text_encoder,
+                        prompts[0],
+                        image_path=enhance_prompt_image,
+                        seed=enhance_prompt_seed,
+                    )
+                    if on_enhanced is not None:
+                        on_enhanced(prompts[0])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "enhance_prompt failed (%s: %s); falling back to raw "
+                        "prompt. Hint: GEMMA_VARIANT=%s tokenizer has no "
+                        "chat_template — switch to an instruction-tuned "
+                        "variant to enable Gemma prompt rewriting.",
+                        type(exc).__name__,
+                        str(exc)[:200],
+                        config.GEMMA_VARIANT,
+                    )
             embeddings_processor = self._encoder_ledger.gemma_embeddings_processor()
             results: list[EmbeddingsProcessorOutput] = []
             for p in prompts:
