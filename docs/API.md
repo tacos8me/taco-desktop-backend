@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.12.0 (2026-04-20)
+**Server version:** v1.16.1 (2026-04-28)
 **Public base URL:** `https://api.noodlefinger.io` *(canonical; Cloudflare-proxied via the shared `noodle` tunnel)*
 **LAN / dev base URL:** `http://<host>:8090` (uvicorn direct)
 
@@ -8,7 +8,7 @@
 **Source of truth:** `/mnt/nvme-1/servers/taco-backend/server.py`. This document is the client contract — any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes, auth) MUST update this file in the same commit.
 
 > **New to the API?** Start with [docs/QUICKSTART.md](./QUICKSTART.md). This doc is the exhaustive spec.
-> **See also:** [GPU architecture](./gpu-architecture.md) · [Model specs](./models.md) · [Configuration](./configuration.md)
+> **See also:** [GPU architecture](./gpu-architecture.md) · [Model specs](./models.md) · [Configuration](./configuration.md) · [Operator tuning](./operator-tuning.md) (rate-limit + concurrency env vars, v1.16.1)
 
 ---
 
@@ -125,12 +125,17 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs, resolved 
 
 | Ceiling | Config | Overflow response |
 |---|---|---|
-| v2 job queue | `MAX_QUEUE_DEPTH = 10` | `429 {"error": "queue_full"}` + `Retry-After: 30` |
-| v2 music pending jobs | `MAX_MUSIC_PENDING = 5` | `429 {"error": "music_queue_full"}` + `Retry-After: 30` |
-| Batch queue | `MAX_BATCH_QUEUE_DEPTH = 5` | `429 {"error": "batch_queue_full"}` + `Retry-After: 30` |
+| v2 job queue (global) | `MAX_QUEUE_DEPTH = 30` *(v1.16.1: was 10)* | `429 {"error": "queue_full"}` + `Retry-After: 30` |
+| v2 job queue (per bearer) | `PER_KEY_QUEUE_CAP = 15` *(v1.16.1: was 3)* | `429 {"error": "per_key_queue_full"}` + `Retry-After: 30` |
+| v2 music pending jobs (global) | `MAX_MUSIC_PENDING = 5` | `429 {"error": "music_queue_full"}` + `Retry-After: 30` |
+| v2 music pending jobs (per bearer) | `PER_KEY_MUSIC_CAP = 5` *(v1.16.1: was 2)* | `429 {"error": "per_key_queue_full"}` + `Retry-After: 30` |
+| Batch queue (global) | `MAX_BATCH_QUEUE_DEPTH = 5` | `429 {"error": "batch_queue_full"}` + `Retry-After: 30` |
+| Batch queue (per bearer) | `PER_KEY_BATCH_CAP = 5` *(v1.16.1: was 2)* | `429 {"error": "per_key_queue_full"}` + `Retry-After: 30` |
 | Items per batch | `MAX_BATCH_ITEMS = 50` | `422` from Pydantic `max_length` |
 | Upload size | `MAX_UPLOAD_BYTES = 1 GiB` | `413` |
 | LoRA upload size | `MAX_LORA_SIZE_BYTES = 1 GiB` | `413` |
+
+> All four per-key / global queue caps are env-overridable. See [`docs/operator-tuning.md`](./operator-tuning.md) for the override pattern, validation steps, and a full operator-facing changelog of v1.16.1's HTTP-layer + systemd tuning.
 
 ### System-wide state
 
@@ -742,7 +747,7 @@ All v1 generation endpoints can return:
 | `generate_audio` | bool | `false` | |
 | `camera_motion` | string \| null | `null` | ≤ 200 chars; appended to prompt as `[...]` |
 | `lora` | [`LoRAInput`](#lorainput) \| null | `null` | |
-| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter |
+| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter. Requires `GEMMA_VARIANT` to point at an instruction-tuned snapshot (e.g. `gemma-3-12b-it-nvfp4`, v1.16.0+); falls back to the raw prompt with a WARN log otherwise (v1.15.3 safe-fallback). |
 
 **Response:** `200 video/mp4` raw bytes.
 
@@ -1044,7 +1049,7 @@ All accept the **same bodies** as their v1 counterparts.
 | `duration` | float | required | `0 < x ≤ 30` seconds — output duration |
 | `fps` | float | required | `0 < x ≤ 60` |
 | `seed` | int | `0` | `≥ 0`; `0` → server picks a random 32-bit uint |
-| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter |
+| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter. Requires `GEMMA_VARIANT` to point at an instruction-tuned snapshot (e.g. `gemma-3-12b-it-nvfp4`, v1.16.0+); falls back to the raw prompt with a WARN log otherwise (v1.15.3 safe-fallback). |
 | `lora` | [`LoRAInput`](#lorainput) \| null | `null` | `null` → defaults to `{"id": "ic-lora-outpaint", "strength": 1.0}`. Can point at any registered LTX IC-LoRA. |
 | `conditioning_strength` | float | `1.0` | `0.0 ≤ x ≤ 1.0` — scalar attention weight on the IC-LoRA conditioning; values < 1 loosen fidelity to the source |
 | `skip_stage_2` | bool | `false` | `true` → faster preview at half target resolution, lower quality |
@@ -1096,7 +1101,7 @@ Architecturally piggybacks on the outpaint pipeline with `target == source` and 
 | `duration` | float | required | `0 < x ≤ 30` seconds |
 | `fps` | float | required | `0 < x ≤ 60` |
 | `seed` | int | `0` | `≥ 0`; `0` → server picks a random 32-bit uint |
-| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter |
+| `enhance_prompt` | bool | `false` | Gemma prompt-rewriter. Requires `GEMMA_VARIANT` to point at an instruction-tuned snapshot (e.g. `gemma-3-12b-it-nvfp4`, v1.16.0+); falls back to the raw prompt with a WARN log otherwise (v1.15.3 safe-fallback). |
 | `lora` | [`LoRAInput`](#lorainput) \| null | `null` | `null` → defaults to `{"id": "ic-lora-hdr", "strength": 1.0}`. Override only when experimenting with alternate IC-LoRAs. |
 | `conditioning_strength` | float | `1.0` | `0.0 ≤ x ≤ 1.0` — scalar attention weight; lower → more LoRA-driven, less faithful to source |
 | `skip_stage_2` | bool | `false` | `true` → fast half-resolution preview; **also matches upstream's reference LoRA-active stage-1 behavior most closely** |
@@ -1899,10 +1904,10 @@ All error responses follow the shape described in [Error shape](#error-shape) (`
 
 | Status | Error code | When | Header |
 |---|---|---|---|
-| `429` | `"queue_full"` | `job_store.pending_count() >= MAX_QUEUE_DEPTH (10)` | `Retry-After: 30` |
+| `429` | `"queue_full"` | `job_store.pending_count() >= MAX_QUEUE_DEPTH (30, v1.16.1; was 10)` | `Retry-After: 30` |
 | `429` | `"music_queue_full"` | Music-specific depth ≥ `MAX_MUSIC_PENDING (5)` | `Retry-After: 30` |
 | `429` | `"batch_queue_full"` | `batch_store.active_count() >= MAX_BATCH_QUEUE_DEPTH (5)` | `Retry-After: 30` |
-| `429` | `"per_key_queue_full"` | v1.8.2 — single bearer has `PER_KEY_QUEUE_CAP` (3) / `PER_KEY_MUSIC_CAP` (2) / `PER_KEY_BATCH_CAP` (2) jobs, music jobs, or batches already in flight | `Retry-After: 30` |
+| `429` | `"per_key_queue_full"` | v1.8.2 — single bearer has `PER_KEY_QUEUE_CAP` (15, v1.16.1; was 3) / `PER_KEY_MUSIC_CAP` (5, v1.16.1; was 2) / `PER_KEY_BATCH_CAP` (5, v1.16.1; was 2) jobs, music jobs, or batches already in flight. All four caps env-overridable; see [`docs/operator-tuning.md`](./operator-tuning.md). | `Retry-After: 30` |
 | `429` | `"per_key_upload_quota_exceeded"` | v1.8.2 — single bearer has uploaded `PER_KEY_UPLOAD_BYTES_PER_DAY` (default 10 GiB) within the last 24h rolling window | `Retry-After: 3600` |
 | `429` | `"per_key_lora_count_exceeded"` | v1.8.2 — single bearer has `PER_KEY_LORA_COUNT` (default 20) active LoRAs; DELETE some first | `Retry-After: 3600` |
 

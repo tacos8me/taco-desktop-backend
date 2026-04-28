@@ -432,14 +432,21 @@ Be honest about the ceiling. The LLM that reads this doc should know what to fal
 
 ## 11. Roadmap (v0.4+)
 
-### Done in v1.16.0
+### ✅ Shipped in v1.16.0
 
-- ✅ **madmom downbeat sidecar** — better bar-1 cuts (~+8% accent-cut accuracy on cross-genre pop). CPU-only FastAPI service on port 8095, BSD-licensed. Opt-in via `analyzer="madmom"` on `POST /v1/music/analyze`. See backend `CLAUDE.md` → "madmom downbeat sidecar (v1.16.0)" for setup + ops.
+- **madmom downbeat sidecar** — better bar-1 cuts (~+8% accent-cut accuracy on cross-genre pop). CPU-only FastAPI service on port 8095, BSD-licensed. Opt-in via `analyzer="madmom"` on `POST /v1/music/analyze`. See backend `CLAUDE.md` → "madmom downbeat sidecar (v1.16.0)" for setup + ops.
+
+### ✅ Shipped in noodlefinger-mcp v0.4.2
+
+- **Per-shot audio slicing** — the `cut_music_video` orchestrator now pre-slices the song into per-clip audio windows using the `shot_list[].start_s` / `end_s` schedule, so each underlying a2v call's motion conditions on the *correct* audio segment for its shot rather than on the full song. Closes a long-standing artifact where motion drifted toward the prevailing energy of the whole track instead of the bar-local pulse. Lives entirely in the MCP layer; backend `/v2/audio-to-video` is unchanged.
+
+### Deferred
+
+- ~~whisperX lyric alignment~~ — lyric-anchor cuts at word granularity. **Deferred** to a future major: ACE-side lyric timestamps were investigated as an alternative (whisperX post-pass on the generated track) and judged not worth the operational complexity at current scale.
+- ~~allin1 section detection~~ — automatic verse/chorus/bridge labels. **Deferred**: blocked on CC-BY-NC weights (allin1's pretrained checkpoints are non-commercial-only). Re-evaluate if the model is re-licensed or a permissive equivalent ships.
 
 ### Pending
 
-- allin1 section detection — automatic verse/chorus/bridge labels (GPU sidecar)
-- whisperX lyric alignment — lyric-anchor cuts at word granularity
 - visual match-cut detection (frame-embedding search) — closes the §10 match-cut gap
 - per-clip ffmpeg LUT color grading — palette swap as composition primitive, not just prompt suffix
 - OTIO/FCPXML export alongside MP4 — pro NLE handoff for finishing in Premiere/Resolve
