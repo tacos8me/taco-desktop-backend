@@ -160,8 +160,26 @@ def export_composition(
     # contract — drift is visible, hard 422 mid-export is not).
     clip_speed: list[float] = []
 
-    for clip in clips:
-        path = _resolve_clip_path(clip["historyId"], uploads)
+    for clip_idx, clip in enumerate(clips):
+        # v1.16.3: clips may carry EITHER historyId (LTX-generated) OR
+        # storage_uri (synthetic flash inserts minted by the MCP orchestrator
+        # — they don't ride history.db at all). Honor both per the long-
+        # standing MCP contract; pre-v1.16.3 only handled historyId and
+        # KeyError'd on flash-only compositions.
+        hist_id = clip.get("historyId")
+        storage_uri = clip.get("storage_uri")
+        if hist_id:
+            path = _resolve_clip_path(hist_id, uploads)
+        elif storage_uri:
+            path = uploads.resolve(storage_uri)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Clip {clip_idx} storage_uri not found on disk: {storage_uri}"
+                )
+        else:
+            raise ValueError(
+                f"Clip {clip_idx} missing both historyId and storage_uri"
+            )
         clip_paths.append(path)
         duration = float(clip.get("duration", 6.0))
         clip_durations.append(duration)

@@ -468,3 +468,87 @@ def test_export_filter_complex_unchanged_by_v1_16_2(tmp_path, fake_resolve, monk
     fc = _filter_complex(cmd)
     assert re.search(r"xfade=transition=fade:duration=0\.5:offset=7\.5", fc), fc
     assert re.search(r"xfade=transition=fade:duration=0\.5:offset=9\.0", fc), fc
+
+
+# ---------------------------------------------------------------------------
+# v1.16.3 — storage_uri fallback for clips without historyId (flash inserts)
+# ---------------------------------------------------------------------------
+
+
+class _StorageUriUploads:
+    """UploadStore stub that materializes any storage_uri to a real tmp file."""
+    def __init__(self, tmp_path: Path):
+        self._tmp = tmp_path
+        self._counter = 0
+
+    def resolve(self, uri: str) -> Path:
+        # Per-uri deterministic file name; create on demand so .exists() is True.
+        safe = uri.replace("/", "_").replace(":", "_")
+        p = self._tmp / f"resolved-{safe}.mp4"
+        if not p.exists():
+            p.write_bytes(b"\x00")
+        return p
+
+
+def test_storage_uri_only_clip_resolves_via_uploads(tmp_path, fake_resolve, monkeypatch):
+    """v1.16.3 regression: a clip carrying storage_uri but no historyId (e.g.
+    a synthetic flash insert minted by the MCP orchestrator) must resolve via
+    UploadStore.resolve(...) instead of KeyError'ing on clip['historyId'].
+    """
+    uploads = _StorageUriUploads(tmp_path)
+    clips = [
+        {"storage_uri": "storage://flash-aaa", "duration": 0.375, "fps": 24.0, "audioStart": 0.0},
+        {"storage_uri": "storage://flash-bbb", "duration": 0.375, "fps": 24.0, "audioStart": 0.375},
+    ]
+    transitions: list[dict] = []
+    # No fake_resolve monkeypatch needed: the new branch never calls
+    # _resolve_clip_path for storage_uri-only clips.
+    cmd = _capture_export(clips, transitions, uploads, None, fake_resolve, monkeypatch)
+    # Sanity: ffmpeg was actually invoked with the resolved files.
+    assert any("resolved-storage___flash-aaa.mp4" in arg for arg in cmd), cmd
+    assert any("resolved-storage___flash-bbb.mp4" in arg for arg in cmd), cmd
+
+
+def test_mixed_historyid_and_storage_uri_clips(tmp_path, fake_resolve, monkeypatch):
+    """v1.16.3: composition with a primary LTX clip (historyId) followed by a
+    flash insert (storage_uri only) — both paths must resolve cleanly.
+    """
+    uploads = _StorageUriUploads(tmp_path)
+    clips = [
+        {"historyId": "primary-1", "duration": 4.0, "fps": 24.0, "audioStart": 0.0},
+        {"storage_uri": "storage://flash-zzz", "duration": 0.5, "fps": 24.0, "audioStart": 4.0},
+        {"historyId": "primary-2", "duration": 4.0, "fps": 24.0, "audioStart": 4.5},
+    ]
+    transitions: list[dict] = []
+    cmd = _capture_export(clips, transitions, uploads, None, fake_resolve, monkeypatch)
+    # historyId path uses the fake_resolve fixture (writes to tmp_path/clip-{id}.mp4).
+    assert any("clip-primary-1.mp4" in arg for arg in cmd), cmd
+    assert any("clip-primary-2.mp4" in arg for arg in cmd), cmd
+    # storage_uri path uses _StorageUriUploads.
+    assert any("resolved-storage___flash-zzz.mp4" in arg for arg in cmd), cmd
+
+
+def test_clip_missing_both_raises(tmp_path, fake_resolve, monkeypatch):
+    """v1.16.3: a clip with neither historyId nor storage_uri must raise a
+    clear ValueError (not a KeyError on a stale field name).
+    """
+    uploads = _StorageUriUploads(tmp_path)
+    clips = [{"duration": 4.0, "fps": 24.0, "audioStart": 0.0}]
+    monkeypatch.setattr(export_handler, "_resolve_clip_path", fake_resolve)
+    with pytest.raises(ValueError, match="missing both historyId and storage_uri"):
+        export_handler.export_composition(clips, [], uploads, None)
+
+
+def test_storage_uri_missing_on_disk_raises(tmp_path, fake_resolve, monkeypatch):
+    """v1.16.3: storage_uri that resolves but file doesn't exist on disk
+    raises FileNotFoundError with a clear message.
+    """
+    class _MissingFileUploads:
+        def resolve(self, uri: str) -> Path:
+            return tmp_path / "does-not-exist.mp4"
+
+    uploads = _MissingFileUploads()
+    clips = [{"storage_uri": "storage://gone", "duration": 4.0, "fps": 24.0, "audioStart": 0.0}]
+    monkeypatch.setattr(export_handler, "_resolve_clip_path", fake_resolve)
+    with pytest.raises(FileNotFoundError, match="storage_uri not found on disk"):
+        export_handler.export_composition(clips, [], uploads, None)
