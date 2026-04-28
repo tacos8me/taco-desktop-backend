@@ -53,18 +53,16 @@ SPATIAL_UPSAMPLER = str(CHECKPOINTS_DIR / "ltx-2.3-spatial-upscaler-x2-1.1.safet
 # Set GEMMA_VARIANT=sikaworld in .env to use the abliterated FP4 text encoder.
 # Set GEMMA_VARIANT=gemma-3-12b-it-nvfp4 for the IT-tuned NVFP4 variant
 # (instruction-tuned — required if `enhance_prompt=true` should produce useful
-# rewrites). The IT-NVFP4 path uses a glob because the HF snapshot commit sha
-# is staged at runtime — operator should pin to a concrete sha after the
-# download settles (resolves to the single snapshot directory under it).
-import glob as _glob
-_IT_NVFP4_GLOB = "/mnt/nvme-1/huggingface/hub/models--NeoChen1024--gemma-3-12b-it-NVFP4/snapshots/*"
-_it_nvfp4_matches = sorted(_glob.glob(_IT_NVFP4_GLOB))
-_IT_NVFP4_PATH = _it_nvfp4_matches[0] if _it_nvfp4_matches else _IT_NVFP4_GLOB
-
+# rewrites instead of degenerate token-loops on PT/sikaworld).
+#
+# v1.16.1: pinned the IT-NVFP4 snapshot SHA. The download cache landed at
+# `/mnt/nvme-1/huggingface/...` (NOT `/hub/...` — `--cache-dir` was set to
+# the parent), so the v1.16.0 glob pointed at the wrong tree. Both glob and
+# pin would have failed at load. This is the actual on-disk path.
 _GEMMA_VARIANTS = {
     "default": "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f",
     "sikaworld": "/mnt/nvme-1/huggingface/gemma-3-12b-sikaworld",
-    "gemma-3-12b-it-nvfp4": _IT_NVFP4_PATH,
+    "gemma-3-12b-it-nvfp4": "/mnt/nvme-1/huggingface/models--NeoChen1024--gemma-3-12b-it-NVFP4/snapshots/90152908233cae111ec85f78f3d69bdcbd1c6ffd",
 }
 GEMMA_VARIANT = os.environ.get("GEMMA_VARIANT", "default")
 GEMMA_ROOT = _GEMMA_VARIANTS.get(GEMMA_VARIANT, _GEMMA_VARIANTS["default"])
@@ -193,16 +191,27 @@ MAX_LORA_SIZE_BYTES = 1024 * 1024 * 1024  # 1GB
 FLUX_LORAS_DIR = Path("/mnt/nvme-1/servers/taco-backend/flux_loras")
 
 # Job queue
-MAX_QUEUE_DEPTH = 10
+# v1.16.1: bumped MAX_QUEUE_DEPTH from 10 -> 30 after empirical user report —
+# 28 a2v jobs submitted sequentially with 1.5s pacing hit the per-key cap of
+# 3 first (24/28 first-pass 429), but the global 10 was the next ceiling. 30
+# leaves headroom for a single bearer to queue 15 + leaves room for other
+# callers without hitting the global cap.
+MAX_QUEUE_DEPTH = 30
 JOB_RESULT_TTL_SECONDS = 600  # 10 minutes
 
 # v1.8.2 / SEC P1-3: per-API-key queue caps. These apply BEFORE the global
 # MAX_QUEUE_DEPTH / MAX_MUSIC_PENDING / MAX_BATCH_QUEUE_DEPTH caps, so one
 # bearer can't single-tenant the whole queue. 429 with per_key_queue_full
 # on breach. Override via env.
-PER_KEY_QUEUE_CAP = int(os.environ.get("PER_KEY_QUEUE_CAP", "3"))
-PER_KEY_MUSIC_CAP = int(os.environ.get("PER_KEY_MUSIC_CAP", "2"))
-PER_KEY_BATCH_CAP = int(os.environ.get("PER_KEY_BATCH_CAP", "2"))
+#
+# v1.16.1: bumped PER_KEY_QUEUE_CAP from 3 -> 15 (real-world MV submission
+# patterns batch ~28 jobs; 3 was the proximate cause of every 429 in user
+# reports). Bumped PER_KEY_MUSIC_CAP 2 -> 5 (analogous), PER_KEY_BATCH_CAP
+# 2 -> 5. Global MAX_QUEUE_DEPTH bumped to 30 above; PER_KEY ceilings now
+# half of the global which keeps the single-tenant-protection rationale.
+PER_KEY_QUEUE_CAP = int(os.environ.get("PER_KEY_QUEUE_CAP", "15"))
+PER_KEY_MUSIC_CAP = int(os.environ.get("PER_KEY_MUSIC_CAP", "5"))
+PER_KEY_BATCH_CAP = int(os.environ.get("PER_KEY_BATCH_CAP", "5"))
 
 # v1.8.2 / SEC P2-3+P2-4: per-API-key upload + LoRA quotas. The upload cap
 # is a rolling 24h byte counter keyed by sha256(api_key); the LoRA cap is

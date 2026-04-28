@@ -20,4 +20,11 @@ if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
-exec uv run --no-sync uvicorn server:app --host 0.0.0.0 --port 8090 --no-access-log
+# v1.16.1: explicit HTTP concurrency + backlog. Default uvicorn has
+# `limit_concurrency=None` (unbounded request handlers) and backlog=2048
+# socket queue. Under 28+ concurrent client polls the kernel SYN backlog
+# overflowed and clients saw "Connection reset by peer" instead of clean
+# 503/queue. `--limit-concurrency 200` caps in-flight at the ASGI layer
+# (clean 503 when full); `--backlog 4096` doubles the socket queue.
+exec uv run --no-sync uvicorn server:app --host 0.0.0.0 --port 8090 --no-access-log \
+    --limit-concurrency 200 --backlog 4096
