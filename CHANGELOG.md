@@ -2,6 +2,60 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.16.2 — 2026-04-28
+
+### Feat: composition export quality knobs (libx264 CRF 18 default + per-export overrides)
+
+User-reported quality regression: `POST /v2/compositions/{id}/export` was producing visibly blocky output even on otherwise-clean LTX clips. Root cause: the export pipeline hardcoded `-c:v libopenh264` with no `-crf` / `-b:v` flags — libopenh264 defaults to ~4-8 Mbps which dithers visibly on 1080p+ video. The detail the LTX clips had was being thrown away at the mux step.
+
+**Fix.** Switch the default to a modern, visually-transparent encoder stack:
+
+- `libx264 + CRF 18 + preset=medium + profile=high + yuv420p`  (was: `libopenh264` no flags)
+- Audio: `aac 256k`  (was: `aac 192k`)
+
+CRF 18 + high profile is the standard visually-transparent operating point for H.264 — perceptually lossless at typical viewing distances. `yuv420p` maximizes player compatibility (mobile / iOS QuickTime / Chrome).
+
+**All knobs are overridable per-export** via the request body (additive — existing clients still work):
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `output_encoder` | enum | `libx264` | `libx264` \| `libx265` \| `libopenh264` |
+| `output_crf` | int 0–51 | 18 (x264), 22 (x265) | Lower = higher quality |
+| `output_preset` | enum | `medium` | x264 preset names |
+| `output_profile` | enum | `high` | `baseline` \| `main` \| `high` \| `high10` \| `high422` \| `high444` |
+| `output_video_bitrate` | str `\d+[kMG]?` | unset | Setting it on a CRF encoder switches to 1-pass ABR with `-maxrate` + `-bufsize` |
+| `output_audio_bitrate` | str | `256k` |  |
+
+Validation lives in the request handler; malformed values return `422` before the job is enqueued.
+
+**ffmpeg binary auto-detection.** The conda-installed ffmpeg this box ships with (`/home/ian/miniconda3/bin/ffmpeg`) was built `--disable-gpl` and DOES NOT include libx264/libx265 — only libopenh264. The system ffmpeg at `/usr/bin/ffmpeg` has libx264 from the Ubuntu `libx264-*` package. The new helper `_resolve_ffmpeg_binary()` probes both, picks the one that supports the requested encoder, and warns when falling back to libopenh264. Override via `TACO_FFMPEG_BIN` env var.
+
+### Adds
+
+- `export_handler._resolve_ffmpeg_binary()` — runtime ffmpeg + encoder discovery.
+- `export_handler.SUPPORTED_ENCODERS` / `SUPPORTED_PRESETS` / `SUPPORTED_PROFILES` — single source of truth for the request-side allowlists.
+- `export_composition(... quality: dict | None = None)` — new optional kwarg threaded through the dispatch in `server.py`.
+- 7 new tests in `tests/test_export_handler_v0_3.py` (default flags, knob overrides, libopenh264 fallback, x264 CRF→ABR switch, x265 cold-CRF default, invalid encoder rejection, filter-graph invariance).
+
+### Backward compat
+
+- Existing callers (empty body or `{"audio_uri": "..."}`) get HIGHER quality output with no API change. Both libx264 and libopenh264 produce H.264 — players don't care which encoder generated it.
+- Filter graph (trim / setpts / concat / xfade / atrim / force_key_frames) is byte-identical to v1.16.1. Only codec args differ. Existing `test_speed_xfade_cumulative_offset` style tests pass unchanged.
+- `--shortest` flag is preserved on the legacy full-song-overlay path.
+
+### Tests
+
+- 150 → 157 (+7). Full suite green.
+
+### Docs
+
+- `CLAUDE.md`: top-of-file v1.16.2 paragraph + version header.
+- `AGENTS.md`: entry 65 in the per-version-deltas style.
+- `docs/API.md`: `POST /v2/compositions/{comp_id}/export` body documents the new optional fields + defaults table.
+- `docs/operator-tuning.md`: new "Export quality (v1.16.2)" section.
+
+---
+
 ## v1.16.1 — 2026-04-28
 
 ### Fix: pin Gemma IT-NVFP4 path + bump rate-limit caps

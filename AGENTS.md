@@ -159,6 +159,16 @@ ComfyUI uses spatial tiling (512/64px) + temporal_size=4096 (effectively no temp
     - **Reversibility**: every per-key / global cap is env-overridable via `.env`. Full operator-facing doc at `docs/operator-tuning.md`.
     - **Tests**: 150/150 still green. No schema changes, no new endpoints.
 
+### v1.16.2 Features (SHIPPED)
+
+65. ~~**Composition export quality knobs (libx264 CRF 18 default + per-export overrides)**~~ — DONE (2026-04-28, v1.16.2). User-reported quality regression on `POST /v2/compositions/{id}/export`: clean LTX clips were emerging visibly blocky after the export step. Root cause: the export pipeline hardcoded `-c:v libopenh264` with NO `-crf` / `-b:v` flags — libopenh264 defaults to ~4-8 Mbps which dithers visibly on 1080p+ video.
+    - **Default switch**: `libx264 + CRF 18 + preset=medium + profile=high + yuv420p` (visually-transparent quality at sane filesizes); audio bumped from `192k → 256k`. Both encoders produce H.264 — backward-compatible at the byte / player level.
+    - **Per-export overrides** (additive — existing callers still work): `output_encoder` ∈ `{libx264, libx265, libopenh264}`, `output_crf` ∈ `[0, 51]`, `output_preset` ∈ x264 preset names, `output_profile` ∈ `{baseline, main, high, high10, high422, high444}`, `output_video_bitrate` (matches `\d+[kMG]?`), `output_audio_bitrate`. Setting `output_video_bitrate` on a CRF encoder switches to 1-pass ABR with `-maxrate` + `-bufsize`. Request-side validation returns `422` on malformed values BEFORE the job is enqueued.
+    - **ffmpeg binary auto-detection**: this box's conda ffmpeg (`/home/ian/miniconda3/bin/ffmpeg`) was built `--disable-gpl` and lacks libx264. New helper `_resolve_ffmpeg_binary()` probes PATH ffmpeg, then `/usr/bin/ffmpeg`, picks the one that supports the requested encoder, warns + falls back to libopenh264 only if no x264/x265 build is available anywhere. Override via `TACO_FFMPEG_BIN` env var.
+    - **Filter graph unchanged**: trim / setpts / concat / xfade / atrim / force_key_frames are byte-identical to v1.16.1; only codec args differ. The B1/B2 v1.15.0 tests (J/L cuts + speed cascade) still pass verbatim.
+    - **Adds**: `_resolve_ffmpeg_binary()` + `SUPPORTED_ENCODERS` / `SUPPORTED_PRESETS` / `SUPPORTED_PROFILES` allowlists in `export_handler.py`; new `quality: dict | None` kwarg on `export_composition(...)` threaded through the `EXPORT_COMPOSITION` dispatch in `server.py`. 7 new tests in `tests/test_export_handler_v0_3.py` (default flags, knob overrides, libopenh264 fallback bitrate path, x264 CRF→ABR swap, x265 cold-CRF default, invalid encoder rejection, filter-graph invariance). 150 → 157 tests, all green.
+    - **Docs**: `CLAUDE.md` top-of-file v1.16.2 paragraph + version header; `CHANGELOG.md` v1.16.2 entry; `docs/API.md` `POST /v2/compositions/{id}/export` body documents the new optional fields + defaults table; `docs/operator-tuning.md` new "Export quality (v1.16.2)" section.
+
 ### Tier 3 — Experimental / Higher Effort
 
 15. **torch.compile on transformer** — available via `TORCH_COMPILE=1` but default OFF. No measurable benefit on Blackwell with cuDNN FA4. May help on Ampere/Hopper.

@@ -2,7 +2,9 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.16.1 (2026-04-28).
+**Version**: v1.16.2 (2026-04-28).
+
+v1.16.2 highlights: **composition export quality knobs**. User reported visible blocking on `POST /v2/compositions/{id}/export` output — the hardcoded `-c:v libopenh264` with no quality flags was emitting ~4-8 Mbps default with no CRF/profile control. Switched the default to `libx264 + CRF 18 + preset=medium + profile=high + yuv420p` (visually-transparent quality at sane filesizes); audio default bumped from `192k → 256k`. All knobs overridable per-export via the request body (`output_encoder`, `output_crf`, `output_preset`, `output_profile`, `output_video_bitrate`, `output_audio_bitrate`). Setting `output_video_bitrate` on a CRF encoder switches to 1-pass ABR with `-maxrate`/`-bufsize`. Filter graph is byte-identical to v1.16.1 — encoder-args change only. New helper `_resolve_ffmpeg_binary()` auto-detects the best ffmpeg binary in PATH (prefers `/usr/bin/ffmpeg` over conda's `--disable-gpl` build that lacks libx264); override via `TACO_FFMPEG_BIN`. Backward-compat: existing callers with empty body or just `audio_uri` get higher quality automatically; API shape additive-only. See `docs/operator-tuning.md` "Export quality" section.
 
 v1.16.1 highlights: **rate-limit caps + HTTP layer hardening**. Real-world MV submissions (28 a2v jobs sequentially with 1.5 s pacing) were tripping `per_key_queue_full` 24/28 times. Caps raised: `PER_KEY_QUEUE_CAP 3 → 15`, `MAX_QUEUE_DEPTH 10 → 30`, `PER_KEY_MUSIC_CAP 2 → 5`, `PER_KEY_BATCH_CAP 2 → 5` (all overridable via env). Uvicorn now runs with `--limit-concurrency 200 --backlog 4096` to fix `Connection reset by peer` under 28+ concurrent client polls (kernel SYN backlog overflow). Systemd unit gets `LimitNOFILE=16384` for httpx-pool + WAL + client-socket headroom. Also: pin Gemma IT-NVFP4 snapshot SHA `90152908233cae111ec85f78f3d69bdcbd1c6ffd` so v1.16.0's `GEMMA_VARIANT=gemma-3-12b-it-nvfp4` actually resolves (the HF download landed at the parent of `/hub/`, not under it). See `docs/operator-tuning.md`.
 

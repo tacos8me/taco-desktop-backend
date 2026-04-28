@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -18,6 +20,80 @@ TRANSITION_MAP: dict[str, str] = {
     "crossfade": "fade",
     # Future: "wipe": "wipeleft", "dissolve": "dissolve", "glitch": "...", etc.
 }
+
+# v1.16.2: encoder validation tables. Keys also gate the request-side allowlist
+# in server.py so the two stay in sync.
+SUPPORTED_ENCODERS = ("libx264", "libx265", "libopenh264")
+SUPPORTED_PRESETS = (
+    "ultrafast", "superfast", "veryfast", "faster", "fast",
+    "medium", "slow", "slower", "veryslow", "placebo",
+)
+SUPPORTED_PROFILES = ("baseline", "main", "high", "high10", "high422", "high444")
+
+
+def _resolve_ffmpeg_binary(preferred_encoder: str | None = None) -> tuple[str, list[str]]:
+    """Pick the ffmpeg binary + the list of encoders it supports.
+
+    v1.16.2 quality fix. Many conda-installed ffmpeg builds (e.g. the
+    ``--disable-gpl`` recipe shipped with miniconda's anaconda channel) ship
+    WITHOUT libx264/libx265 — they only have libopenh264, which can't honor
+    ``-crf`` and produces visibly blocky output at default bitrate. The system
+    ffmpeg at ``/usr/bin/ffmpeg`` typically has libx264 from the Ubuntu
+    libx264-* packages.
+
+    Strategy: probe the conda/PATH ffmpeg first, then ``/usr/bin/ffmpeg``,
+    return the first one that supports the requested encoder. Falls back to
+    ``ffmpeg`` on PATH (whatever it is) when nothing matches.
+
+    Override via ``TACO_FFMPEG_BIN`` env var to pin a specific binary.
+    """
+    override = os.environ.get("TACO_FFMPEG_BIN", "").strip()
+    candidates: list[str] = []
+    if override:
+        candidates.append(override)
+    path_ffmpeg = shutil.which("ffmpeg")
+    if path_ffmpeg and path_ffmpeg not in candidates:
+        candidates.append(path_ffmpeg)
+    if "/usr/bin/ffmpeg" not in candidates and Path("/usr/bin/ffmpeg").exists():
+        candidates.append("/usr/bin/ffmpeg")
+
+    def _probe(binary: str) -> list[str]:
+        try:
+            out = subprocess.run(
+                [binary, "-encoders"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        # `-encoders` lines look like:
+        #   "  V....D libx264              libx264 H.264 / AVC ..."
+        #   "  V....D libx264rgb           libx264 H.264 ... RGB ..."
+        # Match by token boundary so libx264 doesn't also count libx264rgb.
+        encs: set[str] = set()
+        for line in out.stdout.splitlines():
+            tokens = line.split()
+            for enc in SUPPORTED_ENCODERS:
+                if enc in tokens:
+                    encs.add(enc)
+        return sorted(encs)
+
+    # First pass: prefer a binary that supports the requested encoder.
+    if preferred_encoder:
+        for c in candidates:
+            encs = _probe(c)
+            if preferred_encoder in encs:
+                return c, encs
+    # Second pass: pick any binary that supports libx264 (best default).
+    for c in candidates:
+        encs = _probe(c)
+        if "libx264" in encs:
+            return c, encs
+    # Last resort: first probeable binary, whatever it has.
+    for c in candidates:
+        encs = _probe(c)
+        if encs:
+            return c, encs
+    return (candidates[0] if candidates else "ffmpeg"), []
 
 
 def _resolve_clip_path(history_id: str, uploads: UploadStore) -> Path:
@@ -41,6 +117,7 @@ def export_composition(
     transitions: list[dict],
     uploads: UploadStore,
     audio_uri: str | None = None,
+    quality: dict | None = None,
 ) -> bytes:
     """Stitch clips with xfade transitions, optional audio overlay, return MP4 bytes.
 
@@ -48,6 +125,18 @@ def export_composition(
     (wav/mp3/etc.) to overlay as the output audio track. When set, the audio is
     fed as an extra ffmpeg input, mapped to the output, and truncated to the
     video length via ``-shortest``.
+
+    quality: optional dict of v1.16.2 encoder knobs:
+
+      ``output_encoder``       — ``"libx264"`` (default) | ``"libx265"`` | ``"libopenh264"``
+      ``output_crf``           — int 0..51 (default 18 for x264, 22 for x265)
+      ``output_preset``        — libx264-style preset name (default ``"medium"``)
+      ``output_profile``       — H.264 profile (default ``"high"``)
+      ``output_video_bitrate`` — e.g. ``"12M"``; switches CRF encoders to 1-pass ABR
+      ``output_audio_bitrate`` — e.g. ``"256k"`` (default ``"256k"``, was 192k pre-v1.16.2)
+
+    All knobs are validated at the request layer. ``None`` (or absent keys)
+    means "use defaults".
 
     v1.9.3 per-clip segmentation (MusicVideo mode): when every clip carries a
     numeric ``audioStart`` field (seconds into the source song where that
@@ -57,6 +146,8 @@ def export_composition(
     overlay when any clip lacks ``audioStart`` (timeline-mode compositions
     pre-dating the field) or xfade transitions are in play.
     """
+    quality_params = quality or {}
+
     clip_paths: list[Path] = []
     clip_durations: list[float] = []
     clip_fps: list[float] = []
@@ -380,7 +471,8 @@ def export_composition(
         # audioStart (or by clip_duration for the last clip), so the audio
         # total length is (sum of beat gaps) + last clip_duration — within
         # one LTX-quantization step of the video length.
-        audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", "192k"]
+        audio_bitrate = quality_params.get("output_audio_bitrate") or "256k"
+        audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", audio_bitrate]
     elif audio_path is not None:
         # Legacy full-song overlay — unchanged behavior for pre-audioStart
         # comps (timeline mode) or xfade compositions.
@@ -388,7 +480,9 @@ def export_composition(
         # -strict -2 enables native AAC on ffmpeg builds where it's flagged
         # experimental (avcodec_open2(aac) EINVAL). No-op on builds where
         # AAC is already stable (e.g. this box's ffmpeg 6.1.1).
-        audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        # v1.16.2: bitrate default 192k → 256k; overridable via quality dict.
+        audio_bitrate = quality_params.get("output_audio_bitrate") or "256k"
+        audio_codec = ["-strict", "-2", "-c:a", "aac", "-b:a", audio_bitrate, "-shortest"]
     else:
         audio_map = []
         audio_codec = []
@@ -424,13 +518,81 @@ def export_composition(
                 ",".join(f"{t:.6f}" for t in seam_times),
             ]
 
+    # v1.16.2: industry-standard quality defaults. Pre-v1.16.2 was hardcoded
+    # `-c:v libopenh264` with no CRF/bitrate flags = ~4-8 Mbps default and
+    # visible blocking on 1080p+. Switch to libx264 + CRF 18 + profile=high +
+    # preset=medium for visually-transparent quality. All knobs overridable
+    # per-call via quality dict (see docstring).
+    encoder = (quality_params.get("output_encoder") or "").strip() or None
+    crf = quality_params.get("output_crf")
+    preset = quality_params.get("output_preset") or "medium"
+    profile = quality_params.get("output_profile") or "high"
+    video_bitrate = quality_params.get("output_video_bitrate")
+
+    ffmpeg_bin, available_encoders = _resolve_ffmpeg_binary(encoder)
+
+    if encoder is None:
+        # Auto-pick: prefer libx264 for the CRF default; fall back to whatever
+        # the binary has if libx264 isn't compiled in.
+        if "libx264" in available_encoders:
+            encoder = "libx264"
+        elif "libx265" in available_encoders:
+            encoder = "libx265"
+        else:
+            encoder = "libopenh264"
+            logger.warning(
+                "export_composition: ffmpeg %s lacks libx264/libx265; "
+                "falling back to libopenh264 (lower quality at default bitrate). "
+                "Install x264 (apt: libx264-*) or set TACO_FFMPEG_BIN to a build "
+                "that includes it.",
+                ffmpeg_bin,
+            )
+    elif available_encoders and encoder not in available_encoders:
+        raise RuntimeError(
+            f"requested encoder {encoder!r} not available in {ffmpeg_bin}; "
+            f"available: {available_encoders}"
+        )
+
+    video_codec_args: list[str] = ["-c:v", encoder]
+    if encoder == "libx264":
+        video_codec_args.extend(["-crf", str(crf if crf is not None else 18)])
+        video_codec_args.extend(["-preset", preset])
+        video_codec_args.extend(["-profile:v", profile])
+        # yuv420p maximizes player compatibility (e.g. iOS QuickTime, Chrome
+        # mobile); avoids 4:4:4 / yuv444p output that some clients won't decode.
+        video_codec_args.extend(["-pix_fmt", "yuv420p"])
+    elif encoder == "libx265":
+        # x265 CRF runs ~4 colder than x264 for similar perceptual quality.
+        video_codec_args.extend(["-crf", str(crf if crf is not None else 22)])
+        video_codec_args.extend(["-preset", preset])
+        video_codec_args.extend(["-pix_fmt", "yuv420p"])
+    elif encoder == "libopenh264":
+        # Legacy/fallback path — libopenh264 doesn't honor `-crf`. Use bitrate.
+        video_codec_args.extend(["-b:v", video_bitrate or "12M"])
+    else:
+        raise ValueError(f"unsupported encoder: {encoder}")
+
+    if video_bitrate and encoder in ("libx264", "libx265"):
+        # Caller asked for a specific bitrate target on a CRF encoder — switch
+        # to 1-pass ABR. Strip the CRF arg pair we just added; -b:v + -maxrate
+        # + -bufsize give a constrained ABR mode that's better than CRF when
+        # the operator has a hard size budget.
+        if "-crf" in video_codec_args:
+            crf_idx = video_codec_args.index("-crf")
+            del video_codec_args[crf_idx:crf_idx + 2]
+        video_codec_args.extend([
+            "-b:v", video_bitrate,
+            "-maxrate", video_bitrate,
+            "-bufsize", "24M",
+        ])
+
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_bin, "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         *audio_map,
-        "-c:v", "libopenh264",
+        *video_codec_args,
         *force_keyframe_args,
         *audio_codec,
         str(output_path),
