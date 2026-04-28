@@ -2,6 +2,85 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.16.1 — 2026-04-28
+
+### Fix: pin Gemma IT-NVFP4 path + bump rate-limit caps
+
+Two related v1.16.0 follow-ups based on real-world load and a download-path mismatch caught at first pull.
+
+**1. Gemma IT-NVFP4 path was wrong.** The `hf download` landed at `/mnt/nvme-1/huggingface/models--NeoChen1024--gemma-3-12b-it-NVFP4/` (parent of `/hub/`, not under it — `--cache-dir` was set to the parent in the download command). v1.16.0's glob pointed at `/hub/...` which is empty. Pin the actual snapshot SHA `90152908233cae111ec85f78f3d69bdcbd1c6ffd` so the IT variant is loadable when the operator flips `GEMMA_VARIANT=gemma-3-12b-it-nvfp4` in `.env`.
+
+**2. Rate-limit caps were too tight for real MV submission patterns.** A user submitted 28 a2v jobs sequentially with 1.5 s pacing and got 24/28 first-pass `429 per_key_queue_full`. Diagnosed via Explore audit:
+
+- `PER_KEY_QUEUE_CAP: 3 → 15` — proximate cause of every 429. New ceiling fits a 28-job batch + retry headroom while still half the global cap.
+- `MAX_QUEUE_DEPTH: 10 → 30` — global ceiling raised 3×.
+- `PER_KEY_MUSIC_CAP: 2 → 5`, `PER_KEY_BATCH_CAP: 2 → 5` — analogous.
+- `uvicorn --limit-concurrency 200 --backlog 4096` in `run.sh` — fixes the `Connection reset by peer` the user saw on 28 concurrent polls (default `limit_concurrency=None` means unbounded handlers, OS backlog overflow drops SYN packets without RST).
+- `LimitNOFILE=16384` in the systemd unit — lifts default 1024 fd ceiling so internal sockets (Modal / ACE / JoyAI / ERNIE / ltx-sidecar httpx pools + history.db WAL + concurrent client connections) have headroom.
+
+All four per-key / global caps are env-overridable. See `docs/operator-tuning.md` for the full operator-facing doc.
+
+### Tests
+
+150/150 pytest green. No schema changes, no new endpoints. Reversibility via env-var overrides.
+
+---
+
+## v1.16.0 — 2026-04-28
+
+### Feat: IT-Gemma variant + madmom downbeat sidecar
+
+Two opt-in features. Default behavior is unchanged — both new paths are gated behind explicit env / request fields.
+
+**1. `GEMMA_VARIANT=gemma-3-12b-it-nvfp4`** — third entry in `_GEMMA_VARIANTS`, resolves the snapshot dir via glob (operator pins the SHA after the ~11 GB download settles; v1.16.1 hard-codes the SHA). Default stays `"default"` (PT) — IT is purely opt-in. Recommended whenever `enhance_prompt=true` should produce useful instruction-following rewrites rather than literal continuations of the seed prompt.
+
+**2. `analyzer="madmom"` on `POST /v1/music/analyze`** — routes to a new CPU sidecar at `127.0.0.1:8095` (BSD-licensed, separate venv at `/mnt/nvme-1/servers/madmom-sidecar/` because madmom needs `numpy<1.24` + `scipy<1.13`, incompatible with the main taco-backend venv). ~+8% downbeat accuracy on cross-genre pop. Default stays `"librosa"` — byte-identical to v1.15.x for existing callers. `LOAD_MADMOM=1` is the new default; sidecar failures surface as explicit `503` with no silent fallback.
+
+### Adds
+
+- `madmom_client.py` — httpx async client mirroring the `joyai_client` pattern.
+- `tests/test_madmom_routing.py` — 7 routing tests (default, explicit librosa, mocked madmom, ConnectError → 503, sidecar 5xx → 503, `LOAD_MADMOM=0` → 503, invalid analyzer → 422). 143 → 150 tests, all green.
+
+### Docs
+
+- `CLAUDE.md`: new "madmom downbeat sidecar (v1.16.0)" section, IT-NVFP4 Gemma variant note, quick-lookup row.
+- `docs/API.md`: `POST /v1/music/analyze` analyzer field documented + IT-Gemma cross-reference.
+- `docs/MV_EDITING.md`: §5.2 documents the new analyzer kwarg; §11 moves madmom from roadmap to "Done in v1.16.0".
+
+---
+
+## v1.15.3 — 2026-04-27
+
+### Fix: enhance_prompt no longer crashes the run when Gemma tokenizer lacks chat_template
+
+User-reported with mcp v0.3.5 (which flipped `enhance_prompt=True` by default for motion parity): first parallel run blew up with `"Cannot use chat template functions because tokenizer.chat_template is not set"` and `"tuple index out of range"` from the Gemma rewriter.
+
+**Root cause.** ltx-core's `base_encoder.py:58` calls `tokenizer.apply_chat_template`, which fails on PT-variant Gemma tokenizers — Gemma 3 12B PT ships no `chat_template`, and our sikaworld variant symlinks the same PT `tokenizer_config.json` so it inherits the gap. Both `GEMMA_VARIANT` options on this box hit it.
+
+**Fix.** Wrap the `generate_enhanced_prompt` call in `_encode_prompts` in a broad try/except, log a clear WARN naming the variant + the failure mode, and keep going with the raw prompt. The run no longer dies; enhancement just becomes a no-op until the operator points `GEMMA_VARIANT` at an instruction-tuned snapshot whose tokenizer carries a `chat_template` (e.g. v1.16.0's `gemma-3-12b-it-nvfp4`).
+
+---
+
+## v1.15.2 — 2026-04-27
+
+### Fix: cleanup_loop sweeps zombie PROCESSING jobs
+
+User report: backend `/health` showed `queue.processing=2` but only 1 worker busy in `/v1/system/workers` — second job was a zombie left over from a prior dispatch (Modal `httpx.ReadError` that didn't propagate to mark FAILED). `cleanup_loop` only swept terminal-status jobs; PROCESSING leaks accumulated forever in the in-memory store.
+
+Add a 30-minute threshold sweep: any PROCESSING job whose `started_at` (or `created_at` if dispatch never anchored) is older than the threshold gets marked FAILED with code `"zombie"`. Threshold is well above real-world job durations (90 s export, 4 K outpaint stage 2, worst-case retake all under 20 min). Surfaces clearly to callers via the standard error path so `resume_music_video` can distinguish zombies from real failures.
+
+---
+
+## v1.15.1 — 2026-04-26
+
+### Fix: clip.speed silently dropped on single-clip exports
+
+Team Delta failure-mode audit (F5) caught: `len(clip_paths) == 1 and audio_path is None` short-circuit returned raw bytes regardless of `clip.speed` or `tailTrimFrames`. `speed=0.5` / `speed=1000` / `speed=-1` all produced output byte-identical to a no-speed export — silent corruption with no caller-visible signal.
+
+Tighten the shortcut to require `speed == 1.0 AND tailTrimFrames == 0` before returning raw bytes; any transform falls through to the ffmpeg path where `_norm()`'s setpts applies. Two regression tests cover speed and tail-trim singles.
+
+---
+
 ## v1.14.1 — 2026-04-26
 
 ### Fix: CORS preflight + production-origin allowlist
