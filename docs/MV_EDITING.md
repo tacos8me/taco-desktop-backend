@@ -222,9 +222,12 @@ Per-shot fields the orchestrator now accepts:
 | `is_insert` | bool | false | B-roll cutaway (no segment-chain, narrative continues) |
 | `flash_color` | "#RRGGBB" | null | Synthetic flash frame, no LTX generation |
 
-### 5.2 `get_beat_grid(audio_uri)`
+### 5.2 `get_beat_grid(audio_uri, analyzer="librosa")`
 
-Wraps `POST /v1/music/analyze` (taco-backend). Returns `{bpm, beats[], downbeats[], onsets[], rms_envelope[]}` from a librosa pass. ~88% accuracy on pop music; refine with madmom in v0.4+.
+Wraps `POST /v1/music/analyze` (taco-backend). Returns `{bpm, beats[], downbeats[], onsets[], rms_envelope[]}`.
+
+- `analyzer="librosa"` (default) — in-process, ~88% accuracy on pop music. Byte-identical to v1.15.x behavior.
+- `analyzer="madmom"` (v1.16.0) — proxied to the madmom CPU sidecar on port 8095. Better downbeat accuracy (~+8% on cross-genre pop), BSD-licensed. Requires `LOAD_MADMOM=1` and the sidecar to be running; returns `503` otherwise (no silent fallback).
 
 ### 5.3 `plan_shot_list(audio_summary, prompt, genre, num_beats_per_shot=8, sections=[])`
 
@@ -429,7 +432,12 @@ Be honest about the ceiling. The LLM that reads this doc should know what to fal
 
 ## 11. Roadmap (v0.4+)
 
-- madmom downbeat sidecar — better bar-1 cuts (+8% accent-cut accuracy on cross-genre pop)
+### Done in v1.16.0
+
+- ✅ **madmom downbeat sidecar** — better bar-1 cuts (~+8% accent-cut accuracy on cross-genre pop). CPU-only FastAPI service on port 8095, BSD-licensed. Opt-in via `analyzer="madmom"` on `POST /v1/music/analyze`. See backend `CLAUDE.md` → "madmom downbeat sidecar (v1.16.0)" for setup + ops.
+
+### Pending
+
 - allin1 section detection — automatic verse/chorus/bridge labels (GPU sidecar)
 - whisperX lyric alignment — lyric-anchor cuts at word granularity
 - visual match-cut detection (frame-embedding search) — closes the §10 match-cut gap

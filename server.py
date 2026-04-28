@@ -1109,8 +1109,23 @@ _AUDIO_MEDIA_TYPES = {
 
 
 class MusicAnalyzeRequest(BaseModel):
-    """Body for /v1/music/analyze (v1.15.0). See docs/MV_EDITING.md §7."""
+    """Body for /v1/music/analyze (v1.15.0). See docs/MV_EDITING.md §7.
+
+    v1.16.0 adds `analyzer` (default `"librosa"` — byte-identical to v1.15.x
+    behavior). `"madmom"` routes to the madmom sidecar on port 8095 for
+    higher-accuracy downbeat detection (~+8% accent-cut accuracy on
+    cross-genre pop). Sidecar must be running and `LOAD_MADMOM=1`.
+    """
     audio_uri: str = Field(description="storage://<upload_id> for the source audio")
+    analyzer: Literal["librosa", "madmom"] = Field(
+        default="librosa",
+        description=(
+            "Beat-tracking backend. `librosa` (default) runs in-process, "
+            "CPU-only, ~88% accuracy on pop. `madmom` proxies to the "
+            "sidecar at MADMOM_SIDECAR_URL — better downbeat accuracy, "
+            "BSD-licensed; returns 503 if LOAD_MADMOM=0 or sidecar down."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3026,20 +3041,49 @@ async def generate_music(body: MusicGenerationRequest) -> Response:
 
 @app.post("/v1/music/analyze")
 async def analyze_music(body: MusicAnalyzeRequest) -> JSONResponse:
-    """Librosa-only beat/onset/RMS analysis for the MV editing-grammar layer.
+    """Beat/onset/RMS analysis for the MV editing-grammar layer.
 
-    CPU-only, no GPU swap, no LTX/Flux interaction. Bearer-auth gated by the
-    middleware (no system-pause / turbo gating — read-only, cannot block
-    dispatch). See ``docs/MV_EDITING.md`` §7 for the response schema and
-    ``music_analyze.analyze`` for the librosa pipeline.
+    Two analyzer backends (v1.16.0):
+      - `librosa` (default) — in-process, CPU-only, ~88% accuracy on pop.
+      - `madmom` — proxied to the madmom sidecar at MADMOM_SIDECAR_URL,
+        better downbeat accuracy. Requires `LOAD_MADMOM=1` and the sidecar
+        to be reachable; returns 503 otherwise (no silent fallback — the
+        caller asked for a specific analyzer).
+
+    Bearer-auth gated by the middleware (no system-pause / turbo gating —
+    read-only, cannot block dispatch). See ``docs/MV_EDITING.md`` §7 for
+    the response schema.
     """
-    import music_analyze
     try:
         audio_path = uploads.resolve(body.audio_uri)
     except FileNotFoundError:
         return _error(404, "audio_uri not found")
     if not audio_path.exists():
         return _error(404, "audio_uri not found")
+
+    if body.analyzer == "madmom":
+        if not config.LOAD_MADMOM:
+            return _error(
+                503,
+                "madmom analyzer disabled (LOAD_MADMOM=0); set LOAD_MADMOM=1 "
+                "and start the madmom-sidecar service",
+            )
+        from madmom_client import get_madmom_client, MadmomError
+        client = get_madmom_client()
+        try:
+            result = await client.analyze(audio_path)
+        except MadmomError as exc:
+            logger.warning(
+                "madmom analyze failed (%s): %s", exc.status_code, exc
+            )
+            return _error(exc.status_code, str(exc))
+        except Exception as exc:
+            logger.exception("madmom analyze unexpected error: %s", body.audio_uri)
+            return _error(503, f"madmom_sidecar_error: {exc}")
+        return JSONResponse(content=result)
+
+    # Default: librosa in-process.
+    import music_analyze
     try:
         result = await asyncio.to_thread(music_analyze.analyze, audio_path)
     except Exception as exc:

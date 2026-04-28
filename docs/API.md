@@ -945,6 +945,48 @@ When `preserve_identity=true` and `model="flux2-klein"`, two training-free hooks
 
 ---
 
+### `POST /v1/music/analyze`
+
+Read-only beat / onset / RMS envelope analysis of an uploaded audio file. CPU-only, no GPU swap, no LTX/Flux interaction. Bearer-auth gated. Drives the MV editing-grammar layer (see `docs/MV_EDITING.md` §7 for the response schema).
+
+**Body:** `MusicAnalyzeRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `audio_uri` | string | required | `storage://<uuid>` for the source audio |
+| `analyzer` | enum | `"librosa"` | `"librosa"` \| `"madmom"` (v1.16.0) |
+
+**Analyzer backends:**
+- `"librosa"` (default) — in-process librosa beat-track + onset-detect + RMS, ~88% accuracy on pop. Byte-identical to v1.15.x behavior for callers that omit the field.
+- `"madmom"` — proxied to the madmom sidecar at `MADMOM_SIDECAR_URL` (port 8095). Higher accuracy on downbeats (~+8% on cross-genre pop), CPU-only, BSD-licensed. Requires `LOAD_MADMOM=1` in the backend env and the sidecar service running. **No silent fallback** — sidecar unreachable / 5xx surfaces as `503` so callers know they didn't get the analyzer they asked for.
+
+**Note on `enhance_prompt`:** the IT-tuned NVFP4 Gemma variant (`GEMMA_VARIANT=gemma-3-12b-it-nvfp4`, v1.16.0) is recommended for prompt-enhancement workflows because the default PT variant produces literal continuations rather than rewritten prompts.
+
+**Response (`200`):**
+```json
+{
+  "bpm": 124.5,
+  "beats": [0.482, 0.964, 1.446, ...],
+  "downbeats": [0.482, 2.410, ...],
+  "onsets": [0.482, 0.840, ...],
+  "rms_envelope": [[0.0, -28.4], [0.512, -22.1], ...],
+  "duration_s": 156.3,
+  "confidence": 0.87,
+  "analyzer_used": "madmom"   // present only on the madmom branch
+}
+```
+
+**Errors:**
+- `404 "audio_uri not found"` — uploads.resolve failed.
+- `422` — invalid `analyzer` value (Pydantic Literal validator).
+- `503 "madmom analyzer disabled (LOAD_MADMOM=0); ..."` — opt-in flag is off.
+- `503 "sidecar_unreachable: madmom sidecar not running at <url>"` — sidecar process down.
+- `503 "sidecar_5xx (...)"` — sidecar returned 5xx.
+- `504 "sidecar_timeout: ..."` — sidecar took longer than the client timeout.
+- `500 "audio analysis failed: ..."` — librosa branch only.
+
+---
+
 ## v2 async generation
 
 v2 endpoints return `202 Accepted` with a `job_id`. Poll [`GET /v2/jobs/{id}`](#get-v2jobsjob_id) until `status == "completed"`, then GET the result URL — or subscribe to [`GET /v2/jobs/{id}/stream`](#get-v2jobsjob_idstream) for push updates.
