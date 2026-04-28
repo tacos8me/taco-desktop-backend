@@ -2,7 +2,9 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.16.3 (2026-04-28).
+**Version**: v1.16.4 (2026-04-28).
+
+v1.16.4 highlights: **rate-limit caps scaled for heavy-MV operators**. `MAX_QUEUE_DEPTH 30 → 200` (now env-overridable), `PER_KEY_QUEUE_CAP 15 → 100` (half-global ratio preserved), `PER_KEY_MUSIC_CAP 5 → 20`, `PER_KEY_BATCH_CAP 5 → 20`, `MAX_BATCH_QUEUE_DEPTH 5 → 30` (now env-overridable). Sized for 200-clip `cut_music_video` sessions with mcp v0.4.4 parallel clip dispatch — a single bearer can now have ~100 jobs in flight against a 200-deep global queue with headroom for other tenants. All caps remain overridable via `MAX_QUEUE_DEPTH` / `PER_KEY_QUEUE_CAP` / `PER_KEY_MUSIC_CAP` / `PER_KEY_BATCH_CAP` / `MAX_BATCH_QUEUE_DEPTH` env vars. Pure config bump; no code/schema/wire changes. Requires server restart to take effect.
 
 v1.16.3 highlights: **export composition fix — `storage_uri` fallback for clips without `historyId`**. Long-standing contract gap surfaced by users with flash inserts in their shot lists. The MCP orchestrator has always emitted clips with EITHER `historyId` (LTX-generated) OR `storage_uri` (synthetic flash inserts that don't ride history.db at all), per the comment at orchestrator.py:2014-2015. The backend's `export_handler.export_composition` was never updated to honor that contract — line 164 unconditionally accessed `clip["historyId"]` and `KeyError`'d on flash-only or mixed compositions. Live error: `KeyError: 'historyId'` at export_handler.py:164. Fix: added a branch that tries `historyId` first, falls back to `storage_uri` resolved via `UploadStore.resolve(...)`, raises a clear `ValueError` when neither field is present. 4 new regression tests cover storage_uri-only clips, mixed historyId+storage_uri compositions, neither-present rejection, and storage_uri-missing-on-disk handling. No MCP change needed; restart taco-backend to pick up the fix.
 
