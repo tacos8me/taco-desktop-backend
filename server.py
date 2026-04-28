@@ -506,9 +506,13 @@ async def _dispatch_job(job: Job) -> bytes:
         case JobType.EXPORT_COMPOSITION:
             from export_handler import export_composition
             audio_uri = p.get("audio_uri")
+            quality = p.get("quality")
             return await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: export_composition(p["clips"], p["transitions"], uploads, audio_uri=audio_uri),
+                lambda: export_composition(
+                    p["clips"], p["transitions"], uploads,
+                    audio_uri=audio_uri, quality=quality,
+                ),
             )
         case _:
             raise ValueError(f"Unknown job type: {job.type}")
@@ -5241,15 +5245,58 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
     # Falling back to the stored value means a reload-then-export produces the
     # same MP4 as the original export (MusicVideo comps persist audio_uri via
     # v1.9.5's _composition_data_from_body).
+    #
+    # v1.16.2: optional encoder quality knobs:
+    #   output_encoder, output_crf, output_preset, output_profile,
+    #   output_video_bitrate, output_audio_bitrate
+    # All optional; absent → defaults (libx264 / CRF 18 / medium / high / 256k).
     audio_uri: str | None = None
+    quality: dict | None = None
     try:
         body = await request.json()
-        if isinstance(body, dict):
-            raw = body.get("audio_uri")
-            if isinstance(raw, str) and raw:
-                audio_uri = raw
     except Exception:
-        pass  # no body / invalid JSON → fall through to stored lookup
+        body = None
+    if isinstance(body, dict):
+        raw = body.get("audio_uri")
+        if isinstance(raw, str) and raw:
+            audio_uri = raw
+
+        # v1.16.2 quality validation. Reject malformed values with 422 so
+        # callers get a clear signal instead of an opaque ffmpeg failure.
+        from export_handler import (
+            SUPPORTED_ENCODERS, SUPPORTED_PRESETS, SUPPORTED_PROFILES,
+        )
+        import re as _re
+        _bitrate_re = _re.compile(r"^\d+[kMG]?$")
+        q: dict = {}
+        if "output_encoder" in body:
+            v = body["output_encoder"]
+            if not isinstance(v, str) or v not in SUPPORTED_ENCODERS:
+                return _error(422, f"output_encoder must be one of {list(SUPPORTED_ENCODERS)}")
+            q["output_encoder"] = v
+        if "output_crf" in body:
+            v = body["output_crf"]
+            if not isinstance(v, int) or isinstance(v, bool) or not (0 <= v <= 51):
+                return _error(422, "output_crf must be an int in [0, 51]")
+            q["output_crf"] = v
+        if "output_preset" in body:
+            v = body["output_preset"]
+            if not isinstance(v, str) or v not in SUPPORTED_PRESETS:
+                return _error(422, f"output_preset must be one of {list(SUPPORTED_PRESETS)}")
+            q["output_preset"] = v
+        if "output_profile" in body:
+            v = body["output_profile"]
+            if not isinstance(v, str) or v not in SUPPORTED_PROFILES:
+                return _error(422, f"output_profile must be one of {list(SUPPORTED_PROFILES)}")
+            q["output_profile"] = v
+        for key in ("output_video_bitrate", "output_audio_bitrate"):
+            if key in body:
+                v = body[key]
+                if not isinstance(v, str) or not _bitrate_re.match(v):
+                    return _error(422, f"{key} must match ^\\d+[kMG]?$")
+                q[key] = v
+        if q:
+            quality = q
     if audio_uri is None:
         stored = comp["data"].get("audio_uri")
         if isinstance(stored, str) and stored:
@@ -5259,6 +5306,7 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
         "clips": comp["data"].get("clips", []),
         "transitions": comp["data"].get("transitions", []),
         "audio_uri": audio_uri,
+        "quality": quality,
     }
     return _submit_job(JobType.EXPORT_COMPOSITION, params, request)
 

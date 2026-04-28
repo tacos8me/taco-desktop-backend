@@ -42,13 +42,22 @@ class _FakeUploads:
         return p
 
 
-def _capture_export(clips, transitions, uploads, audio_uri, fake_resolve, monkeypatch):
+def _capture_export(clips, transitions, uploads, audio_uri, fake_resolve, monkeypatch, quality=None):
     """Run export_composition with mocked ffmpeg + clip-resolve, return the
     captured ffmpeg argv list (so tests can introspect filter_complex).
     """
     captured: dict = {}
 
     def _fake_run(cmd, **kwargs):
+        # The encoder-probe call is `[bin, "-encoders"]` — return the libx264
+        # listing so the auto-pick path picks libx264 deterministically in tests.
+        if len(cmd) == 2 and cmd[1] == "-encoders":
+            stdout = (
+                " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10\n"
+                " V....D libx265              libx265 H.265 / HEVC\n"
+                " V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10\n"
+            )
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
         captured["cmd"] = cmd
         # Pretend ffmpeg succeeded; write a stub mp4 to the output path so the
         # post-run read_bytes() works.
@@ -59,7 +68,7 @@ def _capture_export(clips, transitions, uploads, audio_uri, fake_resolve, monkey
     monkeypatch.setattr(export_handler, "_resolve_clip_path", fake_resolve)
     monkeypatch.setattr(export_handler.subprocess, "run", _fake_run)
 
-    export_handler.export_composition(clips, transitions, uploads, audio_uri)
+    export_handler.export_composition(clips, transitions, uploads, audio_uri, quality=quality)
     return captured["cmd"]
 
 
@@ -335,3 +344,127 @@ def test_audio_lead_frames_zero_is_byte_identical_to_legacy(tmp_path, fake_resol
     fc = _filter_complex(cmd)
     assert "atrim=start=0.0:duration=4.0" in fc, fc
     assert "atrim=start=4.0:duration=4.0" in fc, fc
+
+
+# ---------------------------------------------------------------------------
+# v1.16.2 — composition export quality knobs
+# ---------------------------------------------------------------------------
+
+
+def test_export_default_uses_libx264_crf18_high(tmp_path, fake_resolve, monkeypatch):
+    """v1.16.2: default export emits libx264 + CRF 18 + profile=high + yuv420p + 256k audio."""
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 2.0, "fps": 24.0},
+        {"historyId": "b", "duration": 2.0, "fps": 24.0},
+    ]
+    cmd = _capture_export(clips, [], uploads, "storage://song", fake_resolve, monkeypatch)
+    assert "-c:v" in cmd
+    assert cmd[cmd.index("-c:v") + 1] == "libx264"
+    assert "-crf" in cmd and cmd[cmd.index("-crf") + 1] == "18"
+    assert "-preset" in cmd and cmd[cmd.index("-preset") + 1] == "medium"
+    assert "-profile:v" in cmd and cmd[cmd.index("-profile:v") + 1] == "high"
+    assert "-pix_fmt" in cmd and cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+    assert "-b:a" in cmd and cmd[cmd.index("-b:a") + 1] == "256k"
+
+
+def test_export_quality_overrides_crf_preset_profile_audio(tmp_path, fake_resolve, monkeypatch):
+    """User-supplied quality knobs propagate verbatim into the ffmpeg argv."""
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 2.0, "fps": 24.0},
+        {"historyId": "b", "duration": 2.0, "fps": 24.0},
+    ]
+    quality = {
+        "output_crf": 14,
+        "output_preset": "slow",
+        "output_profile": "high10",
+        "output_audio_bitrate": "320k",
+    }
+    cmd = _capture_export(
+        clips, [], uploads, "storage://song", fake_resolve, monkeypatch, quality=quality,
+    )
+    assert cmd[cmd.index("-crf") + 1] == "14"
+    assert cmd[cmd.index("-preset") + 1] == "slow"
+    assert cmd[cmd.index("-profile:v") + 1] == "high10"
+    assert cmd[cmd.index("-b:a") + 1] == "320k"
+
+
+def test_export_libopenh264_uses_bitrate_not_crf(tmp_path, fake_resolve, monkeypatch):
+    """libopenh264 path uses -b:v not -crf since it doesn't support CRF."""
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 2.0, "fps": 24.0},
+        {"historyId": "b", "duration": 2.0, "fps": 24.0},
+    ]
+    quality = {"output_encoder": "libopenh264", "output_video_bitrate": "10M"}
+    cmd = _capture_export(clips, [], uploads, None, fake_resolve, monkeypatch, quality=quality)
+    assert cmd[cmd.index("-c:v") + 1] == "libopenh264"
+    assert "-crf" not in cmd
+    assert "-b:v" in cmd and cmd[cmd.index("-b:v") + 1] == "10M"
+
+
+def test_export_video_bitrate_switches_x264_from_crf_to_abr(tmp_path, fake_resolve, monkeypatch):
+    """When output_video_bitrate is set on libx264, swap CRF → 1-pass ABR."""
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 2.0, "fps": 24.0},
+        {"historyId": "b", "duration": 2.0, "fps": 24.0},
+    ]
+    quality = {"output_video_bitrate": "8M"}
+    cmd = _capture_export(clips, [], uploads, None, fake_resolve, monkeypatch, quality=quality)
+    assert cmd[cmd.index("-c:v") + 1] == "libx264"
+    # CRF must have been removed in favor of bitrate.
+    assert "-crf" not in cmd
+    assert cmd[cmd.index("-b:v") + 1] == "8M"
+    assert cmd[cmd.index("-maxrate") + 1] == "8M"
+    assert cmd[cmd.index("-bufsize") + 1] == "24M"
+
+
+def test_export_libx265_uses_colder_default_crf(tmp_path, fake_resolve, monkeypatch):
+    """libx265 default CRF is 22 (vs x264's 18) — perceptually equivalent."""
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 2.0, "fps": 24.0},
+        {"historyId": "b", "duration": 2.0, "fps": 24.0},
+    ]
+    quality = {"output_encoder": "libx265"}
+    cmd = _capture_export(clips, [], uploads, None, fake_resolve, monkeypatch, quality=quality)
+    assert cmd[cmd.index("-c:v") + 1] == "libx265"
+    assert cmd[cmd.index("-crf") + 1] == "22"
+
+
+def test_export_invalid_encoder_raises(tmp_path, fake_resolve, monkeypatch):
+    """Unsupported encoder name raises ValueError before ffmpeg is invoked."""
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 2.0, "fps": 24.0},
+        {"historyId": "b", "duration": 2.0, "fps": 24.0},
+    ]
+    quality = {"output_encoder": "libxavs"}
+    # _capture_export inserts the encoder check inside the export_handler call;
+    # request-side validation in server.py rejects this with 422 BEFORE we get
+    # here, but the handler must also be defensive.
+    with pytest.raises((ValueError, RuntimeError)):
+        _capture_export(clips, [], uploads, None, fake_resolve, monkeypatch, quality=quality)
+
+
+def test_export_filter_complex_unchanged_by_v1_16_2(tmp_path, fake_resolve, monkeypatch):
+    """Encoder swap MUST NOT alter the filter graph. Re-runs the speed-xfade
+    test from B2 and asserts the same offsets — confirming v1.16.2 is purely
+    an encoder-args change.
+    """
+    uploads = _FakeUploads(tmp_path)
+    clips = [
+        {"historyId": "a", "duration": 4.0, "fps": 24.0, "speed": 0.5},
+        {"historyId": "b", "duration": 4.0, "fps": 24.0, "speed": 2.0},
+        {"historyId": "c", "duration": 4.0, "fps": 24.0},
+    ]
+    transitions = [
+        {"clipBIndex": 1, "type": "crossfade", "durationSec": 0.5},
+        {"clipBIndex": 2, "type": "crossfade", "durationSec": 0.5},
+    ]
+    cmd = _capture_export(clips, transitions, uploads, None, fake_resolve, monkeypatch)
+    fc = _filter_complex(cmd)
+    assert re.search(r"xfade=transition=fade:duration=0\.5:offset=7\.5", fc), fc
+    assert re.search(r"xfade=transition=fade:duration=0\.5:offset=9\.0", fc), fc

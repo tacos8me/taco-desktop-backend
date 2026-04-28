@@ -1634,6 +1634,36 @@ Enqueues a `JobType.EXPORT_COMPOSITION` job; returns the same `202` envelope as 
 
 **Precedence (v1.9.5):** request body `audio_uri` > stored composition `audio_uri`. The export route falls back to the stored value when the body omits it, so reloading a MusicVideo composition and hitting export with no body produces the same MP4 as the original export. Pass a body `audio_uri` to override ad-hoc.
 
+**Encoder quality knobs (v1.16.2, optional):** the export body accepts six new fields that override the encoder defaults. All fields are optional — empty body still works (and produces higher quality output than v1.16.1 thanks to the new defaults).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `output_encoder` | enum | `"libx264"` | One of `"libx264"`, `"libx265"`, `"libopenh264"`. Auto-falls-back to `libopenh264` only if the local ffmpeg lacks libx264/libx265. |
+| `output_crf` | int 0–51 | `18` (libx264) / `22` (libx265) | Constant-rate-factor; lower = higher quality. CRF 18 is "visually transparent" for libx264. Ignored by `libopenh264` (uses bitrate instead). |
+| `output_preset` | enum | `"medium"` | x264-style preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. Slower = better compression at same CRF. |
+| `output_profile` | enum | `"high"` | H.264 profile: `baseline`, `main`, `high`, `high10`, `high422`, `high444`. Only applies to `libx264`. |
+| `output_video_bitrate` | str | unset | E.g. `"12M"`, `"8000k"`, `"5000000"`. Matches `^\d+[kMG]?$`. **Setting this on a CRF encoder (libx264 / libx265) switches the export to 1-pass ABR** (`-b:v` + `-maxrate` + `-bufsize 24M`); the CRF flag is dropped. Required for `libopenh264` since it doesn't honor CRF. |
+| `output_audio_bitrate` | str | `"256k"` | Same regex as `output_video_bitrate`. v1.16.1 default was `192k`. |
+
+Validation runs before the job is enqueued. Malformed values return `422` with a clear message (e.g. `"output_crf must be an int in [0, 51]"`).
+
+Defaults rationale: `libx264 + CRF 18 + preset=medium + profile=high + yuv420p` is the standard "visually transparent" operating point for H.264. v1.16.1's hardcoded `libopenh264` with no flags emitted ~4-8 Mbps which produced visible blocking on 1080p+ output. The filter graph (trim / setpts / concat / xfade / atrim / `force_key_frames`) is byte-identical to v1.16.1; only the codec args changed.
+
+Example (CLI, full quality override):
+```bash
+curl -X POST "https://api.example.com/v2/compositions/$COMP/export" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "audio_uri": "storage://abc",
+    "output_encoder": "libx264",
+    "output_crf": 14,
+    "output_preset": "slow",
+    "output_profile": "high10",
+    "output_audio_bitrate": "320k"
+  }'
+```
+
 When `audio_uri` is a valid `storage://` URI pointing at an audio file, the exporter adds it as an extra ffmpeg input, maps it as the output audio track, and truncates to the video length via `-shortest`. Leave empty / omit body and the composition has no stored `audio_uri` for video-only export (pre-v1.9.0 behavior, unchanged).
 
 - The audio file must already exist as a user upload (`PUT /uploads/put/{id}` then reference via `storage://<id>`). Any format ffmpeg supports (WAV, MP3, AAC, FLAC, OGG) works.

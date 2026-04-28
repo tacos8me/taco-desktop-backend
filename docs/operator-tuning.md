@@ -1,6 +1,6 @@
-# Operator tuning — rate limits, concurrency, fd ceilings
+# Operator tuning — rate limits, concurrency, fd ceilings, export quality
 
-> Server version: v1.16.1 (2026-04-28).
+> Server version: v1.16.2 (2026-04-28).
 > Audience: backend operator / on-call. Frontend / SDK callers should look at [API.md](./API.md) instead.
 
 This file documents the runtime-tunable knobs introduced (or rebalanced) in **v1.16.1** after a real-world MV submission pattern (28 sequential a2v jobs at 1.5 s pacing) tripped `per_key_queue_full` on 24/28 first-pass submissions and surfaced `Connection reset by peer` on concurrent client polls.
@@ -115,3 +115,76 @@ If `(2)` reports `1024`, the unit didn't pick up `LimitNOFILE` — `systemctl --
 - Application-layer 429 envelopes are documented in `docs/API.md` → "Queue / rate limit" table.
 - The v1.16.0 `/v1/music/analyze` endpoint (which `madmom_client` proxies) is documented in `docs/API.md`.
 - The `cut_music_video` MCP orchestrator (which is the most common driver of the 28-job submission pattern) lives in noodlefinger-mcp v0.4.2+; per-shot audio slicing is described in its `flows.json`.
+
+---
+
+## Export quality (v1.16.2)
+
+`POST /v2/compositions/{comp_id}/export` ships a libx264-based default encoder stack as of v1.16.2. Pre-v1.16.2 the export pipeline hardcoded `-c:v libopenh264` with NO CRF / bitrate flags — libopenh264 defaults to ~4-8 Mbps which produced visible blocking on 1080p+ output.
+
+The fix switches the default to:
+
+| Knob | v1.16.2 default |
+|---|---|
+| Video encoder | `libx264` |
+| CRF | `18` (libx264) / `22` (libx265) |
+| Preset | `medium` |
+| Profile | `high` |
+| Pixel format | `yuv420p` (max compat) |
+| Audio bitrate | `256k` (was 192k) |
+
+CRF 18 + high profile is the standard "visually transparent" operating point for H.264 — perceptually lossless at typical viewing distances. `yuv420p` maximizes player compatibility (mobile / iOS QuickTime / Chrome all decode it natively).
+
+### Per-export overrides
+
+There are NO env vars for export quality — every knob is per-request. Full schema in `docs/API.md` → `POST /v2/compositions/{comp_id}/export`:
+
+- `output_encoder` ∈ `{libx264, libx265, libopenh264}`
+- `output_crf` ∈ `[0, 51]` (lower = higher quality)
+- `output_preset` ∈ x264 preset names (`ultrafast` … `placebo`)
+- `output_profile` ∈ `{baseline, main, high, high10, high422, high444}`
+- `output_video_bitrate` (string `\d+[kMG]?`, e.g. `"12M"`)
+- `output_audio_bitrate` (string `\d+[kMG]?`, e.g. `"320k"`)
+
+Setting `output_video_bitrate` on libx264/libx265 switches the encoder from CRF mode to 1-pass ABR with `-maxrate` and `-bufsize 24M` — useful when you have a hard size budget and don't care about per-clip quality variance.
+
+Malformed values return `422` BEFORE the job is enqueued.
+
+### `TACO_FFMPEG_BIN` env var (only operator knob)
+
+This is the ONLY operator-side knob for export quality. Sets the ffmpeg binary used for export. Defaults to autodetect.
+
+The autodetect order is:
+
+1. `$TACO_FFMPEG_BIN` if set.
+2. `ffmpeg` from `$PATH` (whatever venv / conda is active).
+3. `/usr/bin/ffmpeg` (Ubuntu system ffmpeg).
+
+The exporter probes each candidate with `-encoders` and picks the first one that supports the requested encoder. **Note**: conda-installed ffmpeg in this box's miniconda env was built `--disable-gpl` and ships WITHOUT libx264/libx265 — only libopenh264. The Ubuntu system ffmpeg at `/usr/bin/ffmpeg` has libx264 from the `libx264-*` package, so autodetect picks it for the libx264 path even though it's not first in `$PATH`.
+
+If neither has libx264/libx265, the exporter logs a WARN and falls back to libopenh264 (lower quality at default bitrate). To install:
+
+```bash
+sudo apt install libx264-164  # or libx265-199
+# Both are dependencies of Ubuntu's `ffmpeg` meta-package.
+```
+
+### Validation
+
+After deployment, sanity-check the live encoder via a small export:
+
+```bash
+COMP_ID=...
+KEY=$(grep -v '^#' .api_keys | grep -v '^$' | head -1)
+
+# Default export.
+JOB=$(curl -sS -X POST "http://localhost:8090/v2/compositions/$COMP_ID/export" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{}' | jq -r .id)
+
+# Poll until done, then download:
+curl -sS -H "Authorization: Bearer $KEY" \
+  "http://localhost:8090/v2/jobs/$JOB/result" -o /tmp/result.mp4
+
+# Confirm libx264 was used and the bitrate is higher than v1.16.1:
+ffprobe -v error -show_entries stream=codec_name,bit_rate /tmp/result.mp4
+```
