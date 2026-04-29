@@ -1888,6 +1888,10 @@ async def _stop_cuda1_tenants() -> None:
         ("ace-step",              config.LOAD_ACE),
         ("joyai-sidecar",         config.LOAD_JOYAI),
         ("ernie-image-sidecar",   config.LOAD_ERNIE),
+        # v1.17.0-rc2: sapiens shares cuda:1 with ACE; stopped on turbo entry
+        # symmetric with the other cuda:1 tenants. Restored in
+        # _restore_cuda1_tenants when LOAD_SAPIENS=1.
+        ("sapiens-sidecar",       config.LOAD_SAPIENS),
         ("ltx-sidecar",           True),  # always stop — may be stale from prior turbo
     ]
     for unit, _ in units:
@@ -1908,6 +1912,8 @@ async def _restore_cuda1_tenants() -> None:
         ("ace-step",            config.LOAD_ACE),
         ("joyai-sidecar",       config.LOAD_JOYAI),
         ("ernie-image-sidecar", config.LOAD_ERNIE),
+        # v1.17.0-rc2: restore sapiens-sidecar on turbo exit when LOAD_SAPIENS=1.
+        ("sapiens-sidecar",     config.LOAD_SAPIENS),
     ]:
         if not cfg_flag:
             continue
@@ -3354,8 +3360,116 @@ def _decr_queue_on_complete(job: Job) -> None:
     queue counter when a submitted-via-_submit_job job reaches a terminal
     state. Music and batch items decrement themselves (they don't go
     through worker_loop).
+
+    v1.17.0-rc2: also chain to ``_on_job_complete`` for validator dispatch.
+    Best-effort — validator failure must not affect queue counter release.
     """
     _decr_key_count(_per_key_queue_counts, job.api_key or "")
+    try:
+        _on_job_complete(job)
+    except Exception:
+        logger.warning("_on_job_complete chained call raised", exc_info=True)
+
+
+_VALIDATOR_VIDEO_TYPES = {
+    JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO,
+    JobType.RETAKE, JobType.VIDEO_OUTPAINT, JobType.VIDEO_HDR,
+}
+
+
+def _is_training_opted_in(api_key: str) -> bool:
+    """Look up ``api_key_metadata.training_opt_in`` for the bearer.
+
+    Default to **opt-in** when the row is missing — single-tenant deploy
+    seeds every key in ``.api_keys`` with ``training_opt_in=1`` on first
+    v3 migration. External bearers added later get opted in by default;
+    flip a row's flag to 0 to disable validator dispatch for that key.
+    Empty / unknown keys are treated as opted-out so validator never runs
+    on auth-disabled local dev unless the key was explicitly seeded.
+    """
+    if not api_key:
+        return False
+    try:
+        from history_store import _hash_key
+        row = history._conn.execute(
+            "SELECT training_opt_in FROM api_key_metadata WHERE api_key_hash = ?",
+            (_hash_key(api_key),),
+        ).fetchone()
+        if row is None:
+            # Unknown bearer — default ON only if any seeded keys exist
+            # (single-tenant deploy seeded `.api_keys`). Otherwise off.
+            return False
+        return bool(row["training_opt_in"])
+    except Exception:
+        logger.warning("training_opt_in lookup failed for key", exc_info=True)
+        return False
+
+
+async def _dispatch_validator(job: Job) -> None:
+    """Resolve the job's result_uri and run the validator pipeline.
+
+    Best-effort: any failure logs a WARN and returns. Updates the matching
+    `generations` row in-place with `validator_score` + `validator_payload_json`
+    + `validator_version` so /v2/history/{id} reads back the score.
+    """
+    if not job.result_uri:
+        return
+    try:
+        from validator import run_all_tiers
+        path = uploads.resolve(job.result_uri)
+        prompt = (job.params or {}).get("prompt") or job.raw_request and job.raw_request.get("prompt") or ""
+        payload = await run_all_tiers(
+            video_uri=job.result_uri,
+            video_path=str(path),
+            prompt=prompt,
+            chat=chat,
+            history=history,
+        )
+        # Update the history row with the score so /v2/history shows it.
+        try:
+            history._conn.execute(
+                """UPDATE generations
+                   SET validator_score = ?, validator_payload_json = ?,
+                       validator_version = ?
+                   WHERE id = ?""",
+                (
+                    payload.get("composite_score"),
+                    _json_mod.dumps(payload),
+                    payload.get("validator_version"),
+                    job.id,
+                ),
+            )
+            history._conn.commit()
+        except Exception:
+            logger.warning("validator history.update failed for %s", job.id, exc_info=True)
+    except FileNotFoundError:
+        logger.info("validator dispatch: result file gone for %s — skipping", job.id)
+    except Exception:
+        logger.warning("validator dispatch failed for %s", job.id, exc_info=True)
+
+
+def _on_job_complete(job: Job) -> None:
+    """worker_loop terminal-state callback — schedule validator if eligible.
+
+    Synchronous (called from worker_loop's finally block); creates a
+    fire-and-forget task so the queue can dequeue the next job
+    immediately. Eligibility:
+      - job reached COMPLETED (not FAILED / CANCELLED)
+      - job.type is a video type (validators are video-only)
+      - bearer has training_opt_in=1 in api_key_metadata
+    """
+    if job.status != JobStatus.COMPLETED:
+        return
+    if job.type not in _VALIDATOR_VIDEO_TYPES:
+        return
+    if not _is_training_opted_in(job.api_key or ""):
+        return
+    try:
+        asyncio.create_task(_dispatch_validator(job))
+    except RuntimeError:
+        # No running event loop — happens in unit tests that drive
+        # worker_loop synchronously. Safe to drop.
+        logger.debug("validator dispatch: no running loop for job %s", job.id)
 
 
 def _submit_job(job_type: JobType, params: dict, request: Request, raw: dict | None = None) -> JSONResponse:
@@ -4367,6 +4481,59 @@ async def v2_char_rank(body: CharRankRequest, request: Request) -> JSONResponse:
     except Exception as exc:
         logger.exception("char/rank failed")
         return _error(500, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Validator pipeline (v1.17.0-rc2)
+# ---------------------------------------------------------------------------
+
+
+class AnalyzeMotionRequest(BaseModel):
+    video_uri: str
+    prompt: str = ""
+    shot_uuid: str | None = None
+    tiers: list[Literal["raft", "sapiens", "gemma"]] | None = None
+    validator_version: str | None = None
+
+
+@app.post("/v2/video/analyze-motion")
+async def v2_analyze_motion(body: AnalyzeMotionRequest, request: Request) -> JSONResponse:
+    """v1.17.0-rc2 — synchronous validator endpoint.
+
+    Runs RAFT (in-process) + Sapiens (sidecar, may be stub) + Gemma judge
+    against the resolved video and returns the composite score + per-tier
+    payloads. Cached via `validator_runs` keyed by (video_sha256,
+    validator_version) — same video, same version → instant cache hit.
+    """
+    # Auth: middleware (`check_api_key`) already 401's when API_KEYS is set
+    # and the bearer is missing. When API_KEYS is empty, auth is disabled
+    # globally and we accept the request. Only re-check here when auth is
+    # actually configured, mirroring `/v2/video/extract-frames`.
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+
+    try:
+        video_path = uploads.resolve(body.video_uri)
+    except (ValueError, FileNotFoundError):
+        return _error(404, "video_not_found")
+
+    try:
+        from validator import run_all_tiers
+        payload = await run_all_tiers(
+            video_uri=body.video_uri,
+            video_path=str(video_path),
+            prompt=body.prompt,
+            chat=chat,
+            history=history,
+            validator_version=body.validator_version,
+            tiers=body.tiers,
+        )
+        return JSONResponse(content=payload)
+    except Exception as exc:
+        logger.exception("analyze-motion failed for %s", body.video_uri)
+        return _error(500, f"analyze_motion_failed: {exc}")
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,9 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.17.0-rc1 (2026-04-29).
+**Version**: v1.17.0-rc2 (2026-04-29).
+
+v1.17.0-rc2 highlights: **validator pipeline** — RAFT in-process + Sapiens via sidecar (currently stub) + Gemma judge via existing chat_manager + composite scoring + caching + on-complete dispatch + turbo coordination. Three tiers: tier-1 RAFT-small on cuda:0 (lazy-load + evict; ~150 ms/clip; produces `dynamic_degree`/`flow_windows[4]`/`motion_smoothness`); tier-2 sapiens sidecar at `127.0.0.1:8096` via new `sapiens_client.py` (mirrors `madmom_client.py`; stub-tolerant — `{"stub": true}` is treated as skipped, contributing 0.2·1.0 to composite, not failed); tier-3 Gemma judge via `chat_manager` + `CHAR_VISION_MODEL=gemma-4-31b-it` with strict-JSON schema validation (`JudgeResponseV1`). Composite formula: `0.4·tier1_norm + 0.2·tier2 + 0.4·tier3`; recommendation `pass` ≥ 0.65, `warn` 0.45-0.65, `retake` < 0.45 OR tier3.verdict=="retake". Cached via `validator_runs(video_sha256, validator_version)` UNIQUE index. New endpoint `POST /v2/video/analyze-motion` synchronous + reuses `run_all_tiers()`. New `_on_job_complete` callback chained from `_decr_queue_on_complete` fires `_dispatch_validator(job)` as fire-and-forget task when (a) status=COMPLETED, (b) type ∈ video types, (c) `_is_training_opted_in(api_key)` — looks up `api_key_metadata.training_opt_in` (default opt-out for unknown keys). Turbo-mode coordination: `sapiens-sidecar` added to `_stop_cuda1_tenants` + `_restore_cuda1_tenants` (gated on `LOAD_SAPIENS`). `LOAD_SAPIENS=0` default — operator flips after diff review. New env vars in `config.py`: `SAPIENS_SIDECAR_URL`, `SAPIENS_TIMEOUT_S`, `LOAD_SAPIENS`, `VALIDATOR_VERSION="1.17.0-rc2"`, `VALIDATOR_ARTIFACTS_DIR`, `JUDGE_PROMPT_V1`. 20 new tests in `tests/test_v1_17_validator.py`; suite now 193 green.
 
 v1.17.0-rc1 highlights: **schema v3 + composition lineage + retake provenance + api_key_metadata**. First wave of the capture+validator machine (per `plans/melodic-sniffing-beacon.md`). `history_store.CURRENT_SCHEMA_VERSION 2 → 3`, additive: 11 new nullable columns on `generations` (validator scoring fields + `parent_clip_id` + `shot_uuid` + `shot_config_key` + `composition_id` + `lora_applied_*` + `prompt_embedding`), 3 new indexes (shot_config_key / parent_clip_id / composition_id), 5 new tables (`composition_clips` inverted-index, `validator_runs` cache, `preference_pairs` DPO data, `training_runs` ledger, `api_key_metadata` per-key training_opt_in). Single-startup migration via the existing `_migrate()` ladder; pre-v3 rows get NULL in new columns; idempotent re-run safe. On first v2→v3 migration, `api_key_metadata` is seeded from `.api_keys` with `training_opt_in=1` for every non-comment line (single-tenant deploy default — ON globally, opt-out only). `.api_keys` is only read during seed, never modified. Wiring: `POST /v2/compositions/{id}/export` writes `composition_clips` lineage rows before submitting (best-effort, won't block export); `POST /v2/retake` populates `parent_clip_id` via new `find_id_by_result_uri()` helper for DPO pair construction downstream; `_dispatch_job*` strip v3 history-only fields from `job.params` before splatting into manager kwargs. `worker_loop`'s `on_complete` callback (v1.8.2) verified wired — v1.17.0-rc2 will register validator dispatch there. No breaking changes; no dispatch/sampler/filter-graph changes. Restart taco-backend to migrate on next boot. 12 new tests in `tests/test_v1_17_schema.py`. v1.17.0-rc2 follows with the validator sidecar (RAFT + Sapiens-2 + Gemma judge).
 
@@ -41,7 +43,8 @@ v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard 
 | LoRA plumbing | [LTX LoRA](#conventions) / [Flux LoRA](#flux-lora-v11--folder-drop-discovery-adapter-mode) / [IC-LoRA outpaint](#ic-lora-video-outpaint-v170) / [IC-LoRA HDR](#ic-lora-video-hdr-v1140) |
 | Async job queue, phases, SSE | [v2 job observability](#v2-job-observability-v116--v117) + `job_queue.py` |
 | History + reproducibility | [Generation history](#generation-history-history_storepy) |
-| Sidecars (ACE / JoyAI / ERNIE / madmom / LTX-remote) | [ACE](#ace-music-sidecar-v12) / [JoyAI](#joyai-image-edit-sidecar-v12-migrated-from-cuda0) / [ERNIE](#ernie-image-sidecar-v13) / [madmom](#madmom-downbeat-sidecar-v1160) / [Remote pool](#remote-sidecar-pool-v16) |
+| Sidecars (ACE / JoyAI / ERNIE / madmom / sapiens / LTX-remote) | [ACE](#ace-music-sidecar-v12) / [JoyAI](#joyai-image-edit-sidecar-v12-migrated-from-cuda0) / [ERNIE](#ernie-image-sidecar-v13) / [madmom](#madmom-downbeat-sidecar-v1160) / [sapiens](#sapiens-pose-sidecar-v1170-rc2) / [Remote pool](#remote-sidecar-pool-v16) |
+| Validator pipeline (RAFT + Sapiens + Gemma judge) | [Validator pipeline (v1.17.0-rc2)](#validator-pipeline-v1170-rc2) — `POST /v2/video/analyze-motion` + `_on_job_complete` dispatch + `validator_runs` cache |
 | Video outpaint | [IC-LoRA video outpaint](#ic-lora-video-outpaint-v170) |
 | MV editing grammar / shot lists / beat-aligned cuts | `docs/MV_EDITING.md` (v1.15.0 — `/v1/music/analyze` + `clip.speed` + `transition.audioLeadFrames`) |
 | Music structure analyzer (madmom) | [madmom downbeat sidecar (v1.16.0)](#madmom-downbeat-sidecar-v1160) — `POST /v1/music/analyze` with `analyzer="madmom"` |
@@ -63,6 +66,8 @@ v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard 
 - `ernie_client.py` — ERNIE-Image sidecar client (httpx → cuda:1:8094), swaps with JoyAI on cuda:1
 - `joyai_client.py` — JoyAI-Image-Edit sidecar client (httpx → cuda:1:8092)
 - `madmom_client.py` — madmom downbeat-detection sidecar client (httpx → CPU:8095, v1.16.0). Opt-in via `analyzer="madmom"` on `POST /v1/music/analyze`.
+- `sapiens_client.py` — sapiens pose-temporal-stability sidecar client (httpx → cuda:1:8096, v1.17.0-rc2). Stub-tolerant: passes `{"stub": true}` payloads through verbatim for `validator.composite()` to treat as "skipped, no penalty". `LOAD_SAPIENS=0` default.
+- `validator.py` — v1.17.0-rc2 validator pipeline. Tier 1 (RAFT in-process, raft_small on cuda:0, lazy-load + evict), Tier 2 (sapiens sidecar, stub-tolerant), Tier 3 (Gemma judge via existing `chat_manager` + strict-JSON `JudgeResponseV1`). Composite scoring `0.4·t1 + 0.2·t2 + 0.4·t3`, recommendation pass/warn/retake. `run_all_tiers()` is the entrypoint used by both `POST /v2/video/analyze-motion` and `_on_job_complete` dispatch. Caches via `validator_runs(video_sha256, validator_version)` UNIQUE index from rc1 schema.
 - `ltx_sidecar_client.py` — LTX video sidecar client. One primary `ltx_sidecar` (local cuda:1:8093) + optional `ltx_remote_sidecar` (Modal, configured via `LTX_REMOTE_SIDECAR_URL`). `generate()` supports base64 media inlining (`audio_b64` / `image_b64` / `video_b64`) for remote sidecars that can't see the local `uploads/` filesystem, plus outpaint extras (`position`, `conditioning_strength`, `skip_stage_2`).
 - `job_queue.py` — Async job queue: submit (202), poll, result, cancel; saves to history on completion. `JobType` enum includes `VIDEO_OUTPAINT` (v1.7.0). v1.13.0 adds `Job.worker_id: str | None` — set by each dispatch path (`local-0`, `local-1`, `modal-<N>`, `runpod-<N>`) and read by `GET /v1/system/workers` to infer per-worker busy/idle state.
 - `upload_store.py` — UUID file storage for uploads and job results
@@ -174,6 +179,113 @@ main taco-backend venv.
   unreachable returns `503` from `/v1/music/analyze` so callers know they
   didn't get the analyzer they asked for.
 - Env: `MADMOM_SIDECAR_URL` (default `http://127.0.0.1:8095`).
+
+### sapiens pose sidecar (v1.17.0-rc2)
+
+Tier-2 of the validator pipeline — pose temporal-stability detection. FastAPI
+service at `127.0.0.1:8096`, runs on cuda:1 alongside ACE; gets
+`systemctl stop`'d on turbo-mode entry like the other cuda:1 tenants. In
+v1.17.0-rc2 the sidecar ships in stub-mode (real inference lands rc2-side);
+the client (`sapiens_client.py`) tolerates `{"stub": true}` payloads and
+passes them through to `validator.composite()` which treats them as
+"skipped, no penalty" (contributes 0.2·1.0 to the composite).
+
+- Activation: `LOAD_SAPIENS=1` (default `0` for the rc2 ship — operator
+  flips after diff review).
+- Dispatch: in-process via `validator._run_tier2_sapiens(video_path)` →
+  `sapiens_client.analyze_pose(video_path)`. Also runs as part of
+  `POST /v2/video/analyze-motion` and `_on_job_complete` validator dispatch.
+- Service: `systemctl --user {start,stop,restart,status} sapiens-sidecar`.
+- Failure semantics: any sidecar error (ConnectError / 5xx / timeout)
+  returns `tier2=None` and the composite drops the tier2 weight (graceful
+  degrade — validator never blocks on tier-2 failure).
+- Env: `SAPIENS_SIDECAR_URL` (default `http://127.0.0.1:8096`),
+  `SAPIENS_TIMEOUT_S` (default 60).
+
+## Validator pipeline (v1.17.0-rc2)
+
+Three tiers + composite scoring + `validator_runs` cache + on-complete
+dispatch. Lives in `validator.py`. Rooted in the v1.17.0-rc1 schema (the
+`validator_runs` table + `validator_score` / `validator_payload_json` /
+`validator_version` columns on `generations`).
+
+**Tier 1 — RAFT** (in-process on cuda:0):
+
+- `torchvision.models.optical_flow.raft_small` — chosen over `raft_large`
+  because the validator runs on every completed video; the +1 GB transient
+  VRAM and ~50 ms/frame difference matter at 28-job concurrency. Switch is
+  a one-line change in `_run_tier1_raft` if accuracy regresses.
+- Decode pipeline: PyAV at 24fps → downsample to 256-wide → per-pair flow
+  magnitude → mean-per-pair time series.
+- Outputs: `dynamic_degree` (top-5% percentile), `flow_windows` (4-window
+  means), `motion_smoothness` (1 / (1 + variance(diff(flow)))).
+- VRAM lifecycle: lazy-load on first call; evict + `empty_cache()` after
+  each call so LTX reclaims cuda:0 cleanly. Weights download lazily from
+  pytorch.org on first run (~22 MB, cached to `~/.cache/torch/hub/`).
+
+**Tier 2 — Sapiens** (via sidecar at :8096):
+
+- See [sapiens pose sidecar](#sapiens-pose-sidecar-v1170-rc2) above.
+- Stub-tolerant: `{"stub": true}` → composite uses `0.2·1.0` in tier2 slot.
+- Real-failure (ConnectError / 5xx / timeout) → `tier2=None` → composite
+  drops the tier2 weight entirely.
+
+**Tier 3 — Gemma judge** (via existing `chat_manager` + `CHAR_VISION_MODEL`):
+
+- Mirrors `/v2/char/rank` (server.py:4307-4363). Samples 5 keyframes
+  (first / quartile / middle / 3-quartile / last) via
+  `history_store._extract_frames_as_pils`, base64-encodes as JPEG, builds
+  multimodal request with `config.JUDGE_PROMPT_V1` as system prompt.
+- Strict-JSON output: `{verdict, score, reasoning, retake_hint}` validated
+  against `JudgeResponseV1` Pydantic model (mirrors `CharRankResponse`
+  schema-validation pattern from v1.8.2 / SEC P1-5).
+- On any failure (LLM unreachable, schema violation, parse error): returns
+  fallback `{verdict: "warn", score: 0.5}` so composite still computes.
+
+**Composite scoring**: `0.4·tier1_norm + 0.2·tier2 + 0.4·tier3`, where
+`tier1_norm = min(dynamic_degree / 5.0, 1.0)` (empirically healthy clips
+sit in 1-10 magnitude at 256-wide). Recommendation:
+
+- `pass` iff composite ≥ 0.65
+- `warn` iff 0.45 ≤ composite < 0.65
+- `retake` iff composite < 0.45 OR `tier3.verdict == "retake"`
+  (verdict-level override beats numeric composite — catches cases where
+  RAFT and pose look fine but the LLM spots prompt-output mismatch).
+
+**Caching** via `validator_runs(video_sha256, validator_version)` UNIQUE
+index. SHA-256 streamed from disk (1 MiB chunks) so large clips don't
+balloon RAM. Bumping `config.VALIDATOR_VERSION` forces re-runs.
+
+**Endpoints**:
+
+- `POST /v2/video/analyze-motion` — synchronous. Body
+  `{video_uri, prompt?, shot_uuid?, tiers?, validator_version?}` →
+  composite payload. Reuses `run_all_tiers()`. 404 on unknown URI; 401
+  on missing bearer (when `API_KEYS` is set); 500 with
+  `analyze_motion_failed` envelope on tier orchestration error.
+
+**On-complete dispatch wiring** (`server.py`):
+
+- `_decr_queue_on_complete(job)` — existing v1.8.2 callback — now also
+  calls `_on_job_complete(job)` after the per-key counter decrement.
+- `_on_job_complete(job)` eligibility:
+  - `job.status == COMPLETED`
+  - `job.type ∈ _VALIDATOR_VIDEO_TYPES = {TEXT_TO_VIDEO,
+    IMAGE_TO_VIDEO, AUDIO_TO_VIDEO, RETAKE, VIDEO_OUTPAINT, VIDEO_HDR}`
+  - `_is_training_opted_in(job.api_key)` — looks up
+    `api_key_metadata.training_opt_in`. Default opt-out for unknown
+    keys (single-tenant deploy seeded `.api_keys` with opt-in=1 on
+    rc1's first migration; external bearers stay opt-out until
+    explicitly INSERTed).
+- `_dispatch_validator(job)` — fire-and-forget task. Resolves the
+  result_uri to a path, calls `validator.run_all_tiers`, then UPDATEs
+  the matching `generations` row with `validator_score`,
+  `validator_payload_json`, `validator_version`. Best-effort: any
+  failure logs WARN and returns; the queue worker has already moved on.
+
+**Turbo coordination**: `sapiens-sidecar` added to `_stop_cuda1_tenants`
+and `_restore_cuda1_tenants` (gated on `LOAD_SAPIENS`). Mirrors the
+ACE / JoyAI / ERNIE pattern verbatim.
 
 ### Dashboard and GPU telemetry (v1.2, advanced controls v1.3)
 
