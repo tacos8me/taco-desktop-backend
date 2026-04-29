@@ -2,6 +2,24 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.17.0-rc5 — 2026-04-29
+
+### Fix: motion_intent wire-through + dispatch metrics + dead-column docs
+
+Three fixes folded in from doc + roadmap audits over the rc2-rc4 ship.
+
+1. **`motion_intent` contract bug — silently dropped** (`server.py` `AnalyzeMotionRequest`, `validator.py` `run_all_tiers` / `_run_tier3_judge`, `config.py` `JUDGE_PROMPT_V1`). MCP v0.7.0 already injects `motion_intent` (singular) into the analyze-motion request body — pulled from `quality_validation.motion_intent_map[shot_idx]` — but the backend Pydantic model never declared the field, so `extra="ignore"` ate it before it ever reached the validator. Tier-3's prompt didn't read it either. Net effect: per-clip motion intent the operator collects was forwarded but never used; static portraits were getting `retake` recommendations because the Gemma judge had no way to know "static" was the goal. Fix: declared `motion_intent: str | None = Field(default=None, max_length=200)` on `AnalyzeMotionRequest`, threaded through `run_all_tiers()` → `_run_tier3_judge()` (kwarg, default `None`), rendered conditionally into the user-message text block (the line is omitted entirely when `None` so the rc4 baseline prompt is byte-identical for callers that don't supply intent). Updated `JUDGE_PROMPT_V1` system prompt to mention the new `Motion intent:` line and instruct the judge to reconcile against it. Passive `_dispatch_validator` does NOT carry `motion_intent` — only the synchronous `/v2/video/analyze-motion` endpoint receives it from MCP.
+
+2. **Dispatch failure observability gap** (`server.py` `_validator_dispatch_counter`, `_dispatch_validator`, `_on_job_complete`, new `GET /v1/system/metrics`). Fire-and-forget validator failures were invisible beyond WARN logs — a multi-day Gemma outage would silently NULL `validator_score` on a cohort with no operator-visible signal. Added a process-local dict counter incremented on each dispatch path: `success` / `failure` (in `_dispatch_validator`) and `skipped_not_video` / `skipped_opt_out` / `skipped_validator_disabled` (in `_on_job_complete`'s early-return branches). Exposed via new `GET /v1/system/metrics` endpoint with computed `failure_rate_pct = 100 * failure / max(1, success + failure)` (skips excluded from denominator so the rate reflects real failures, not normal traffic). Auth gating mirrors `/v2/video/analyze-motion`: 401 only when `API_KEYS` is configured. Counters reset on process restart (no persistence — this is a smoke-detector, not a metrics store).
+
+3. **Dead-code v3 columns documented** (`history_store.py` `_migrate` docstring). Five v3 columns have zero writers today: `prompt_embedding` / `validator_artifact_uri` / `lora_applied_id` / `lora_applied_strength` / `composition_id`. Future readers were going to find them and assume something was broken. Annotated each in the `_migrate` docstring under WRITTEN (rc1+/rc2+) / DEAD-LETTER (rc5) / FORWARD-LOOKING (Phase B / Phase C) sections, with concrete trigger conditions for when the writers ship. Documentation-only; no code/schema change. `composition_id` flagged as a candidate for removal in v1.18 — `composition_clips` inverse-index is already the canonical lineage.
+
+`config.VALIDATOR_VERSION` bumped `1.17.0-rc4 → 1.17.0-rc5` (cache invalidation — the JUDGE_PROMPT_V1 text changed, so re-run any cached rows from rc4 against the new prompt).
+
+7 new regression tests in `tests/test_v1_17_validator.py`: `test_motion_intent_propagates_to_tier3_prompt`, `test_motion_intent_absent_no_prompt_pollution`, `test_analyze_motion_endpoint_accepts_motion_intent`, `test_dispatch_counter_success`, `test_dispatch_counter_failure`, `test_dispatch_counter_skipped_opt_out`, `test_metrics_endpoint_exposes_dispatch_counter`. Suite is now 207 green (was 200).
+
+No client-side changes required — MCP already passes `motion_intent` correctly. The backend was the half of the round-trip that wasn't listening. Operator restarts taco-backend to apply.
+
 ## v1.17.0-rc4 — 2026-04-29
 
 ### Fix: tier-1 H/8 snap, tier-3 None-guard, composite false-pass guard, validator_artifacts dir creation, turbo log emission, scrub of buggy rc2/rc3 rows

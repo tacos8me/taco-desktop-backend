@@ -146,7 +146,7 @@ LOAD_SAPIENS = os.environ.get("LOAD_SAPIENS", "0").lower() in ("1", "true", "yes
 
 # Validator pipeline (v1.17.0-rc2). `validator_runs` cache rows are keyed by
 # (video_sha256, validator_version) — bumping the version forces re-runs.
-VALIDATOR_VERSION = "1.17.0-rc4"
+VALIDATOR_VERSION = "1.17.0-rc5"
 VALIDATOR_ARTIFACTS_DIR = Path(
     os.environ.get(
         "VALIDATOR_ARTIFACTS_DIR",
@@ -159,6 +159,11 @@ VALIDATOR_ARTIFACTS_DIR = Path(
 # validated server-side via `JudgeResponseV1` (mirrors CharRankResponse).
 JUDGE_PROMPT_V1 = """You are a video-quality judge for AI-generated music-video clips. Given:
 - The original prompt the user wrote
+- (Optional) Motion intent — a short operator-supplied label for the kind
+  of motion this clip should have (e.g. "static portrait", "frenetic
+  action", "slow camera push-in"). When provided, reconcile your verdict
+  against intent: a static clip with intent="static portrait" is a pass,
+  not a retake. When absent, judge motion against the prompt alone.
 - Optical-flow summary (tier1) showing motion magnitude over time
 - Pose temporal-stability summary (tier2, may be skipped)
 - 3-5 keyframes from the generated clip

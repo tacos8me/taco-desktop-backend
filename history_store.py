@@ -458,6 +458,42 @@ class HistoryStore:
         Pre-v3 rows get NULL for new columns; no backfill. The
         ``api_key_metadata`` table is seeded once from ``.api_keys`` on
         initial migration; subsequent migrations are idempotent no-ops.
+
+        v3 column writer status (audit-as-of v1.17.0-rc5; see
+        ``docs/CAPTURE_VALIDATOR.md`` §7 for the canonical roadmap):
+
+          WRITTEN (v1.17.0-rc1+):
+            - ``parent_clip_id``        — server.py /v2/retake handler
+            - ``shot_uuid``             — MCP v0.7.0 forwarding
+                                          (orchestrator._normalize_input)
+            - ``shot_config_key``       — MCP v0.7.0 forwarding (same)
+
+          WRITTEN (v1.17.0-rc2+):
+            - ``validator_score``       — passive dispatch via
+                                          server._dispatch_validator
+            - ``validator_payload_json`` — same
+            - ``validator_version``     — same
+
+          DEAD-LETTER as of rc5 (no writers; retained for forward-compat):
+            - ``composition_id``        — denorm convenience; the canonical
+                                          lineage lives in ``composition_clips``
+                                          inverse-index. Safe to drop in
+                                          v1.18 if a schema bump is acceptable.
+
+          FORWARD-LOOKING (writers ship in Phase B / Phase C):
+            - ``prompt_embedding``      — Phase B: lazy-fill via llama-swap
+                                          /v1/embeddings once that endpoint
+                                          is wired (~3584-dim float32).
+            - ``validator_artifact_uri`` — populated when sapiens-sidecar
+                                          real inference writes pose.npz /
+                                          flow.npz / overlay.mp4 (currently
+                                          stub mode → no artifacts).
+            - ``lora_applied_id``       — populated by manager-side hook on
+                                          LoRA fusion (currently the
+                                          dispatcher reads ``lora.id`` from
+                                          the request body but doesn't
+                                          persist it post-fusion).
+            - ``lora_applied_strength`` — same.
         """
         current = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if current >= CURRENT_SCHEMA_VERSION:

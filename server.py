@@ -1625,6 +1625,36 @@ async def system_gpu() -> dict:
     return _gpu_cache
 
 
+@app.get("/v1/system/metrics")
+async def system_metrics(request: Request) -> JSONResponse:
+    """Process-local observability counters (v1.17.0-rc5).
+
+    Currently exposes only `validator_dispatch` — fire-and-forget validator
+    runs on completed video jobs are otherwise invisible beyond WARN logs.
+    Counters reset on process restart (no persistence). Auth-required when
+    `API_KEYS` is configured (mirrors every other /v1/system/* endpoint —
+    operator metrics, not public).
+
+    `failure_rate_pct` is computed over only the active dispatches
+    (success + failure). Skipped counts (not_video / opt_out / validator
+    disabled) are excluded from the denominator so the rate reflects real
+    validator failures, not normal traffic.
+    """
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    s = _validator_dispatch_counter["success"]
+    f = _validator_dispatch_counter["failure"]
+    rate = (100.0 * f / max(1, s + f)) if (s + f) > 0 else 0.0
+    return JSONResponse(content={
+        "validator_dispatch": {
+            **_validator_dispatch_counter,
+            "failure_rate_pct": round(rate, 2),
+        },
+    })
+
+
 @app.get("/health")
 async def health() -> dict:
     if _paused:
@@ -3431,6 +3461,20 @@ _VALIDATOR_VIDEO_TYPES = {
 }
 
 
+# v1.17.0-rc5: process-local counters for validator-dispatch observability.
+# Reset on process restart (no persistence); exposed via /v1/system/metrics.
+# Catches multi-day silent regressions (e.g. Gemma outage NULLing a cohort
+# of validator_score columns) that the WARN-only logging in
+# `_dispatch_validator` doesn't surface above the noise floor.
+_validator_dispatch_counter: dict[str, int] = {
+    "success": 0,
+    "failure": 0,
+    "skipped_not_video": 0,
+    "skipped_opt_out": 0,
+    "skipped_validator_disabled": 0,
+}
+
+
 def _is_training_opted_in(api_key: str) -> bool:
     """Check whether the given API key has training_opt_in=1 in api_key_metadata.
 
@@ -3467,8 +3511,14 @@ async def _dispatch_validator(job: Job) -> None:
     Best-effort: any failure logs a WARN and returns. Updates the matching
     `generations` row in-place with `validator_score` + `validator_payload_json`
     + `validator_version` so /v2/history/{id} reads back the score.
+
+    v1.17.0-rc5: increments `_validator_dispatch_counter["success"|"failure"]`
+    for /v1/system/metrics observability. Passive dispatch does NOT carry
+    `motion_intent` (only the synchronous /v2/video/analyze-motion endpoint
+    receives that value from MCP).
     """
     if not job.result_uri:
+        _validator_dispatch_counter["failure"] += 1
         return
     try:
         from validator import run_all_tiers
@@ -3498,9 +3548,12 @@ async def _dispatch_validator(job: Job) -> None:
             history._conn.commit()
         except Exception:
             logger.warning("validator history.update failed for %s", job.id, exc_info=True)
+        _validator_dispatch_counter["success"] += 1
     except FileNotFoundError:
+        _validator_dispatch_counter["failure"] += 1
         logger.info("validator dispatch: result file gone for %s — skipping", job.id)
     except Exception:
+        _validator_dispatch_counter["failure"] += 1
         logger.warning("validator dispatch failed for %s", job.id, exc_info=True)
 
 
@@ -3513,18 +3566,27 @@ def _on_job_complete(job: Job) -> None:
       - job reached COMPLETED (not FAILED / CANCELLED)
       - job.type is a video type (validators are video-only)
       - bearer has training_opt_in=1 in api_key_metadata
+
+    v1.17.0-rc5: increments `_validator_dispatch_counter["skipped_*"]` for
+    each early-return branch so /v1/system/metrics can report a failure
+    rate that excludes intentional skips.
     """
     if job.status != JobStatus.COMPLETED:
+        # Failed / cancelled jobs aren't observability-interesting here —
+        # they have their own error counters. No counter mutation.
         return
     if job.type not in _VALIDATOR_VIDEO_TYPES:
+        _validator_dispatch_counter["skipped_not_video"] += 1
         return
     if not _is_training_opted_in(job.api_key or ""):
+        _validator_dispatch_counter["skipped_opt_out"] += 1
         return
     try:
         asyncio.create_task(_dispatch_validator(job))
     except RuntimeError:
         # No running event loop — happens in unit tests that drive
         # worker_loop synchronously. Safe to drop.
+        _validator_dispatch_counter["skipped_validator_disabled"] += 1
         logger.debug("validator dispatch: no running loop for job %s", job.id)
 
 
@@ -4548,6 +4610,11 @@ class AnalyzeMotionRequest(BaseModel):
     video_uri: str
     prompt: str = ""
     shot_uuid: str | None = None
+    # v1.17.0-rc5: per-clip motion intent forwarded by MCP (e.g. "static
+    # portrait", "frenetic action"). Tier-3 judge uses this to reconcile its
+    # verdict against operator intent — don't penalize a static clip when
+    # intent says "static". Capped at 200 chars to bound prompt growth.
+    motion_intent: str | None = Field(default=None, max_length=200)
     tiers: list[Literal["raft", "sapiens", "gemma"]] | None = None
     validator_version: str | None = None
 
@@ -4581,6 +4648,7 @@ async def v2_analyze_motion(body: AnalyzeMotionRequest, request: Request) -> JSO
             video_uri=body.video_uri,
             video_path=str(video_path),
             prompt=body.prompt,
+            motion_intent=body.motion_intent,
             chat=chat,
             history=history,
             validator_version=body.validator_version,

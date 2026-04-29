@@ -134,7 +134,7 @@ def test_validator_runs_cache_hit(tmp_path):
         call_count["sapiens"] += 1
         return {"tier2_skipped": True, "status": "stub", "latency_s": 0.0}
 
-    async def fake_judge(chat, video_path, prompt, t1, t2):
+    async def fake_judge(chat, video_path, prompt, t1, t2, motion_intent=None):
         call_count["gemma"] += 1
         return {"verdict": "pass", "score": 0.8, "judge_score": 0.8, "reasoning": "x", "retake_hint": None, "latency_s": 0.01}
 
@@ -176,7 +176,7 @@ def test_validator_runs_cache_miss_on_version_bump(tmp_path):
     async def fake_sapiens(video_path):
         return {"tier2_skipped": True, "status": "stub", "latency_s": 0.0}
 
-    async def fake_judge(chat, video_path, prompt, t1, t2):
+    async def fake_judge(chat, video_path, prompt, t1, t2, motion_intent=None):
         return {"verdict": "pass", "score": 0.8, "judge_score": 0.8, "reasoning": "x", "retake_hint": None, "latency_s": 0.01}
 
     with patch("validator._run_tier1_raft", fake_raft), \
@@ -642,6 +642,244 @@ def test_validator_artifacts_dir_created_on_startup(tmp_path, monkeypatch):
     # Mirror the lifespan body — mkdir is idempotent + not gated on anything else.
     config.VALIDATOR_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     assert target.exists() and target.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# v1.17.0-rc5 fixes — motion_intent wire-through + dispatch metrics counter.
+# ---------------------------------------------------------------------------
+
+
+def test_motion_intent_propagates_to_tier3_prompt(tmp_path, monkeypatch):
+    """rc5: when motion_intent is provided, the tier-3 prompt must include
+    the intent line so the Gemma judge can reconcile against it."""
+    from validator import _run_tier3_judge
+
+    video = _make_fake_video(tmp_path, "v.mp4", size=64)
+
+    class _FakeStream:
+        frames = 12
+        average_rate = 24
+        duration = None
+        time_base = 1
+
+    class _FakeContainer:
+        streams = type("S", (), {"video": [_FakeStream()]})()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import av as _av
+    monkeypatch.setattr(_av, "open", lambda *a, **k: _FakeContainer())
+
+    from PIL import Image
+    monkeypatch.setattr(
+        "validator._extract_frames_as_pils",
+        lambda video_bytes, indices: [Image.new("RGB", (32, 32)) for _ in indices],
+    )
+
+    captured: dict = {"messages": None}
+
+    class _FakeChat:
+        async def generate_chat_completion(self, messages, **kwargs):
+            captured["messages"] = messages
+            content = '{"verdict": "pass", "score": 0.8, "reasoning": "ok", "retake_hint": null}'
+            return {"choices": [{"message": {"content": content}}]}
+
+    asyncio.run(
+        _run_tier3_judge(
+            _FakeChat(), str(video), "a sunset", {}, None,
+            motion_intent="static portrait",
+        )
+    )
+    msgs = captured["messages"]
+    assert msgs is not None
+    user_block = msgs[1]["content"]
+    text = user_block[0]["text"]
+    assert "static portrait" in text, f"motion_intent not in prompt: {text!r}"
+    assert "Motion intent" in text
+
+
+def test_motion_intent_absent_no_prompt_pollution(tmp_path, monkeypatch):
+    """rc5: motion_intent=None must NOT add the intent line — prompt stays
+    byte-identical to rc4 for callers who don't supply intent."""
+    from validator import _run_tier3_judge
+
+    video = _make_fake_video(tmp_path, "v.mp4", size=64)
+
+    class _FakeStream:
+        frames = 12
+        average_rate = 24
+        duration = None
+        time_base = 1
+
+    class _FakeContainer:
+        streams = type("S", (), {"video": [_FakeStream()]})()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import av as _av
+    monkeypatch.setattr(_av, "open", lambda *a, **k: _FakeContainer())
+
+    from PIL import Image
+    monkeypatch.setattr(
+        "validator._extract_frames_as_pils",
+        lambda video_bytes, indices: [Image.new("RGB", (32, 32)) for _ in indices],
+    )
+
+    captured: dict = {"messages": None}
+
+    class _FakeChat:
+        async def generate_chat_completion(self, messages, **kwargs):
+            captured["messages"] = messages
+            content = '{"verdict": "pass", "score": 0.8, "reasoning": "ok", "retake_hint": null}'
+            return {"choices": [{"message": {"content": content}}]}
+
+    asyncio.run(
+        _run_tier3_judge(_FakeChat(), str(video), "a sunset", {}, None)
+    )
+    text = captured["messages"][1]["content"][0]["text"]
+    assert "Motion intent" not in text, f"intent line leaked into rc4 baseline: {text!r}"
+
+
+def test_analyze_motion_endpoint_accepts_motion_intent(tmp_path, monkeypatch):
+    """rc5: POST /v2/video/analyze-motion with motion_intent must thread
+    that value into validator.run_all_tiers()."""
+    from server import uploads as srv_uploads
+
+    upload_id, storage_uri = srv_uploads.create()
+    srv_uploads.save(upload_id, b"\x00" * 64)
+
+    captured: dict = {"motion_intent": "<not_set>"}
+
+    async def fake_run_all(**kwargs):
+        captured["motion_intent"] = kwargs.get("motion_intent", "<missing_kwarg>")
+        return {
+            "video_uri": kwargs["video_uri"],
+            "validator_version": "1.17.0-rc5",
+            "tier1": {"dynamic_degree": 4.0, "flow_windows": [1] * 4, "motion_smoothness": 0.9},
+            "tier2": {"tier2_skipped": True},
+            "tier3": {"verdict": "pass", "score": 0.85, "judge_score": 0.85},
+            "composite_score": 0.85,
+            "recommendation": "pass",
+            "reasoning_summary": "tier2_stub",
+            "ran_at": time.time(),
+            "latency_s": 0.1,
+            "cached": False,
+        }
+
+    monkeypatch.setattr("validator.run_all_tiers", fake_run_all)
+    resp = client.post("/v2/video/analyze-motion", json={
+        "video_uri": storage_uri,
+        "prompt": "a sunset",
+        "motion_intent": "frenetic action",
+    })
+    assert resp.status_code == 200, resp.text
+    assert captured["motion_intent"] == "frenetic action"
+
+
+def test_dispatch_counter_success(tmp_path, monkeypatch):
+    """rc5: successful _dispatch_validator must increment success counter."""
+    import server as srv
+
+    # Reset counter so test is deterministic.
+    for k in srv._validator_dispatch_counter:
+        srv._validator_dispatch_counter[k] = 0
+
+    upload_id, storage_uri = srv.uploads.create()
+    srv.uploads.save(upload_id, b"\x00" * 32)
+
+    async def fake_run_all(**kwargs):
+        return {
+            "video_uri": kwargs["video_uri"],
+            "validator_version": "1.17.0-rc5",
+            "composite_score": 0.8,
+            "recommendation": "pass",
+        }
+
+    monkeypatch.setattr("validator.run_all_tiers", fake_run_all)
+
+    job = Job(id="j_disp_ok", type=JobType.TEXT_TO_VIDEO,
+              status=JobStatus.COMPLETED, api_key="k",
+              result_uri=storage_uri)
+    asyncio.run(srv._dispatch_validator(job))
+    assert srv._validator_dispatch_counter["success"] == 1
+    assert srv._validator_dispatch_counter["failure"] == 0
+
+
+def test_dispatch_counter_failure(monkeypatch):
+    """rc5: exception in run_all_tiers must increment failure counter."""
+    import server as srv
+
+    for k in srv._validator_dispatch_counter:
+        srv._validator_dispatch_counter[k] = 0
+
+    upload_id, storage_uri = srv.uploads.create()
+    srv.uploads.save(upload_id, b"\x00" * 32)
+
+    async def fake_run_all(**kwargs):
+        raise RuntimeError("simulated tier failure")
+
+    monkeypatch.setattr("validator.run_all_tiers", fake_run_all)
+
+    job = Job(id="j_disp_fail", type=JobType.TEXT_TO_VIDEO,
+              status=JobStatus.COMPLETED, api_key="k",
+              result_uri=storage_uri)
+    asyncio.run(srv._dispatch_validator(job))
+    assert srv._validator_dispatch_counter["failure"] == 1
+    assert srv._validator_dispatch_counter["success"] == 0
+
+
+def test_dispatch_counter_skipped_opt_out(monkeypatch):
+    """rc5: opt-out bearer on a video job must increment skipped_opt_out."""
+    import server as srv
+
+    for k in srv._validator_dispatch_counter:
+        srv._validator_dispatch_counter[k] = 0
+
+    api_key = "test_counter_optout"
+    _seed_opt_in(srv.history, api_key, opt_in=False)
+
+    job = Job(id="j_optout_count", type=JobType.TEXT_TO_VIDEO,
+              status=JobStatus.COMPLETED, api_key=api_key,
+              result_uri="storage://" + "x" * 32)
+
+    # No-op dispatch so we don't accidentally side-effect.
+    async def noop_dispatch(j):
+        pass
+
+    monkeypatch.setattr(srv, "_dispatch_validator", noop_dispatch)
+    srv._on_job_complete(job)
+    assert srv._validator_dispatch_counter["skipped_opt_out"] == 1
+
+
+def test_metrics_endpoint_exposes_dispatch_counter(monkeypatch):
+    """rc5: GET /v1/system/metrics returns the counter + computed rate."""
+    import server as srv
+
+    srv._validator_dispatch_counter.update({
+        "success": 8,
+        "failure": 2,
+        "skipped_not_video": 50,
+        "skipped_opt_out": 3,
+        "skipped_validator_disabled": 0,
+    })
+    resp = client.get("/v1/system/metrics")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "validator_dispatch" in data
+    vd = data["validator_dispatch"]
+    assert vd["success"] == 8
+    assert vd["failure"] == 2
+    assert vd["skipped_not_video"] == 50
+    # 100 * 2 / (8+2) = 20.0
+    assert vd["failure_rate_pct"] == pytest.approx(20.0)
 
 
 def test_scrub_removes_buggy_rc2_rows(tmp_path):
