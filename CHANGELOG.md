@@ -2,6 +2,20 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.17.0-rc3 — 2026-04-29
+
+### Fix: training_opt_in docstring + sapiens turbo-stop gating
+
+Two small polish fixes surfaced by rc2 review.
+
+1. **`_is_training_opted_in` docstring corrected** (server.py:3380). The prior docstring claimed *"Default to opt-in when the row is missing. External bearers added later get opted in by default."* — but the implementation correctly defaults to **opt-out** for unknown rows (matching the CLAUDE.md spec and the actual code path at server.py:3398-3401). The CODE was right; only the docstring drifted. Replaced with an accurate description: opt-out by default, single-tenant deploy seeded `.api_keys` to opt-in via the rc1 v3 migration, unknown bearers must be explicitly INSERTed into `api_key_metadata` to opt in. Documented as intentional defense-in-depth.
+
+2. **`_stop_cuda1_tenants` now honors LOAD_* flags** (server.py:1897). The loop previously discarded the `cfg_flag` tuple component (`for unit, _ in units`) and unconditionally called `systemctl stop` on every listed unit — including `sapiens-sidecar` even when `LOAD_SAPIENS=0`. Mirrors the (correct) gating pattern in `_restore_cuda1_tenants` at server.py:1918: `for unit, cfg_flag in units: if not cfg_flag: continue`. `ltx-sidecar` stays gated `True` so it's still always stopped. Effect: turbo entry no longer emits a spurious `systemctl stop sapiens-sidecar` when the operator hasn't enabled the sidecar.
+
+One new regression test (`test_turbo_entry_skips_sapiens_when_load_sapiens_off`) mirrors the existing restore-side test for the stop-side path. Suite is now 194 green.
+
+No code path that runs in production changes behavior for already-correct deploys (everyone in single-tenant has `LOAD_SAPIENS=0` while the rc2 stub bakes); the fix is preventative — when an operator flips `LOAD_SAPIENS=1` after diff review, the now-symmetric gating ensures stop/restore stay in sync.
+
 ## v1.17.0-rc2 — 2026-04-29
 
 ### Feat: validator pipeline (RAFT in-process + Sapiens sidecar + Gemma judge)
