@@ -2,6 +2,26 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.18.0-rc4 — 2026-04-29
+
+### Fix: embedding-dim mismatch — schema rebuild at FLOAT[4096] + model swap to qwen3-embed-8b
+
+rc1-rc3 shipped Phase B retrieval against a non-existent embedding model. `chat_manager.EMBEDDING_MODEL_VERSION` pointed at `gemma-3-12b-nvfp4` (a vLLM chat-completion upstream with no `--task embedding`), and `clip_embeddings` was created at `FLOAT[3584]` based on a wrong premise that Gemma 3 12B was an embedding model with that hidden dim. Reality: Gemma 3 12B is a chat model (hidden_size=3840), and 3584 is the hidden dim of Qwen2.5-7B / gte-Qwen2 — copy-paste error from upstream planning.
+
+**Symptom**: every `chat_manager.embed` call returned 5xx with `unable to start process: upstream command exited prematurely but successfully` — vLLM exits cleanly when handed `/v1/embeddings` against a chat-only deployment. Result: `clip_embeddings_rowids` had 0 rows in production; `scripts/backfill_prompt_embeddings.py` was never run successfully; `/v2/embeddings/search` returned 503 every call.
+
+**Fix**:
+
+- `chat_manager.EMBEDDING_MODEL_VERSION = "qwen3-embed-8b"` (Qwen3-Embedding-8B-Q8_0.gguf via llama.cpp `--embeddings --pooling mean`, 4096-dim, MTEB-tuned). The upstream was already configured in `/home/ian/config.yml` from a prior deploy; no llama-swap config edits required.
+- `history_store.CURRENT_SCHEMA_VERSION 4 → 5`. New `_migrate()` v4→v5 step drops + recreates `clip_embeddings` at `FLOAT[4096]`. Safe drop+recreate: production table was empty (no successful backfill ever ran). Migration is no-op when sqlite-vec extension didn't load.
+- `tests/test_v1_18_phase_b.py` `EMBED_DIM = 4096`.
+- New regression test `tests/test_v1_18_schema.py::test_v5_clip_embeddings_dim` verifies the column type after migration via `SELECT sql FROM sqlite_master`.
+- `docs/operator-tuning.md` "Embeddings + sqlite-vec" section rewritten with the qwen3-embed-8b config snippet and the model-swap recipe (bump `CURRENT_SCHEMA_VERSION` + update `EMBEDDING_MODEL_VERSION` together so the rebuild fires).
+
+**No behavioral change** for any caller other than embeddings — the v5 migration is additive-safe over the v4 surface; pre-v5 DBs get the rebuild on first boot. Privacy gates / validator wiring / Phase C training infra all unaffected.
+
+Restart taco-backend to migrate. After restart, optionally run `scripts/backfill_prompt_embeddings.py` against the opted-in corpus — for the first time, it will actually populate `clip_embeddings`.
+
 ## v1.18.0-rc3 — 2026-04-29
 
 ### Feat: Phase C training infrastructure (preference_pairs ETL + train_dpo_sft + A/B framework + lora_registry rollback)

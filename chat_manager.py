@@ -5,8 +5,8 @@ Gemma 3 12B IT (or any OpenAI-compatible model).
 
 v1.18.0-rc2: also exposes ``embed`` and ``embed_batch`` helpers that
 proxy ``/v1/embeddings`` to llama-swap. Returns float32-packed bytes
-(~14 KB per 3584-dim Gemma embedding) ready to insert into the
-``clip_embeddings`` sqlite-vec virtual table.
+(~16 KB per 4096-dim qwen3-embed-8b embedding) ready to insert into
+the ``clip_embeddings`` sqlite-vec virtual table.
 """
 
 from __future__ import annotations
@@ -25,12 +25,13 @@ logger = logging.getLogger(__name__)
 # 30s timeout for chat completions
 _TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
-# v1.18.0-rc2 — embeddings model identifier on llama-swap. Defaults to
-# the same model as `CHAT_MODEL` so a single Gemma load can serve both
-# completions and embeddings; override the env if llama-swap exposes a
-# dedicated embed model with a different ID. Stored alongside each
-# embedding for migration safety when the model rolls.
-EMBEDDING_MODEL_VERSION = "gemma-3-12b-nvfp4"
+# v1.18.0-rc4 — embeddings model identifier on llama-swap. Points at
+# `qwen3-embed-8b` (Qwen3-Embedding-8B-Q8_0.gguf via llama.cpp
+# `--embeddings --pooling mean`, 4096-dim, MTEB-tuned). Stored alongside
+# each embedding for migration safety when the model rolls. rc1-rc3
+# referenced `gemma-3-12b-nvfp4` here, but Gemma is a chat model and the
+# upstream rejected /v1/embeddings — see CHANGELOG rc4.
+EMBEDDING_MODEL_VERSION = "qwen3-embed-8b"
 
 # Generous timeout for batch embeddings — 64 inputs at ~30 toks each is
 # a few seconds on hot llama-swap, but cold-load can spike.
@@ -113,7 +114,7 @@ class ChatManager:
         """Embed a single string via llama-swap ``/v1/embeddings``.
 
         Returns little-endian float32-packed bytes ready to insert into the
-        ``clip_embeddings(embedding FLOAT[3584])`` sqlite-vec virtual table.
+        ``clip_embeddings(embedding FLOAT[4096])`` sqlite-vec virtual table.
         Length = 4 * embedding_dim. Raises :class:`httpx.HTTPError` on
         transport failure and :class:`RuntimeError` when the response shape
         doesn't match OpenAI's spec — caller is expected to surface 503.

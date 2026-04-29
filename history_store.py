@@ -16,7 +16,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 # v1.18.0-rc2 — sqlite-vec extension for vector search. Loaded BEFORE
 # `PRAGMA journal_mode=WAL` per sqlite-vec docs (extension load must
@@ -464,7 +464,7 @@ class HistoryStore:
                 self._conn.execute(
                     """CREATE VIRTUAL TABLE IF NOT EXISTS clip_embeddings USING vec0(
                         id TEXT PRIMARY KEY,
-                        embedding FLOAT[3584],
+                        embedding FLOAT[4096],
                         embedding_model_version TEXT
                     )"""
                 )
@@ -552,7 +552,8 @@ class HistoryStore:
           FORWARD-LOOKING (writers ship in Phase B / Phase C):
             - ``prompt_embedding``      — Phase B: lazy-fill via llama-swap
                                           /v1/embeddings once that endpoint
-                                          is wired (~3584-dim float32).
+                                          is wired (~4096-dim float32 from
+                                          qwen3-embed-8b as of rc4).
                                           **DEPRECATED as of v1.18.0-rc1**:
                                           embeddings will live in the
                                           ``clip_embeddings`` sqlite-vec
@@ -734,6 +735,24 @@ class HistoryStore:
                 if "validator_version_at_train" not in tr_cols:
                     self._conn.execute(
                         "ALTER TABLE training_runs ADD COLUMN validator_version_at_train TEXT"
+                    )
+            if current < 5:
+                # v5 (v1.18.0-rc4) — rebuild clip_embeddings at the correct dim.
+                # rc1+rc2+rc3 shipped FLOAT[3584] based on a wrong assumption
+                # that Gemma 3 12B was an embedding model with 3584 hidden dim.
+                # Gemma is 3840 and isn't an embedding model. Switching to
+                # qwen3-embed-8b (4096-dim, MTEB-tuned) — the embedding
+                # upstream that was already configured in llama-swap.
+                # Safe to drop+recreate: rc1+rc2+rc3 shipped before any
+                # backfill ran; clip_embeddings is empty in production.
+                if SQLITE_VEC_AVAILABLE:
+                    self._conn.execute("DROP TABLE IF EXISTS clip_embeddings")
+                    self._conn.execute(
+                        """CREATE VIRTUAL TABLE clip_embeddings USING vec0(
+                            id TEXT PRIMARY KEY,
+                            embedding FLOAT[4096],
+                            embedding_model_version TEXT
+                        )"""
                     )
             self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
             self._conn.commit()

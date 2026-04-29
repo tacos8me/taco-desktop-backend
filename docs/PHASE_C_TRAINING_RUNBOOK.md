@@ -37,12 +37,48 @@ that mcp v0.7.0+ is the deployed orchestrator and that `/v2/retake`
 
 ## Section 2 — Pair construction (weekly cron)
 
-Add to crontab once corpus signals start flowing:
+Installed as a systemd user timer (no crontab entry needed). Runs every
+Monday at 04:00 UTC with a randomized jitter up to 10 minutes; missed
+runs fire on next boot via `Persistent=true`.
 
-```cron
-# Phase C: weekly preference-pair ETL (every Sunday 4 AM UTC)
-0 4 * * 0 cd /mnt/nvme-1/servers/taco-backend && uv run --no-sync python scripts/construct_preference_pairs.py >> logs/pair_etl.log 2>&1
+Unit files:
+
+- `/home/ian/.config/systemd/user/preference-pairs.service` — oneshot
+  invoking `uv run --no-sync python scripts/construct_preference_pairs.py
+  --since-watermark` from the project root. Inherits `HOME` + `PATH` so
+  the same `/home/ian/.local/bin/uv` resolves as it does for
+  `taco-backend.service`. `TimeoutStartSec=600`.
+- `/home/ian/.config/systemd/user/preference-pairs.timer` — `OnCalendar=Mon
+  04:00 UTC`, `RandomizedDelaySec=600`, `Persistent=true`.
+
+Operator commands:
+
+```bash
+# Disable temporarily (e.g. before a planned DB maintenance window)
+systemctl --user stop preference-pairs.timer
+
+# Re-enable
+systemctl --user start preference-pairs.timer
+
+# Trigger one immediate run (does NOT touch the timer schedule)
+systemctl --user start preference-pairs.service
+
+# Inspect last run's logs
+journalctl --user -u preference-pairs -n 200
+
+# Confirm next-run timestamp
+systemctl --user list-timers preference-pairs.timer
 ```
+
+**Expected behavior during corpus accumulation**: at single-operator
+volume the four sources will return 0 rows for several weeks after rc1
+ships. The pre-rc1 history rows have NULL in `parent_clip_id` /
+`shot_config_key` / `composition_id`, and the rc5+ corpus needs to
+accumulate ~100 retakes before `user_retake` finds signal. A clean
+log line of `source=<name> rows=0 (would-insert)` per source is the
+expected steady state until the corpus crosses ~1000 pairs (~6-8 weeks).
+A non-zero exit or a SQLite error in `journalctl` is the only thing
+that warrants attention.
 
 Manual invocation:
 

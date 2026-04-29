@@ -34,11 +34,8 @@ if str(_ROOT) not in sys.path:
 
 import config  # noqa: E402
 from chat_manager import ChatManager, EMBEDDING_MODEL_VERSION  # noqa: E402
-from history_store import (  # noqa: E402
-    HistoryStore,
-    SQLITE_VEC_AVAILABLE,
-    SQLITE_VEC_LOAD_ERROR,
-)
+import history_store  # noqa: E402
+from history_store import HistoryStore  # noqa: E402
 
 
 logging.basicConfig(
@@ -59,10 +56,13 @@ async def _backfill(
     sleep_ms: int,
 ) -> None:
     history = HistoryStore()
-    if not SQLITE_VEC_AVAILABLE:
+    # Read the module attribute after the constructor — `SQLITE_VEC_AVAILABLE`
+    # is mutated inside `HistoryStore._load_sqlite_vec()`. Importing the name
+    # directly would snapshot the pre-construction `False`.
+    if not history_store.SQLITE_VEC_AVAILABLE:
         logger.error(
             "sqlite-vec extension not loaded (%s) — cannot backfill",
-            SQLITE_VEC_LOAD_ERROR,
+            history_store.SQLITE_VEC_LOAD_ERROR,
         )
         return
 

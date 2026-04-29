@@ -194,11 +194,18 @@ curl -sS -H "Authorization: Bearer $KEY" \
 ffprobe -v error -show_entries stream=codec_name,bit_rate /tmp/result.mp4
 ```
 
-## Embeddings + sqlite-vec (v1.18.0-rc2)
+## Embeddings + sqlite-vec (v1.18.0-rc2, model wired in rc4)
 
 Phase B retrieval depends on two pieces: the `sqlite-vec` SQLite
 extension (vector storage + cosine/L2 search) and llama-swap's
-`/v1/embeddings` endpoint (Gemma 3 12B → 3584-dim float32 vectors).
+`/v1/embeddings` endpoint. **rc4 changed the embedding model**: rc1-rc3
+referenced `gemma-3-12b-nvfp4` (a chat model that doesn't serve
+embeddings — `/v1/embeddings` returned 5xx). rc4 points the client at
+`qwen3-embed-8b` (Qwen3-Embedding-8B-Q8_0.gguf via llama.cpp
+`--embeddings --pooling mean`, 4096-dim, MTEB-tuned), which was already
+configured in `/home/ian/config.yml` from an earlier deploy. The schema's
+`clip_embeddings` virtual table was rebuilt at `FLOAT[4096]` via the v5
+migration; safe because no backfill had run before rc4.
 
 ### Install
 
@@ -230,36 +237,54 @@ WARN history_store: sqlite-vec extension load failed (...); embedding search end
 
 ### llama-swap `/v1/embeddings`
 
-llama.cpp natively supports `/v1/embeddings` when the Gemma model is
-loaded. Verify:
+llama-swap config lives at `/home/ian/config.yml` (user systemd unit
+`llama-swap.service`). The `qwen3-embed-8b` upstream is the model
+`chat_manager.embed` proxies to. Verify:
 
 ```bash
 curl -sS -X POST http://192.168.1.80:8080/v1/embeddings \
   -H 'Content-Type: application/json' \
-  -d '{"model": "gemma-3-12b-nvfp4", "input": "test"}' | head -c 200
+  -d '{"model": "qwen3-embed-8b", "input": "test"}' | head -c 200
 ```
 
 A healthy response is JSON shaped like
-`{"data":[{"embedding":[...3584 floats...],"index":0}],"model":...}`.
+`{"data":[{"embedding":[...4096 floats...],"index":0}],"model":"qwen3-embed-8b"}`.
 
-If you see HTTP 502 / `unable to start process: upstream command exited
-prematurely`, llama-swap's config is missing the embeddings binding.
-Add to llama-swap's model config:
+If you see HTTP 5xx / `unable to start process: upstream command exited
+prematurely but successfully`, the model id you're sending isn't an
+embeddings upstream — chat-only models (vLLM without `--task embedding`)
+exit cleanly when handed `/v1/embeddings`. Confirm the upstream entry
+in `/home/ian/config.yml` has `--embeddings --pooling mean`:
 
 ```yaml
-# In ~/llama-swap/config.yaml under the gemma model:
-gemma-3-12b-nvfp4:
+# In /home/ian/config.yml — already present since the qwen3-embed-8b
+# entry was added; included here for reference if you ever swap models.
+"qwen3-embed-8b":
+  ttl: 600
+  env:
+    - "CUDA_VISIBLE_DEVICES=0"
+  checkEndpoint: /health
   cmd: |
-    /path/to/llama-server
-    --model /path/to/gemma-3-12b-Q5_K_M.gguf
+    ${llama-bin}
+    --model "/home/ian/models/embed/Qwen3-Embedding-8B-Q8_0.gguf"
+    --alias "qwen3-embedding"
     --embeddings           # ← critical: enables /v1/embeddings
     --pooling mean
-    -ngl 99
-    --port 8080
+    --n-gpu-layers 99
+    --ctx-size 8192
 ```
 
 `--embeddings` adds the route; `--pooling mean` matches sentence-
-embedding semantics (default for retrieval). Restart llama-swap.
+embedding semantics (default for retrieval). After config edits,
+restart llama-swap with `systemctl --user restart llama-swap`.
+
+If you swap to a different embedding model, also update
+`chat_manager.EMBEDDING_MODEL_VERSION` to match the new upstream id and
+bump `CURRENT_SCHEMA_VERSION` in `history_store.py` to trigger a
+`clip_embeddings` rebuild at the new dim. The
+`embedding_model_version` column on each row is the migration-safety
+field — old vectors stay tagged with their generator so a partial
+backfill can co-exist during the cutover.
 
 ### Backfill historical rows
 

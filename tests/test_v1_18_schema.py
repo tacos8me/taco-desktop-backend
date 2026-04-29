@@ -174,7 +174,8 @@ def test_schema_v4_migration_runs_clean(tmp_path: Path) -> None:
         assert col in tr_cols, f"missing training_runs column: {col}"
 
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == CURRENT_SCHEMA_VERSION == 4
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert user_version >= 4
 
 
 def test_schema_v4_migration_idempotent(tmp_path: Path) -> None:
@@ -191,7 +192,8 @@ def test_schema_v4_migration_idempotent(tmp_path: Path) -> None:
     store._migrate()
 
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == 4
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert user_version >= 4
 
     assert _table_columns(store._conn, "generations") == gen_cols_first
     assert _indexes(store._conn, "preference_pairs") == pp_indexes_first
@@ -231,7 +233,8 @@ def test_schema_v3_to_v4_upgrade_preserves_rows(tmp_path: Path) -> None:
 
     store = HistoryStore(db_path=db)
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == 4
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert user_version >= 4
 
     # Verify generations row preserved + new cols NULL.
     row = store._conn.execute(
@@ -426,7 +429,9 @@ def test_v3_db_loaded_by_v4_code_works(tmp_path: Path) -> None:
     conn.close()
 
     store = HistoryStore(db_path=db)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    upgraded = store._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert upgraded == CURRENT_SCHEMA_VERSION
+    assert upgraded >= 4
 
     # v3-shape inserts still work (no required new columns).
     store._conn.execute(
@@ -449,18 +454,20 @@ def test_v3_db_loaded_by_v4_code_works(tmp_path: Path) -> None:
 def test_v4_db_loaded_by_v3_code_silently_ignores_extra_columns(
     tmp_path: Path,
 ) -> None:
-    """v4 DB opened by code that only knows the v3 column set: SQLite is
+    """v4+ DB opened by code that only knows the v3 column set: SQLite is
     column-tolerant, so v3-shape SELECTs and INSERTs continue to work
     even though extra columns are present (additive safety)."""
     db = tmp_path / "history.db"
-    # Migrate to v4.
+    # Migrate to current schema (v4 introduced the additive columns this
+    # test exercises; future migrations stay additive over the same set).
     HistoryStore(db_path=db)._conn.close()
 
     # Now open with a raw connection and run only v3-shape queries.
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == 4
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert user_version >= 4
 
     # v3-shape INSERT into generations (no new columns referenced) → succeeds.
     conn.execute(
@@ -545,3 +552,32 @@ def test_existing_v3_test_suite_still_passes(tmp_path: Path) -> None:
         )
         store._conn.commit()
     store._conn.rollback()
+
+
+def test_v5_clip_embeddings_dim(tmp_path):
+    """v5 (rc4) rebuilt ``clip_embeddings`` at FLOAT[4096] for qwen3-embed-8b.
+
+    rc1+rc2+rc3 created the virtual table at FLOAT[3584] based on a wrong
+    assumption that Gemma 3 12B was an embedding model with that hidden dim.
+    The v5 migration drops + recreates the table; safe because no backfill
+    had run before rc4.
+    """
+    import history_store as hs_mod
+
+    if not hs_mod.SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec extension not available; v5 rebuild requires it")
+
+    db = tmp_path / "history.db"
+    store = HistoryStore(db_path=db)
+
+    row = store._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='clip_embeddings'"
+    ).fetchone()
+    assert row is not None, "clip_embeddings virtual table missing"
+    sql = row[0]
+    assert "FLOAT[4096]" in sql, f"expected FLOAT[4096] in clip_embeddings sql, got: {sql!r}"
+    assert "FLOAT[3584]" not in sql, f"v5 migration did not drop the old 3584 dim: {sql!r}"
+
+    user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert user_version >= 5

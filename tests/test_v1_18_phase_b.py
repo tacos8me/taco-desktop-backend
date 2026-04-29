@@ -42,7 +42,7 @@ from server import app  # noqa: E402
 client = TestClient(app)
 
 
-EMBED_DIM = 3584
+EMBED_DIM = 4096
 
 
 def _pack_embed(vec: list[float]) -> bytes:
