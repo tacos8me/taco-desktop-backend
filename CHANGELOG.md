@@ -2,6 +2,52 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.17.0-rc2 — 2026-04-29
+
+### Feat: validator pipeline (RAFT in-process + Sapiens sidecar + Gemma judge)
+
+Second wave of the **capture + validator machine** (per `plans/melodic-sniffing-beacon.md`). v1.17.0-rc1 landed the schema substrate; this RC wires the actual scoring pipeline + on-complete dispatch + endpoint + turbo coordination. **No** restart required for code-only changes; **does** require restart to pick up the new `LOAD_SAPIENS` flag and `sapiens-sidecar` systemd unit (sidecar shell already up at :8096 from rc1, currently in stub-mode).
+
+**Three tiers**, each independently degradable:
+
+- **Tier 1 — RAFT** (in-process): `torchvision.models.optical_flow.raft_small` on cuda:0, lazy-loaded + evicted after each call so LTX reclaims VRAM cleanly. Decodes via PyAV at 24fps, downsamples to 256px wide, computes per-pair mean optical-flow magnitude. Returns `{dynamic_degree, flow_windows[4], motion_smoothness, latency_s}`. RAFT-small chosen over RAFT-large because the validator runs on every completed clip; the +1 GB transient VRAM and ~50 ms/frame difference matter at 28-job concurrency. Switch to raft_large later if accuracy regresses (single-line change in `_run_tier1_raft`).
+
+- **Tier 2 — Sapiens** (via sidecar): `POST http://127.0.0.1:8096/v1/analyze-pose` through `sapiens_client.py` (mirrors `madmom_client.py`). Returns pose temporal-stability metrics. **Stub-tolerant**: a `{"stub": true, ...}` response from rc1's sidecar shell is treated as "skipped, not failed" — composite scoring uses `1.0` in that slot (no penalty). Sidecar 5xx / unreachable / timeout → tier2=None and the validator degrades gracefully (composite drops to tier1+tier3+stub-1.0 weighting).
+
+- **Tier 3 — Gemma judge** (via existing `chat_manager`): samples 5 keyframes (first / quartile / middle / 3-quartile / last) from the clip, builds a multimodal request following the `/v2/char/rank` pattern at server.py:4307, sends to `CHAR_VISION_MODEL=gemma-4-31b-it`. New system prompt `JUDGE_PROMPT_V1` in `config.py` decides if the clip's actual motion matches the prompt's intent (catches the v0.4.6 "static-in-first-half then motion" defect class). Strict-JSON output, schema-validated via `JudgeResponseV1` Pydantic model (verdict ∈ {pass, warn, retake}, score ∈ [0, 1], reasoning, retake_hint). Schema violation / parse error / chat unreachable → returns a fallback `{verdict: "warn", score: 0.5}` so the composite still computes — never raises.
+
+**Composite scoring** (`validator.composite`): `0.4·tier1_dynamic + 0.2·tier2_stability + 0.4·tier3_score`. tier1 dynamic_degree is normalized via `min(dyn/5.0, 1.0)` (empirically healthy clips at width=256 sit in the 1-10 magnitude range). When tier2 is skipped or unreachable its slot contributes `0.2·1.0`; missing tier1 or tier3 collapses the composite to a partial weighted score and `notes` flags the dropped tier. Recommendation: `pass` ≥ 0.65, `warn` 0.45-0.65, `retake` < 0.45 OR tier3.verdict == "retake" (verdict-level override beats numeric composite).
+
+**Caching** via `validator_runs` table (added in rc1): keyed by UNIQUE `(video_sha256, validator_version)`. SHA-256 streamed from disk to avoid loading large clips into RAM. Cache hits return the persisted payload with `cached: true` injected. A `validator_version` bump forces fresh runs.
+
+**`POST /v2/video/analyze-motion`** (synchronous): body `{video_uri, prompt?, shot_uuid?, tiers?, validator_version?}` → composite payload + per-tier breakdown. Auth: bearer required when `API_KEYS` is non-empty (mirrors `/v2/video/extract-frames`). Reuses `validator.run_all_tiers()` so cache hits are instant. 404 on unknown URI; 500 with `analyze_motion_failed` envelope otherwise.
+
+**On-complete dispatch wiring**: `worker_loop`'s existing `on_complete(job)` callback (v1.8.2 / SEC P1-3 + verified in rc1) now chains to a new `_on_job_complete(job)` after the per-key counter decrement. Eligibility:
+
+- `job.status == COMPLETED` (failed / cancelled jobs skipped)
+- `job.type ∈ {TEXT_TO_VIDEO, IMAGE_TO_VIDEO, AUDIO_TO_VIDEO, RETAKE, VIDEO_OUTPAINT, VIDEO_HDR}`
+- `_is_training_opted_in(job.api_key)` — looks up `api_key_metadata.training_opt_in`. Default opt-out for unknown keys (single-tenant deploy seeded `.api_keys` with opt-in=1 on rc1's first migration; external bearers keep the default-off policy until explicitly INSERTed).
+
+When eligible, `asyncio.create_task(_dispatch_validator(job))` fires fire-and-forget — the queue worker dequeues the next job immediately, validator runs in the background. `_dispatch_validator` resolves the result_uri to a path, calls `validator.run_all_tiers`, then UPDATEs the matching `generations` row with `validator_score` + `validator_payload_json` + `validator_version` so `/v2/history/{id}` reads back the score on subsequent fetches.
+
+**Turbo-mode coordination**: `sapiens-sidecar` added to `_stop_cuda1_tenants` and `_restore_cuda1_tenants` in `server.py`. Mirrors the ACE / JoyAI / ERNIE pattern verbatim; both branches gated on `config.LOAD_SAPIENS`. Symmetric stop-on-entry + restore-on-exit.
+
+**Files**:
+
+- `sapiens_client.py` (NEW, 132 LOC) — httpx async client mirroring `madmom_client.py`.
+- `validator.py` (NEW, 510 LOC) — tier orchestration + composite + caching + Pydantic JudgeResponseV1.
+- `config.py` (+30 LOC) — `SAPIENS_SIDECAR_URL`, `SAPIENS_TIMEOUT_S`, `LOAD_SAPIENS`, `VALIDATOR_VERSION`, `VALIDATOR_ARTIFACTS_DIR`, `JUDGE_PROMPT_V1`.
+- `server.py` (+150 LOC) — `_on_job_complete`, `_is_training_opted_in`, `_dispatch_validator`, `/v2/video/analyze-motion`, sapiens turbo wiring.
+- `tests/test_v1_17_validator.py` (NEW, ~400 LOC) — 20 tests across composite scoring, cache hit/miss/version-bump, endpoint roundtrip, on-complete eligibility (video / non-video / opt-out / failed / unknown-key), turbo wiring, judge schema validation.
+
+**Default off**: `LOAD_SAPIENS=0` ships off; operator flips to `1` after diff review and `systemctl --user start sapiens-sidecar`. With LOAD_SAPIENS=0, tier2 is synthetic-skipped — composite still works, validator score available, identity-drift detection deferred until rc2 sidecar inference lands.
+
+**Dependencies added**: none. `torchvision.models.optical_flow.raft_small` is already available via the existing PyTorch 2.11 + torchvision 0.26 stack — verified at import time. RAFT weights download lazily on first call (~22 MB, cached to `~/.cache/torch/hub/checkpoints/`).
+
+20 new tests in `tests/test_v1_17_validator.py`; total suite now 193 tests, all green.
+
+---
+
 ## v1.17.0-rc1 — 2026-04-29
 
 ### Feat: schema v3 + composition lineage + retake provenance + api_key_metadata

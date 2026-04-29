@@ -136,6 +136,40 @@ MAX_MUSIC_PENDING = int(os.environ.get("MAX_MUSIC_PENDING", "5"))
 MADMOM_SIDECAR_URL = os.environ.get("MADMOM_SIDECAR_URL", "http://127.0.0.1:8095")
 LOAD_MADMOM = os.environ.get("LOAD_MADMOM", "1").lower() in ("1", "true", "yes")
 
+# sapiens-sidecar pose-temporal-stability service (v1.17.0-rc2) — port 8096,
+# tier-2 of the validator pipeline. Coexists with ACE on cuda:1 and is
+# stopped by `_stop_cuda1_tenants` on turbo entry. Default OFF for the rc2
+# ship; operator flips `LOAD_SAPIENS=1` after diff review.
+SAPIENS_SIDECAR_URL = os.environ.get("SAPIENS_SIDECAR_URL", "http://127.0.0.1:8096")
+SAPIENS_TIMEOUT_S = float(os.environ.get("SAPIENS_TIMEOUT_S", "60"))
+LOAD_SAPIENS = os.environ.get("LOAD_SAPIENS", "0").lower() in ("1", "true", "yes")
+
+# Validator pipeline (v1.17.0-rc2). `validator_runs` cache rows are keyed by
+# (video_sha256, validator_version) — bumping the version forces re-runs.
+VALIDATOR_VERSION = "1.17.0-rc2"
+VALIDATOR_ARTIFACTS_DIR = Path(
+    os.environ.get(
+        "VALIDATOR_ARTIFACTS_DIR",
+        "/mnt/nvme-1/servers/taco-backend/validator_artifacts",
+    )
+)
+
+# Tier-3 Gemma judge — system prompt v1. Decides whether a generated clip's
+# motion matches the prompt's motion intent. Returns strict JSON, schema-
+# validated server-side via `JudgeResponseV1` (mirrors CharRankResponse).
+JUDGE_PROMPT_V1 = """You are a video-quality judge for AI-generated music-video clips. Given:
+- The original prompt the user wrote
+- Optical-flow summary (tier1) showing motion magnitude over time
+- Pose temporal-stability summary (tier2, may be skipped)
+- 3-5 keyframes from the generated clip
+
+Decide if the clip's actual motion matches the prompt's motion intent.
+Watch for: static-in-first-half then motion (the v0.4.6 defect we fixed),
+identity drift, prompt-output mismatch.
+
+Return STRICT JSON: {"verdict": "pass"|"warn"|"retake", "score": 0.0-1.0,
+"reasoning": "...", "retake_hint": "specific prompt rewrite suggestion or null"}"""
+
 CHAT_API_BASE = "http://192.168.1.80:8080"  # External llama-swap server
 CHAT_MODEL = "gemma-3-12b-nvfp4"           # Model ID on the external server
 CHAR_VISION_MODEL = "gemma-4-31b-it"       # Vision model for Char mode ranking
