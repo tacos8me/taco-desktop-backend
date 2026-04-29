@@ -356,6 +356,16 @@ async def worker_loop(
                     enhanced_prompt=job.enhanced_prompt,
                     raw_request=job.raw_request,
                     gen_config_snapshot=job.gen_config_snapshot,
+                    # v1.17.0-rc1: lineage / provenance fields. All optional —
+                    # only retakes set parent_clip_id, only MCP-driven shots
+                    # set shot_uuid / shot_config_key, only the export pipeline
+                    # backfills composition_id. Absent → NULL in history row.
+                    parent_clip_id=_params.get("parent_clip_id"),
+                    shot_uuid=_params.get("shot_uuid"),
+                    shot_config_key=_params.get("shot_config_key"),
+                    composition_id=_params.get("composition_id"),
+                    lora_applied_id=_params.get("lora_applied_id"),
+                    lora_applied_strength=_params.get("lora_applied_strength"),
                 )
                 _job_id_for_log = job.id
                 _result_uri = job.result_uri

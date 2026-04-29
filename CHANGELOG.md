@@ -2,6 +2,43 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.17.0-rc1 — 2026-04-29
+
+### Feat: schema v3 + composition lineage + retake provenance + api_key_metadata
+
+First wave of the **capture + validator machine** (per `plans/melodic-sniffing-beacon.md`). Lays the data substrate so every clip generation, every retake, and every composition export becomes labeled training data downstream. v1.17.0-rc2 will follow with the validator sidecar wiring (RAFT + Sapiens-2 + Gemma judge); this RC is the schema and lineage groundwork only.
+
+**Schema v3** (additive, single-startup migration via `_migrate()`'s existing `PRAGMA user_version` ladder; pre-v3 rows get `NULL` in new columns; no backfill, no breaking changes):
+
+- 11 new nullable columns on `generations`:
+  - `validator_score REAL`, `validator_payload_json TEXT`, `validator_version TEXT`, `validator_artifact_uri TEXT`
+  - `parent_clip_id TEXT` — populated by `/v2/retake` so DPO pair construction can join (chosen=kept, rejected=retake) downstream
+  - `shot_uuid TEXT`, `shot_config_key TEXT` — cross-session shot identity + DPO pair-matching hash (filled by MCP orchestrator in v0.7.0)
+  - `composition_id TEXT` — denorm convenience for "which exported MV did this clip end up in"
+  - `lora_applied_id TEXT`, `lora_applied_strength REAL` — which LoRA actually fused at inference
+  - `prompt_embedding BLOB` — lazy-fill 3584-dim Gemma embedding (Phase B retrieval)
+- 3 indexes: `idx_gen_shot_config_key`, `idx_gen_parent_clip_id`, `idx_gen_composition_id`
+- 5 new tables (all `CREATE TABLE IF NOT EXISTS`, idempotent re-run safe):
+  - `composition_clips` — inverted-index of clips included in each composition export. PK `(comp_id, clip_history_id, position)`. Flash inserts (no `historyId`) write `clip_history_id=NULL` but still record their position.
+  - `validator_runs` — cached validator output keyed by `UNIQUE (video_sha256, validator_version)`. Re-runs after a version bump get fresh rows.
+  - `preference_pairs` — chosen-vs-rejected DPO training data. `signal_source` ∈ {`user_retake`, `validator`, `composition_kept`, `explicit_rating`}.
+  - `training_runs` — LoRA training-job ledger. `deployed_at` / `deprecated_at` track deployment lifecycle.
+  - `api_key_metadata` — per-key `training_opt_in INTEGER NOT NULL DEFAULT 1`. Single-tenant deploy default: ON globally. Future external bearers flip via one INSERT.
+- **First-time seed**: on initial v2→v3 migration (and only then), `api_key_metadata` is seeded from `.api_keys` with `training_opt_in=1` for every non-comment line. Subsequent migrations are no-ops; the table is the source of truth thereafter. `.api_keys` is only **read** during seed — never modified.
+
+**Wiring**:
+
+- `POST /v2/compositions/{id}/export` now writes one `composition_clips` row per clip (after the existing v1.16.3 `historyId | storage_uri` resolution) before submitting `JobType.EXPORT_COMPOSITION`. Best-effort: lineage-write failure does not block the export.
+- `POST /v2/retake` looks up the source `video_uri`'s history row via the new `find_id_by_result_uri()` helper and threads `parent_clip_id` through `job.params` so `worker_loop`'s `history.save()` records it on the new retake row. Unknown URIs (legacy clip / retention-expired / raw upload) → `parent_clip_id=NULL`, no error.
+- `_dispatch_job` / `_dispatch_job_turbo` / `_dispatch_job_turbo_remote` now strip the v3 history-only fields (`parent_clip_id`, `shot_uuid`, `shot_config_key`, `composition_id`, `lora_applied_id`, `lora_applied_strength`) from `job.params` before splatting into manager kwargs — they ride in `params` only so `worker_loop` can persist them.
+- `worker_loop` already had the `on_complete(job)` hook (v1.8.2 / SEC P1-3); verified wired through `_decr_queue_on_complete` in `server.py` startup. v1.17.0-rc2 will register a second callback for fire-and-forget validator dispatch.
+
+**No code change** to dispatch logic, sampler, or filter graph; **no schema breaking changes**. Existing callers and v0.6 MCP sessions continue working byte-identical. Restart taco-backend to run the migration on next boot.
+
+12 new tests in `tests/test_v1_17_schema.py` cover migration cleanliness, idempotency, v2→v3 upgrade preserving rows, `.api_keys` seeding (and idempotent re-seed), composition lineage write (regular + flash inserts), retake parent-id population (resolved + unknown URI), `validator_runs` UNIQUE constraint, `preference_pairs` round-trip, and `worker_loop`'s `on_complete` callback firing exactly once.
+
+---
+
 ## v1.16.4 — 2026-04-29
 
 ### Chore: scale rate-limit caps for heavy-MV operators
