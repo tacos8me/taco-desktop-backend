@@ -577,7 +577,7 @@ LTX and Flux target `cuda:0`. `config.py` sets `LTX_DEVICE = FLUX_DEVICE = "cuda
 - `DELETE /v2/batch/{batch_id}` — cancel remaining items
 - Items are sorted images-first (Klein before Dev) to minimize GPU swaps
 - Under turbo, `_batch_worker` uses `asyncio.gather` to process in parallel (2 local + up to MAX remote)
-- `MAX_BATCH_QUEUE_DEPTH` (default 5), `MAX_BATCH_ITEMS` (default 50)
+- `MAX_BATCH_QUEUE_DEPTH` (default 30, v1.16.4+), `MAX_BATCH_ITEMS` (default 50)
 - Supported item types: `text-to-image`, `image-to-image`, `image-edit`, `text-to-video`, `image-to-video`
 
 ## Keyframe symbolic indices

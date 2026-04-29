@@ -1,6 +1,6 @@
 # taco-backend — Complete API Reference
 
-**Server version:** v1.16.1 (2026-04-28)
+**Server version:** v1.18.0-rc3 (2026-04-29)
 **Public base URL:** `https://api.noodlefinger.io` *(canonical; Cloudflare-proxied via the shared `noodle` tunnel)*
 **LAN / dev base URL:** `http://<host>:8090` (uvicorn direct)
 
@@ -8,7 +8,7 @@
 **Source of truth:** `/mnt/nvme-1/servers/taco-backend/server.py`. This document is the client contract — any commit that adds, removes, or changes an endpoint (URL, method, request/response shape, status codes, auth) MUST update this file in the same commit.
 
 > **New to the API?** Start with [docs/QUICKSTART.md](./QUICKSTART.md). This doc is the exhaustive spec.
-> **See also:** [GPU architecture](./gpu-architecture.md) · [Model specs](./models.md) · [Configuration](./configuration.md) · [Operator tuning](./operator-tuning.md) (rate-limit + concurrency env vars, v1.16.1)
+> **See also:** [GPU architecture](./gpu-architecture.md) · [Model specs](./models.md) · [Configuration](./configuration.md) · [Operator tuning](./operator-tuning.md) (rate-limit + concurrency env vars; embeddings + sqlite-vec section, v1.18.0-rc2)
 
 ---
 
@@ -46,6 +46,7 @@ v1.12 adds **multi-frame video-segment chain conditioning** — a proper fix for
   - [`GET/POST /v1/system/config`](#get-v1systemconfig) · [`POST /v1/system/config/reset`](#post-v1systemconfigreset)
   - [`GET/POST /v1/system/flux-config`](#get-v1systemflux-config) · [`POST /v1/system/flux-config/reset`](#post-v1systemflux-configreset)
   - [`GET/POST /v1/system/sampler`](#get-v1systemsampler)
+  - [`POST /v1/system/lora/rollback`](#post-v1systemlorarollback) **(v1.18.0-rc3)** · [`POST /v2/system/bulk-revalidate`](#post-v2systembulk-revalidate-v1180-rc2) **(v1.18.0-rc2)**
 - [Uploads](#uploads) — [`POST /v1/upload`](#post-v1upload) · [`PUT /uploads/put/{upload_id}`](#put-uploadsputupload_id) · [`GET /uploads/get/{upload_id}`](#get-uploadsgetupload_id-v191)
 - [LoRA registries](#lora-registries) — [LTX](#ltx-loras) · [Flux](#flux-loras)
 - [v1 sync generation](#v1-sync-generation)
@@ -62,6 +63,8 @@ v1.12 adds **multi-frame video-segment chain conditioning** — a proper fix for
 - [Batch scheduler](#batch-scheduler) — [`POST /v2/batch`](#post-v2batch) · [`GET /v2/batch/{id}`](#get-v2batchbatch_id) · [`GET /v2/batch/{id}/result/{index}`](#get-v2batchbatch_idresultindex) · [`DELETE /v2/batch/{id}`](#delete-v2batchbatch_id)
 - [History](#history) — [`GET /v2/history`](#get-v2history) · [`GET /v2/history/{id}`](#get-v2historygeneration_id) · [`GET /v2/history/{id}/image`](#get-v2historygeneration_idimage) · [`GET /v2/history/{id}/thumbnail`](#get-v2historygeneration_idthumbnail) · [`DELETE /v2/history/{id}`](#delete-v2historygeneration_id)
 - [Chat & vision](#chat--vision) — [`POST /v1/chat/completions`](#post-v1chatcompletions) · [`POST /v2/char/rank`](#post-v2charrank)
+- [Validator pipeline](#validator-pipeline-v1170-rc2) **(v1.17.0-rc2)** — [`POST /v2/video/analyze-motion`](#post-v2videoanalyze-motion-v1170-rc2)
+- [Embeddings & retrieval](#embeddings--retrieval-v1180-rc2) **(v1.18.0-rc2)** — [`POST /v2/embeddings/search`](#post-v2embeddingssearch-v1180-rc2) · [`POST /v2/embeddings/recommend-loras`](#post-v2embeddingsrecommend-loras-v1180-rc2)
 - [Approved images](#approved-images) — [`POST /v1/approved-images`](#post-v1approved-images) · [`GET /v1/approved-images`](#get-v1approved-images) · [`GET /v1/approved-images/events`](#get-v1approved-imagesevents) · [`GET /v1/approved-images/{id}/file`](#get-v1approved-imagesimage_idfile)
 - [Compositions](#compositions)
 - [Video utilities](#video-utilities) — [`POST /v2/video/extract-frames`](#post-v2videoextract-frames-v1100) · [`POST /v2/video/extract-segment`](#post-v2videoextract-segment-v1120-experimental)
@@ -87,7 +90,7 @@ Authorization: Bearer <api-key>
 - **No-auth endpoints (public):** `GET /health`, `GET /v1/approved-images/events` (SSE, server-filtered by api_key_hash), `GET /v2/jobs/{id}/stream` (SSE, via bearer header or `?token=<sse-token>` query param — browsers use the query param since `EventSource` cannot set custom headers).
 - **Removed from public surface (v1.8.1):** `GET /dashboard` and `GET /v1/system/gpu` now require a bearer token and are ONLY served by the LAN-only admin companion on port 8099 (see `dashboard_server.py`). On the public host they respond with 401.
 - **Tenancy (v1.8.1 / SEC P0-1):** every `/v2/jobs/{id}` and `/v2/batch/{id}` endpoint enforces that the caller's bearer matches the resource's owner key. Cross-tenant access returns `404 Not found` with the same shape as an unknown ID (no existence oracle). Jobs and batches created before tenancy was enforced — or under auth-disabled mode — have an empty `api_key` and remain accessible to everyone (backwards-compat). History endpoints have always been tenancy-scoped via SQL `api_key_hash` filters.
-- **Admin gate (v1.8.2 / SEC P0-2):** 12 mutation endpoints — `POST /v1/system/{pause,resume,turbo,config,config/reset,flux-config,flux-config/reset,sampler,pool/remote-workers}` and `POST /v1/{flux,ltx}/{unload,reload}` — additionally require the caller's bearer to appear in `.admin_keys` (or `TACO_ADMIN_KEY`). Mismatch returns `403 admin_required`. If `.admin_keys` is empty, the server falls back to the backwards-compat bridge: every `.api_keys` entry is treated as admin and a WARN is logged at boot. Read endpoints (`GET /v1/system/{pool,config,flux-config,sampler}`) remain user-level (any valid bearer).
+- **Admin gate (v1.8.2 / SEC P0-2):** 12 mutation endpoints — `POST /v1/system/{pause,resume,turbo,config,config/reset,flux-config,flux-config/reset,sampler,pool/remote-workers}` and `POST /v1/{flux,ltx}/{unload,reload}` — additionally require the caller's bearer to appear in `.admin_keys` (or `TACO_ADMIN_KEY`). Mismatch returns `403 admin_required`. If `.admin_keys` is empty, the server falls back to the backwards-compat bridge: every `.api_keys` entry is treated as admin and a WARN is logged at boot. Read endpoints (`GET /v1/system/{pool,config,flux-config,sampler}`) remain user-level (any valid bearer). Admin-gated additions: `POST /v2/system/bulk-revalidate` (v1.18.0-rc2) and `POST /v1/system/lora/rollback` (v1.18.0-rc3).
 
 ### Error shape
 
@@ -134,8 +137,11 @@ Uploads and generated media are referenced by `storage://<uuid>` URIs, resolved 
 | Items per batch | `MAX_BATCH_ITEMS = 50` | `422` from Pydantic `max_length` |
 | Upload size | `MAX_UPLOAD_BYTES = 1 GiB` | `413` |
 | LoRA upload size | `MAX_LORA_SIZE_BYTES = 1 GiB` | `413` |
+| Embeddings + bulk-revalidate (per bearer) *(v1.18.0-rc2)* | token-bucket: `10 req/sec`, burst `10`, applied only to `/v2/embeddings/*` + `/v2/system/bulk-revalidate` | `429 {"error": "rate_limited"}` + `Retry-After: <s>` (computed from time-to-1-token) |
 
 > All four per-key / global queue caps are env-overridable. See [`docs/operator-tuning.md`](./operator-tuning.md) for the override pattern, validation steps, and a full operator-facing changelog of v1.16.1's HTTP-layer + systemd tuning.
+
+> The Phase B rate-limit (v1.18.0-rc2) is process-local and resets on restart. Buckets are keyed by `sha256(api_key)` so raw bearers never land in heap dumps. When `API_KEYS` is empty (auth-disabled deploy) the gate fails open. See `/v1/system/metrics` for the rolling counters (`embeddings_search_rate_limited`, etc.).
 
 ### System-wide state
 
@@ -590,6 +596,58 @@ Toggle sampler. Writes into `_gen_config` (same store as `/v1/system/config`).
 **Body:** `{"sampler": "cfg_pp" | "euler", "eta_stage1": 1.0, "eta_default": 0.0, "stage2_sigmas": [...]}`
 (all fields optional except `sampler`; server defaults `stage2_sigmas` to `[0.85, 0.725, 0.4219, 0.0]` when `sampler=cfg_pp` and `stage2_sigmas` is not provided)
 **Response:** `{"status": "ok", "sampler": "..."}`
+
+### `POST /v1/system/lora/rollback`
+
+**NEW in v1.18.0-rc3.** One-click rollback of the currently-deployed production LoRA when it regresses in the field. Marks the current run deprecated, finds the most-recent prior `deployed_at`-non-`deprecated_at` training run, and rewrites `MCP_PRODUCTION_LORA=` in `.env` atomically (or empty string if there is no prior production). Used together with the Phase C training pipeline shipped in v1.18.0-rc3 (`scripts/train_dpo_sft.py` + `scripts/ab_decision.py`).
+
+**Auth:** bearer **must** appear in `.admin_keys` (or match `TACO_ADMIN_KEY`). `403 admin_required` otherwise.
+
+**Body:**
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `lora_id` | string | required | non-empty; **must** equal the current `MCP_PRODUCTION_LORA` — guards against accidentally deprecating a non-production candidate |
+| `reason` | string \| null | `null` | free-form audit-trail string, logged at WARN |
+
+**Response (200):**
+
+```json
+{
+  "rolled_back_from": "run_2026_04_22_a",
+  "rolled_back_to": "run_2026_04_15_b",
+  "reason": "FE reports motion drift on portraits",
+  "applied_at": 1714415000.123,
+  "note": "MCP_PRODUCTION_LORA written to .env; restart mcp/taco-backend to fully apply"
+}
+```
+
+`rolled_back_to` is the empty string `""` when there is no prior production LoRA to fall back on.
+
+**Side effects:**
+- `UPDATE training_runs SET deprecated_at = now() WHERE run_id = <lora_id>` (no-op when the row is missing — operator may have registered the LoRA out-of-band; not an error).
+- `MCP_PRODUCTION_LORA=<rolled_back_to>` rewritten in `.env` via tmpfile + atomic rename.
+- `os.environ["MCP_PRODUCTION_LORA"]` updated in the live process. **MCP / taco-backend must be restarted to fully apply** — readers that already cached the value at boot keep using the old LoRA until they re-read `.env`.
+- Audit line at WARN: `PRODUCTION LORA ROLLBACK: from=<id> to=<id|<none>> reason=<...>`.
+
+**Status codes:**
+- `200` — rollback applied (incl. case where there was no prior production, returning `rolled_back_to=""`).
+- `400` `invalid_json` — body parse failure.
+- `400` `lora_id_required` — empty / missing `lora_id`.
+- `403` `admin_required` — bearer not in `.admin_keys`.
+- `409` — `lora_id` mismatch with current `MCP_PRODUCTION_LORA`. Body shape: `{"error": "lora_id mismatch: requested=<x> but current MCP_PRODUCTION_LORA=<y>"}`.
+
+**Curl:**
+
+```bash
+# since_version: 1.18.0-rc3
+curl -X POST "$API/v1/system/lora/rollback" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"lora_id":"run_2026_04_22_a","reason":"FE reports motion drift on portraits"}'
+```
+
+> See also: [Phase C training runbook](./PHASE_C_TRAINING_RUNBOOK.md) for the full A/B → promote → rollback loop.
 
 ---
 
@@ -1516,6 +1574,311 @@ Scale: 1-3 poor, 4-6 some resemblance, 7-8 good, 9-10 excellent. The system prom
 
 ---
 
+## Validator pipeline (v1.17.0-rc2)
+
+Three-tier composite quality scoring for video clips: **RAFT** in-process (optical flow / motion stats), **Sapiens** sidecar (pose temporal stability — currently stub-tolerant; real inference lands later), and a **Gemma vision judge** via the existing `chat_manager` proxy with strict-JSON schema validation. Composite formula `0.4·tier1 + 0.2·tier2 + 0.4·tier3`; recommendation `pass` ≥ 0.65, `warn` 0.45–0.65, `retake` < 0.45 (or any time the tier-3 verdict is `"retake"` — the verdict-level override beats numeric composite). Cached per `(video_sha256, validator_version)` in the `validator_runs` table; bumping `config.VALIDATOR_VERSION` (currently `1.17.0-rc5`) forces re-runs.
+
+The validator also fires fire-and-forget on every completed video job whose bearer is opt-in (see `api_key_metadata.training_opt_in`); the synchronous endpoint below is the operator/MCP-facing way to re-score on demand.
+
+### `POST /v2/video/analyze-motion` (v1.17.0-rc2)
+
+**Synchronous** — runs all three tiers (subject to `tiers` filter) and returns the composite payload.
+
+**Auth:** any valid bearer when `API_KEYS` is set. Open when auth is disabled.
+
+**Body:** `AnalyzeMotionRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `video_uri` | string | required | `storage://<uuid>` — resolved via `UploadStore`; `404 video_not_found` if unresolvable |
+| `prompt` | string | `""` | original generation prompt — fed to the tier-3 Gemma judge |
+| `shot_uuid` | string \| null | `null` | optional shot anchor from MCP shot lists; persisted into `validator_runs.shot_uuid` for downstream pair construction |
+| `motion_intent` | string \| null | `null` | ≤ 200 chars — operator's per-clip intent (e.g. `"static portrait"`, `"frenetic action"`). Tier-3 reconciles its verdict against this — supplying `"static"` keeps a low-motion clip from being retake'd. **Forwarded by MCP v0.7.0+** from `quality_validation.motion_intent_map`. *(v1.17.0-rc5)* |
+| `tiers` | list of `"raft"` \| `"sapiens"` \| `"gemma"` \| null | `null` | subset filter; `null` runs all enabled tiers |
+| `validator_version` | string \| null | `null` | overrides `config.VALIDATOR_VERSION` for cache-key purposes; pin only when intentionally re-scoring against a stale version |
+
+**Response (200):** the composite payload. Exact shape is the result of `validator.run_all_tiers(...)`:
+
+```json
+{
+  "validator_version": "1.17.0-rc5",
+  "video_uri": "storage://abc-123",
+  "composite_score": 0.71,
+  "recommendation": "pass",
+  "reasoning_summary": "RAFT motion 4.2; pose stable (stub); judge: dynamic match",
+  "tier1": {
+    "dynamic_degree": 4.21,
+    "flow_windows": [3.8, 4.5, 4.0, 4.6],
+    "motion_smoothness": 0.83
+  },
+  "tier2": {"stub": true},
+  "tier3": {
+    "verdict": "pass",
+    "score": 0.78,
+    "reasoning": "subject motion matches prompt 'walking dog'",
+    "retake_hint": null
+  },
+  "cached": false
+}
+```
+
+Field semantics:
+- `composite_score` — `null` when **all required tiers (tier1 AND tier3) failed**; recommendation is `"error"` in that case (v1.17.0-rc4 false-pass guard).
+- `recommendation` — one of `"pass"` / `"warn"` / `"retake"` / `"error"`.
+- `tier1` — RAFT optical-flow stats. `dynamic_degree` is the top-5% percentile of mean per-pair flow magnitude at 256-wide downsample.
+- `tier2` — Sapiens payload. `{"stub": true}` is the stub-mode response treated as "skipped, no penalty"; real pose stats land when `LOAD_SAPIENS=1` and the sidecar is wired.
+- `tier3` — Gemma judge response, validated against the `JudgeResponseV1` Pydantic schema. Falls back to `{verdict: "warn", score: 0.5}` on any LLM / parse failure so the composite still computes.
+- `cached` — `true` when the result was a `validator_runs` lookup; same `(video_sha256, validator_version)` returns instant.
+
+**Status codes:**
+- `200` — composite payload returned.
+- `401 "Missing API key"` — only when `API_KEYS` is configured.
+- `404 video_not_found` — `video_uri` does not resolve.
+- `500 analyze_motion_failed: <exc>` — tier orchestration error.
+
+**Curl:**
+
+```bash
+# since_version: 1.17.0-rc2
+curl -X POST "$API/v2/video/analyze-motion" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "video_uri": "storage://abc-123",
+    "prompt": "a cat walking through autumn leaves",
+    "motion_intent": "slow drift",
+    "shot_uuid": "shot-7"
+  }'
+```
+
+> See also: `GET /v1/system/metrics` (v1.17.0-rc5) for the validator dispatch counters (`success` / `failure` / `failure_rate_pct`, plus skip reasons) — handy when debugging silent on-complete validator outages.
+
+---
+
+## Embeddings & retrieval (v1.18.0-rc2)
+
+Phase B retrieval surface — semantic search over the caller's own past clips and per-LoRA performance ranking on similar prompts. Backed by the `clip_embeddings` sqlite-vec virtual table (3584-dim Gemma embeddings, float32-LE-packed). Every query is **hard-filtered by `api_key_hash` of the caller** — bearer A cannot ever surface bearer B's rows (verified by `test_embeddings_search_privacy_gate`).
+
+**Rate limit:** token-bucket, `10 req/sec/bearer`, burst `10`, applied to `/v2/embeddings/*` and `/v2/system/bulk-revalidate`. Returns `429 rate_limited` + `Retry-After` on exhaustion.
+
+**Extension prerequisite:** sqlite-vec must be loaded at boot. When the extension is missing, all three endpoints in this section return `503` with `embedding search not available — install sqlite-vec extension`. Backend boot does NOT fail in this case (graceful degrade); the operator-facing fix is `pip install sqlite-vec>=0.1.9` + restart.
+
+**Embedding model versioning:** every row in `clip_embeddings` carries an `embedding_model_version` tag (set by `chat_manager.embed`). When llama-swap rolls a new embeddings model, the version tag changes; readers can detect mismatches and trigger backfill via `scripts/backfill_prompt_embeddings.py`.
+
+### `POST /v2/embeddings/search` (v1.18.0-rc2)
+
+Ranked semantic search over the caller's past completed clips. Useful for "find similar shots", retrieval-augmented prompt assembly, and corpus inspection.
+
+**Auth:** any valid bearer when `API_KEYS` is set. When auth is disabled, the privacy gate degrades to a single global tenant (and an explicit `Bearer` header still scopes results to that bearer for test fixtures).
+
+**Body:** `EmbeddingsSearchRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | `5 ≤ len ≤ 2000` chars — semantic query |
+| `k` | int | `5` | `1 ≤ k ≤ 20` — number of results to return |
+| `min_validator_score` | float | `0.5` | `0.0 ≤ x ≤ 1.0` — drop rows whose `validator_score` is below this floor (NULL coerces to 0) |
+| `validator_version_filter` | string \| null | `null` | scoping filter; `null` resolves to current `config.VALIDATOR_VERSION` (`1.17.0-rc5`). Cross-version rows are excluded — a row's validator score is only meaningful within one version |
+| `genre` | string \| null | `null` | reserved for future genre-tag filtering. **Not yet wired** — accepted but ignored by the SQL today |
+
+**Ranking formula** (`final_score`, descending):
+
+```
+0.50 * similarity + 0.35 * validator_norm + 0.10 * recency + 0.05 * composition_kept
+```
+
+- `similarity = 1 / (1 + L2_distance)` — Gemma embeddings are unit-norm so this stays well-behaved in (0, 1].
+- `validator_norm = max(0, validator_score - 0.5) / 0.5` — only rewards above-warn rows.
+- `recency = exp(-age_days / 30)` — 30-day half-life decay.
+- `composition_kept = 1.0 if g.composition_id is set else 0.0` — clips that landed in a final export get a small bump.
+
+The SQL fetches `4 * k` candidates (capped at `k`), ranks them in Python, returns the top `k`.
+
+**Response (200):**
+
+```json
+{
+  "validator_version_filter": "1.17.0-rc5",
+  "results": [
+    {
+      "shot_id": "gen_01HX...",
+      "prompt": "a cat walking through autumn leaves",
+      "similarity_score": 0.872134,
+      "validator_score": 0.78,
+      "lora_applied_id": "run_2026_04_15_b",
+      "lora_applied_strength": 0.85,
+      "model": "ltx-2-3-fast",
+      "shot_uuid": "shot-7",
+      "in_final_composition": true,
+      "created_at": 1713984000.0,
+      "final_score": 0.745216
+    }
+  ]
+}
+```
+
+**Status codes:**
+- `200` — ranked results.
+- `401 "Missing API key"` — only when `API_KEYS` is configured.
+- `429 rate_limited` — token bucket exhausted; `Retry-After` set.
+- `500 "embedding search failed"` — sqlite-vec query error (`vec_distance_l2`, schema drift, etc.).
+- `503 "embedding search not available — install sqlite-vec extension"` — extension didn't load at boot.
+- `503 "embedding service unavailable"` — llama-swap `/v1/embeddings` proxy failed (timeout / connect error).
+
+**Metrics:** `embeddings_search_total` / `_success` / `_failure` / `_rate_limited` + rolling p50/p95 latency over the last 1000 calls — exposed via `GET /v1/system/metrics`.
+
+**Curl:**
+
+```bash
+# since_version: 1.18.0-rc2
+curl -X POST "$API/v2/embeddings/search" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "cinematic portrait of a woman walking through autumn leaves",
+    "k": 5,
+    "min_validator_score": 0.65
+  }'
+```
+
+### `POST /v2/embeddings/recommend-loras` (v1.18.0-rc2)
+
+Aggregates LoRA performance across the caller's top-50 most similar past shots. Returns ranked LoRAs by mean validator score plus a no-LoRA-baseline-relative `expected_boost`.
+
+**Auth:** same as `/v2/embeddings/search`.
+
+**Body:** `RecommendLorasRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `prompt` | string | required | `5 ≤ len ≤ 2000` chars — semantic query for "what would I generate next?" |
+| `motion_intent` | string \| null | `null` | ≤ 200 chars — reserved for future motion-aware ranking. **Accepted but not yet used** in the rank formula |
+| `k` | int | `3` | `1 ≤ k ≤ 10` — top-N LoRAs to return |
+| `min_validator_score` | float | `0.5` | `0.0 ≤ x ≤ 1.0` — score floor for shots considered (NULL → 0) |
+
+**Ranking formula** (`rank_score`, descending):
+
+```
+0.7 * mean_validator_score + 0.3 * max(0, expected_boost)
+```
+
+- `mean_validator_score` — per-LoRA mean across the top-50 similar shots.
+- `expected_boost = mean_validator_score - no_lora_baseline_mean` — improvement over the same caller's no-LoRA shots in the cohort. Clamped to ≥ 0 in the rank but reported raw in the response.
+- `mean_strength` — per-LoRA mean of `lora_applied_strength` across the cohort (informational).
+
+The response splits the no-LoRA group out as `no_lora_baseline_mean` for context; only LoRA-tagged groups appear in `recommendations`.
+
+**Response (200):**
+
+```json
+{
+  "recommendations": [
+    {
+      "lora_id": "run_2026_04_15_b",
+      "mean_validator_score": 0.812,
+      "sample_count": 12,
+      "mean_strength": 0.85,
+      "expected_boost": 0.064,
+      "rank_score": 0.587
+    }
+  ],
+  "total_samples": 47,
+  "no_lora_baseline_mean": 0.748
+}
+```
+
+When the cohort is empty (no opt-in similar shots above `min_validator_score`):
+
+```json
+{"recommendations": [], "total_samples": 0}
+```
+
+**Status codes:**
+- `200` — ranked recommendations (possibly empty).
+- `401 "Missing API key"` — only when `API_KEYS` is configured.
+- `429 rate_limited` — token bucket exhausted.
+- `500 "embedding search failed"` / `500 "recommend_loras_failed: <exc>"` — query / aggregation error.
+- `503 "embedding search not available"` — sqlite-vec missing.
+- `503 "embedding service unavailable"` — llama-swap embeddings proxy failed.
+
+**Metrics:** `recommend_loras_total` (counter only — no latency window).
+
+**Curl:**
+
+```bash
+# since_version: 1.18.0-rc2
+curl -X POST "$API/v2/embeddings/recommend-loras" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "wide cinematic establishing shot, golden hour",
+    "k": 3,
+    "min_validator_score": 0.65
+  }'
+```
+
+### `POST /v2/system/bulk-revalidate` (v1.18.0-rc2)
+
+**Admin** — re-runs the validator pipeline on rows whose `validator_version` differs from a target version (or is NULL). Defaults to `dry_run=true` so accidental invocations are inert; flip `dry_run=false` to actually queue work.
+
+**Auth:** bearer **must** appear in `.admin_keys` (or match `TACO_ADMIN_KEY`). `403 admin_required` otherwise. Also subject to the per-bearer 10 req/sec rate-limit.
+
+**Body:** `BulkRevalidateRequest`
+
+| Field | Type | Default | Constraint |
+|---|---|---|---|
+| `target_validator_version` | string | required | `1 ≤ len ≤ 64` — the version to revalidate **toward**. Rows where `validator_version != target` (or IS NULL) AND `result_uri IS NOT NULL` are selected |
+| `dry_run` | bool | `true` | `true` returns the count without writing; `false` queues fire-and-forget validator dispatches |
+| `limit` | int | `100` | `1 ≤ limit ≤ 10000` — caps how many rows are touched per call. Re-run the endpoint to drain large backlogs in chunks |
+
+**Response (200) — `dry_run=true`:**
+
+```json
+{
+  "dry_run": true,
+  "would_revalidate": 47,
+  "target_validator_version": "1.17.0-rc5",
+  "sample_ids": ["gen_01HX...", "gen_01HY..."]
+}
+```
+
+**Response (200) — `dry_run=false`:**
+
+```json
+{
+  "dry_run": false,
+  "queued": 47,
+  "target_validator_version": "1.17.0-rc5"
+}
+```
+
+`queued` is the number of fire-and-forget `_dispatch_validator` tasks actually spawned (skips rows whose `job_type` doesn't deserialize). Each task updates the row's `validator_score` / `validator_payload_json` / `validator_version` itself; failures are logged at WARN.
+
+**Status codes:**
+- `200` — selection or queue summary returned.
+- `403 admin_required` — bearer not in `.admin_keys`.
+- `429 rate_limited` — token bucket exhausted.
+
+**Curl:**
+
+```bash
+# since_version: 1.18.0-rc2 — dry-run first, always
+curl -X POST "$API/v2/system/bulk-revalidate" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"target_validator_version":"1.17.0-rc5","dry_run":true,"limit":500}'
+
+# Real run after reviewing the dry-run output:
+curl -X POST "$API/v2/system/bulk-revalidate" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"target_validator_version":"1.17.0-rc5","dry_run":false,"limit":500}'
+```
+
+> Operator note: `bulk_revalidate_total` counter exposed via `GET /v1/system/metrics`. The validator dispatch path is shared with the on-complete callback, so a large bulk revalidate competes with live traffic — chunk via `limit` and keep an eye on the dispatch failure rate.
+
+---
+
 ## Approved images
 
 A per-API-key "approved feed" — noodle-i approves an image, noodle-v watches the feed.
@@ -2129,6 +2492,11 @@ The **MCP** column lists the corresponding tier-1 wrapper tool from [docs/MCP.md
 | GET | `/v2/history/{id}/thumbnail` | yes | History thumbnail | — |
 | DELETE | `/v2/history/{id}` | yes | Delete history entry | — |
 | POST | `/v2/char/rank` | yes | Vision character consistency rank | — |
+| POST | `/v2/video/analyze-motion` | yes | **v1.17.0-rc2** Validator pipeline (RAFT + Sapiens + Gemma judge) | — |
+| POST | `/v2/embeddings/search` | yes | **v1.18.0-rc2** Semantic search over caller's clips (rate-limited) | — |
+| POST | `/v2/embeddings/recommend-loras` | yes | **v1.18.0-rc2** Per-LoRA performance ranking (rate-limited) | — |
+| POST | `/v2/system/bulk-revalidate` | admin | **v1.18.0-rc2** Re-run validator on stale rows (rate-limited) | — |
+| POST | `/v1/system/lora/rollback` | admin | **v1.18.0-rc3** Roll back current production LoRA + rewrite `.env` | — |
 | POST | `/v2/compositions` | yes | Create composition | `create_composition` |
 | GET | `/v2/compositions` | yes | List compositions | — |
 | GET | `/v2/compositions/{id}` | yes | Get composition | — |
@@ -2136,7 +2504,7 @@ The **MCP** column lists the corresponding tier-1 wrapper tool from [docs/MCP.md
 | DELETE | `/v2/compositions/{id}` | yes | Delete composition | — |
 | POST | `/v2/compositions/{id}/export` | yes | Enqueue export job | `export_composition` |
 
-**Total: 73 routes.**
+**Total: 78 routes** (v1.18.0-rc3: +5 since v1.16.1 — `analyze-motion`, `embeddings/search`, `embeddings/recommend-loras`, `system/bulk-revalidate`, `system/lora/rollback`).
 
 ---
 
@@ -2227,6 +2595,35 @@ curl -N -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/stream"
 curl -H "Authorization: Bearer $KEY" "$API/v2/jobs/$JOB/result" --output outpaint.mp4
 ```
 
+### Validator + retrieval (v1.17.0-rc2 / v1.18.0-rc2)
+
+```bash
+# Synchronous validator (RAFT + Sapiens + Gemma judge)
+curl -X POST "$API/v2/video/analyze-motion" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"video_uri":"storage://abc-123","prompt":"a cat walking","motion_intent":"slow drift"}'
+
+# Find similar past clips (Phase B)
+curl -X POST "$API/v2/embeddings/search" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"prompt":"cinematic portrait golden hour","k":5,"min_validator_score":0.65}'
+
+# What LoRA worked best on similar shots?
+curl -X POST "$API/v2/embeddings/recommend-loras" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"prompt":"wide establishing shot, autumn leaves","k":3}'
+
+# Admin: bulk-revalidate stale rows (always dry-run first)
+curl -X POST "$API/v2/system/bulk-revalidate" \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"target_validator_version":"1.17.0-rc5","dry_run":true,"limit":500}'
+
+# Admin: roll back the production LoRA
+curl -X POST "$API/v1/system/lora/rollback" \
+  -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"lora_id":"run_2026_04_22_a","reason":"motion drift on portraits"}'
+```
+
 ### Batch submit
 
 ```bash
@@ -2244,6 +2641,31 @@ curl -X POST "$API/v2/batch" \
 
 ## Changelog
 
+- **v1.18.0-rc3** (2026-04-29)
+  - **NEW (admin):** `POST /v1/system/lora/rollback` — one-click rollback of the currently-deployed production LoRA. Marks the run deprecated, finds the prior good run, rewrites `MCP_PRODUCTION_LORA=` in `.env` atomically. `409` on `lora_id` mismatch with current; restart required to fully apply. Audit-logged at WARN.
+- **v1.18.0-rc2** (2026-04-29)
+  - **NEW:** `POST /v2/embeddings/search` — semantic search over the caller's past clips, ranked by `0.50·sim + 0.35·validator + 0.10·recency + 0.05·composition_kept`. Hard-filtered by `api_key_hash` for tenant isolation.
+  - **NEW:** `POST /v2/embeddings/recommend-loras` — per-LoRA performance ranking against similar shots, with no-LoRA baseline + `expected_boost`.
+  - **NEW (admin):** `POST /v2/system/bulk-revalidate` — re-run validator on rows where `validator_version != target`. Defaults to `dry_run=true`.
+  - **Per-key rate-limit middleware:** token-bucket `10 req/sec`, burst `10`, applied to `/v2/embeddings/*` + `/v2/system/bulk-revalidate`. `429 rate_limited` + `Retry-After` on exhaustion.
+  - Process-local Phase B counters surfaced via `/v1/system/metrics` (`embeddings_search_total/success/failure/rate_limited`, rolling p50/p95 latency, `recommend_loras_total`, `bulk_revalidate_total`).
+  - `lora_applied_id` + `lora_applied_strength` now persisted on every video v2 endpoint — required by `recommend-loras` aggregation.
+  - Backed by sqlite-vec virtual table `clip_embeddings`; endpoints return `503` with a clear message when the extension didn't load (graceful boot).
+- **v1.18.0-rc1** (2026-04-29) — Schema v4 keystone migration. Additive nullable columns on `generations` (`motion_intent`, `embedding_model_version`), `preference_pairs` (`validator_version` + `idx_pp_unique_pair_source` UNIQUE for dedup), `training_runs` (`training_seed`, `hyperparams_json`, `dataset_snapshot_path`, `code_sha`, `validator_version_at_train`). No new endpoints.
+- **v1.17.0-rc5** (2026-04-29) — `motion_intent` field on `AnalyzeMotionRequest` (was being silently dropped by `extra="ignore"`); `JUDGE_PROMPT_V1` updated to read it; new `/v1/system/metrics` exposes validator dispatch counters (`success`, `failure`, `failure_rate_pct`, plus skip reasons). `config.VALIDATOR_VERSION` bumped to `1.17.0-rc5` (cache-invalidation — judge prompt text changed).
+- **v1.17.0-rc4** (2026-04-29) — Three downstream validator bugs fixed and one-time scrub of corrupted rc2/rc3 rows. Tier-1 RAFT now H/8-snaps for non-square inputs; tier-3 Gemma None-guards; composite returns `recommendation: "error"` (not silent `pass`) when both tier1 and tier3 fail. `validator_artifacts/` created at startup. `config.VALIDATOR_VERSION` bumped to `1.17.0-rc4`.
+- **v1.17.0-rc3** (2026-04-29) — `_stop_cuda1_tenants` now honors `LOAD_*` flags (no spurious `systemctl stop sapiens-sidecar` when `LOAD_SAPIENS=0`); `_is_training_opted_in` docstring corrected (default is opt-out for unknown bearers; code was already right).
+- **v1.17.0-rc2** (2026-04-29)
+  - **NEW:** `POST /v2/video/analyze-motion` — three-tier composite scoring (RAFT + Sapiens + Gemma judge). Cached per `(video_sha256, validator_version)` in `validator_runs`. Also fires fire-and-forget on completed video jobs for opt-in bearers.
+  - Sapiens sidecar at `127.0.0.1:8096`, gated on `LOAD_SAPIENS` (default `0` — operator flips after diff review). Stub-tolerant: `{"stub": true}` payloads contribute `0.2·1.0` to composite, not failed.
+  - Gemma judge response strict-validated against `JudgeResponseV1`; falls back to `{verdict: "warn", score: 0.5}` on any LLM/parse failure.
+  - Turbo coordination: `sapiens-sidecar` added to `_stop_cuda1_tenants` / `_restore_cuda1_tenants`.
+- **v1.17.0-rc1** (2026-04-29) — Schema v3 keystone (validator scoring fields + parent_clip_id + shot_uuid + shot_config_key + composition_id + lora_applied_* + prompt_embedding on `generations`; new `composition_clips` lineage, `validator_runs` cache, `preference_pairs`, `training_runs`, `api_key_metadata` tables). On-export composition lineage rows. Retake `parent_clip_id` populated. No new endpoints.
+- **v1.16.4** (2026-04-28) — Rate-limit caps scaled for heavy MV operators: `MAX_QUEUE_DEPTH 30→200`, `PER_KEY_QUEUE_CAP 15→100`, `PER_KEY_MUSIC_CAP 5→20`, `PER_KEY_BATCH_CAP 5→20`, `MAX_BATCH_QUEUE_DEPTH 5→30`. All env-overridable. Pure config bump.
+- **v1.16.3** — Export composition `storage_uri` fallback for clips without `historyId` (flash inserts).
+- **v1.16.2** — Composition export quality knobs (`output_encoder` / `output_crf` / `output_preset` / `output_profile` / `output_video_bitrate` / `output_audio_bitrate`); default switched to libx264 + CRF 18 + preset=medium + profile=high.
+- **v1.16.1** (2026-04-28) — Rate-limit caps + uvicorn `--limit-concurrency 200 --backlog 4096` + `LimitNOFILE=16384`. Gemma IT-NVFP4 snapshot SHA pin.
+- **v1.16.0** (2026-04-25) — `GEMMA_VARIANT=gemma-3-12b-it-nvfp4` (recommended for `enhance_prompt=true`); `analyzer="madmom"` on `POST /v1/music/analyze` (CPU-only sidecar at `127.0.0.1:8095`).
 - **v1.12.0** (2026-04-20)
   - **NEW (experimental):** `POST /v2/video/extract-segment` — extract a contiguous `8k+1` pixel-frame range (`k ∈ {1..4}`; default 9) from a stored MP4 and re-encode as a standalone H.264 MP4 upload. Same capability-URL / quota / semaphore pattern as `/v2/video/extract-frames`.
   - **NEW (experimental):** `segment_uri: string | null` field on `AudioToVideoRequest` and `ImageToVideoRequest`. 3-way mutually exclusive with `image_uri` and `keyframes` (422 on mixed specifications). Backend VAE-encodes the segment as a multi-latent-frame tensor and hard-pins 9 consecutive target pixel frames via a single `VideoConditionByLatentIndex` — replacing v1.11.5's single-pixel-frame-0 hard-pin, which drifted past seam 2.

@@ -62,8 +62,12 @@ Scale at runtime via `POST /v1/system/pool/remote-workers` (per-provider dict or
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_MUSIC_PENDING` | `5` | Max concurrent music generation jobs. Returns `429 music_queue_full` when exceeded |
-| `MAX_BATCH_QUEUE_DEPTH` | `5` | Max concurrent batch submissions |
+| `MAX_QUEUE_DEPTH` | `200` | Global pending-job ceiling across all bearers. v1.16.4 raised from 30. |
+| `MAX_BATCH_QUEUE_DEPTH` | `30` | Max concurrent batch submissions. v1.16.4 raised from 5. |
 | `MAX_BATCH_ITEMS` | `50` | Max items per single batch request (1-50) |
+| `PER_KEY_QUEUE_CAP` | `100` | Max in-flight jobs per bearer. v1.16.4 raised from 15. |
+| `PER_KEY_MUSIC_CAP` | `20` | Max in-flight music jobs per bearer. v1.16.4 raised from 5. |
+| `PER_KEY_BATCH_CAP` | `20` | Max in-flight batch submissions per bearer. v1.16.4 raised from 5. |
 | `AUTO_TURBO_IDLE_MINUTES` | `15` | Minutes of cuda:1 inactivity before an opportunistic turbo-mode elevation may occur |
 
 ### Paths
@@ -82,8 +86,12 @@ LOAD_JOYAI=1
 # LOAD_ERNIE=1           # Uncomment for ERNIE-Image (mutually exclusive with JoyAI on cuda:1)
 GEMMA_VARIANT=default
 MAX_MUSIC_PENDING=5
-MAX_BATCH_QUEUE_DEPTH=5
+MAX_QUEUE_DEPTH=200
+MAX_BATCH_QUEUE_DEPTH=30
 MAX_BATCH_ITEMS=50
+PER_KEY_QUEUE_CAP=100
+PER_KEY_MUSIC_CAP=20
+PER_KEY_BATCH_CAP=20
 # DUAL_GPU_LTX=1    # Uncomment for dedicated dual-GPU LTX mode
 # TORCH_COMPILE=1   # Uncomment to enable torch.compile (adds 60-120s warmup)
 # Remote-sidecar pool (v1.5 → v1.9.0 multi-provider) — leave URLs empty to disable

@@ -1,6 +1,6 @@
 # Operator tuning — rate limits, concurrency, fd ceilings, export quality
 
-> Server version: v1.16.4 (2026-04-29).
+> Server version: v1.18.0-rc3 (2026-04-29).
 > Audience: backend operator / on-call. Frontend / SDK callers should look at [API.md](./API.md) instead.
 
 This file documents the runtime-tunable knobs originally introduced in **v1.16.1** (after a 28 a2v / 1.5 s-pacing submission tripped `per_key_queue_full` on 24/28 first-pass submissions) and rescaled in **v1.16.4** for heavy-MV operators running 200-clip `cut_music_video` sessions with mcp v0.4.4+ parallel clip dispatch.
@@ -319,3 +319,267 @@ multi-tenant fairness ceiling.
 | 429 on every request | rate limit too tight for workload | tune `_EMBEDDINGS_RATE_LIMIT_*` |
 | Empty `results: []` despite known clips | privacy gate filter, OR opted-out bearer, OR validator_version filter mismatch | check `api_key_metadata.training_opt_in`; verify `validator_version_filter` matches actual rows |
 | `total_samples: 0` from /recommend-loras | no clips with `lora_applied_id` populated yet | submit a few jobs with `{"lora": {...}}` after rc2 deploy |
+
+---
+
+## Validator pipeline (v1.17.0-rc2+)
+
+Three-tier validator (RAFT motion + Sapiens pose + Gemma judge) runs
+fire-and-forget on every completed video job for opted-in bearers.
+Composite score lands in `generations.validator_score`; full payload in
+`generations.validator_payload_json`.
+
+### Env vars
+
+All registered in `config.py`. Restart `taco-backend` after changes.
+
+| Env var | Default | What it controls |
+|---|---|---|
+| `LOAD_SAPIENS` | `0` | Tier-2 sidecar gate. `0` = stub mode (composite uses `0.2·1.0` placeholder, never blocks). `1` = real Sapiens inference; requires `sapiens-sidecar` service running on cuda:1:8096. |
+| `SAPIENS_SIDECAR_URL` | `http://127.0.0.1:8096` | Tier-2 sidecar base URL. Override only for non-loopback deployments. |
+| `SAPIENS_TIMEOUT_S` | `60` | Per-request timeout in seconds. On timeout/5xx/ConnectError, tier2 returns `None` and the composite drops the tier2 weight (graceful degrade — never blocks the validator). |
+| `VALIDATOR_VERSION` | `1.17.0-rc5` | String used as `validator_runs(video_sha256, validator_version)` cache key. Bumping forces re-runs of all clips. Treat as immutable per release. |
+| `VALIDATOR_ARTIFACTS_DIR` | `<repo>/validator_artifacts/` | On-disk directory where tier dumps land for debugging. Safe to `rm -rf` between runs. |
+| `JUDGE_PROMPT_V1` | (long default in `config.py`) | Tier-3 system prompt for the Gemma judge. Override only when tuning the judge — schema-validated against `JudgeResponseV1` so a malformed prompt that breaks JSON output will surface as `tier3` fallback `verdict=warn / score=0.5`. |
+| `NOODLEFINGER_BEAT_MADMOM_MIN` | `0.55` | Minimum madmom downbeat-confidence score to use madmom output; below this the orchestrator falls back to librosa. |
+| `NOODLEFINGER_BEAT_LIBROSA_MIN` | `0.40` | Minimum librosa beat-confidence floor before the analyzer returns a degraded-quality warning. |
+
+### Enabling the Sapiens sidecar (tier 2)
+
+Tier 2 ships in stub mode for the rc2 → rc5 window. Flip on after diff
+review:
+
+```bash
+# 1. Add to .env (or env source loaded by run.sh):
+echo "LOAD_SAPIENS=1" >> .env
+
+# 2. Enable + start the sidecar unit:
+systemctl --user enable --now sapiens-sidecar
+
+# 3. Restart taco-backend so config picks up LOAD_SAPIENS:
+systemctl --user restart taco-backend
+
+# 4. Confirm the sidecar is alive:
+curl -sS http://127.0.0.1:8096/health
+# → {"status":"ok",...}
+```
+
+Turbo-mode coordination is automatic: `sapiens-sidecar` is in
+`_stop_cuda1_tenants` + `_restore_cuda1_tenants` (gated on
+`LOAD_SAPIENS`), so turbo entry will stop it and exit will restart it
+just like ACE / JoyAI / ERNIE.
+
+### Verification
+
+After dispatching a video job, the validator runs as a
+fire-and-forget task. Confirm scores are landing:
+
+```bash
+sqlite3 history.db \
+  "SELECT id, validator_score, validator_version
+   FROM generations
+   WHERE validator_score IS NOT NULL
+   ORDER BY created_at DESC LIMIT 5"
+```
+
+For a healthy pipeline, `validator_score` should populate within
+~1-3 s of the video MP4 hitting disk. NULL across recent rows means
+the dispatch is being skipped — check the metrics counter:
+
+```bash
+KEY=$(grep -v '^#' .api_keys | grep -v '^$' | head -1)
+curl -sS -H "Authorization: Bearer $KEY" \
+  http://localhost:8090/v1/system/metrics | jq .validator_dispatch
+```
+
+Counter shape: `{success, failure, skipped_not_video,
+skipped_opt_out, skipped_validator_disabled, failure_rate_pct}`.
+High `skipped_opt_out` means the bearer's `api_key_metadata.training_opt_in`
+is 0 (validator dispatch is gated on training opt-in). High
+`failure` with non-trivial `failure_rate_pct` means the
+validator itself is erroring — `journalctl --user -u taco-backend |
+grep validator` for the WARN line.
+
+### Synchronous one-off — `POST /v2/video/analyze-motion`
+
+Use to validate a single clip without going through the queue.
+Reuses `validator.run_all_tiers()` directly. Body:
+`{video_uri, prompt?, shot_uuid?, tiers?, validator_version?}`.
+Useful for ad-hoc diagnosis without polluting `validator_runs`
+cache (synchronous endpoint still writes the cache row, keyed by
+the SHA-256 of the resolved file).
+
+---
+
+## Phase C training setup (v1.18.0-rc3+)
+
+Phase C ships training infrastructure (preference-pair ETL +
+SFT-on-chosen LoRA training + A/B promotion harness). The first
+real training run waits until the preference-pair corpus crosses
+~1000 high-strength pairs (~6-8 weeks of organic traffic). All
+scripts default to dry-run / opt-in semantics; nothing trains
+without explicit operator action.
+
+### Pre-flight checklist
+
+Before kicking off the first training run:
+
+1. **Corpus**: `sqlite3 history.db "SELECT COUNT(*) FROM preference_pairs WHERE signal_strength >= 0.5 AND validator_version = '<your-version>'"` ≥ 1000. (default trainer floor; raise to 0.7 if you want to require validator_pass-or-better signal only)
+2. **Window**: schedule the run during off-hours — SFT uses the
+   full LTX 22B base for ~50-60 GPU-hours on a single Blackwell.
+   Throughout the run cuda:0 is unavailable for inference; turbo +
+   cuda:1 sidecar can keep video flowing on a separate GPU but
+   throughput is halved.
+3. **Backup**: `cp history.db history.db.pre-train-$(date +%F)`.
+   Training itself never writes to `generations` rows, but the
+   `INSERT` into `training_runs` and `UPDATE preference_pairs SET
+   used_in_training_run_id` are post-hoc auditable; keep a
+   pristine snapshot anyway.
+4. **Validator version freeze**: confirm `VALIDATOR_VERSION` has
+   not been bumped mid-corpus — pairs across mixed validator
+   versions are filtered out by `construct_preference_pairs.py`,
+   but a recent bump can silently halve the eligible corpus.
+
+### Weekly preference-pair construction
+
+Cron candidate (run weekly, e.g. Sundays 03:00):
+
+```bash
+cd /mnt/nvme-1/servers/taco-backend
+uv run --no-sync python scripts/construct_preference_pairs.py --since-watermark
+```
+
+`--since-watermark` (default) is incremental — reads
+`.preference_pairs_watermark`, includes only `generations` rows
+created after, then writes `time.time()` back on success. Use
+`--full-rebuild` once after the rc3 schema migration to backfill
+historical rows; subsequent runs should be incremental. `--dry-run`
+reports counts without writing.
+
+The script is idempotent (`INSERT OR IGNORE` on
+`idx_pp_unique_pair_source`) — re-running is safe.
+
+### First training run
+
+Defense-in-depth: defaults to `dry_run=True`. `--execute` is the
+consent gate.
+
+```bash
+# (1) Dry run — no GPU, no DB writes; prints expected dataset size:
+uv run --no-sync python scripts/train_dpo_sft.py \
+  --config configs/sft_quality_lora.yaml
+
+# (2) Real run — claims cuda:0 for ~50-60 hours:
+uv run --no-sync python scripts/train_dpo_sft.py \
+  --config configs/sft_quality_lora.yaml --execute
+
+# (3) Resume from checkpoint after interruption:
+uv run --no-sync python scripts/train_dpo_sft.py \
+  --config configs/sft_quality_lora.yaml --execute \
+  --resume-from training_runs/sft-quality-v0.0.1/checkpoint-2/
+```
+
+Output artifact lands in `loras/<run_id>/` and a row is appended to
+`training_runs` with full reproducibility metadata
+(seed/hyperparams/dataset snapshot/code SHA/validator_version).
+The trained LoRA is registered as a candidate — **NOT** auto-deployed.
+A/B promotion is the next gate.
+
+### A/B promotion harness
+
+Set in `.env` and restart taco-backend + mcp:
+
+```
+AB_TEST_ACTIVE=1
+AB_CANDIDATE_LORA=sft-quality-v0.0.1
+AB_AUTO_PROMOTE=1     # set 0 for operator-gated decision-only mode
+```
+
+When active, the mcp orchestrator's `_normalize_input` tags each
+MV session with `_ab_arm` (baseline vs candidate) at coin-flip
+50/50. Weekly cron runs the decision script:
+
+```bash
+AB_CANDIDATE_LORA=sft-quality-v0.0.1 \
+  uv run --no-sync python scripts/ab_decision.py
+```
+
+Promotion thresholds (paired t-test on per-MV mean
+`validator_score`):
+
+- **PROMOTE** iff `delta >= +10%` AND `p < 0.05`.
+- **DEPRECATE** iff `delta <= -5%` AND `p < 0.05`.
+- Otherwise: NO ACTION.
+
+Insufficient-samples rule: ≥ 30 MVs per arm before any decision.
+With `AB_AUTO_PROMOTE=0` the decision is logged and a row is
+written but `MCP_PRODUCTION_LORA` is **not** rotated — the
+operator runs the rollback / promote endpoint manually.
+
+---
+
+## Rollback procedures
+
+### LoRA rollback
+
+`POST /v1/system/lora/rollback` deprecates the current production
+LoRA and rolls `MCP_PRODUCTION_LORA` back to the previous
+deployed-and-not-deprecated training run. Admin-keyed (per
+`.admin_keys` / `TACO_ADMIN_KEY`).
+
+```bash
+ADMIN_KEY=$(cat .admin_keys | grep -v '^#' | head -1)
+CURRENT=$(grep MCP_PRODUCTION_LORA .env | cut -d= -f2)
+
+curl -sS -X POST http://localhost:8090/v1/system/lora/rollback \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"lora_id\": \"$CURRENT\", \"reason\": \"validator_score regression in arm A vs baseline\"}"
+```
+
+Response shape: `{rolled_back_from, rolled_back_to, reason,
+applied_at, note}`. The `lora_id` field MUST match the current
+production value — guards against accidentally deprecating a
+non-production candidate. Mismatch returns `409`.
+
+The new value is written to `.env`. **Restart `taco-backend` and
+`mcp` to fully apply** — the endpoint does not hot-swap in-process
+state; the next cold start re-reads `.env`.
+
+If no prior good production LoRA exists, `rolled_back_to` is the
+empty string and `MCP_PRODUCTION_LORA` is cleared (mcp falls back
+to no-LoRA generation).
+
+### Schema rollback
+
+**Don't.** All v1.17.0-rc1+ migrations are additive — new
+nullable columns + new tables, no destructive ALTERs. Pre-migration
+rows get NULL in new columns and continue to read fine after
+upgrade. To "roll back" you would either:
+
+- Run an older taco-backend binary against the upgraded DB —
+  works as long as the binary doesn't reject unknown
+  `PRAGMA user_version`. v1.16.x readers tolerate v3 / v4
+  schemas because all reads use named columns.
+- Or restore from a pre-upgrade `history.db` backup if you took
+  one. Forward-only is the supported path.
+
+### Validator version downgrade
+
+`config.VALIDATOR_VERSION` is a free-form string; older scores
+remain valid because `validator_runs` is keyed by
+`(video_sha256, validator_version)` UNIQUE — downgrading just
+means new dispatches will look up a different cache row.
+
+```bash
+# In config.py, revert the constant:
+# VALIDATOR_VERSION = "1.17.0-rc5"  →  VALIDATOR_VERSION = "1.17.0-rc4"
+systemctl --user restart taco-backend
+```
+
+Old `generations.validator_score` rows scored under rc5 are
+preserved — no backfill, no deletion. New dispatches re-score
+under rc4 and land in fresh `validator_runs` rows. Phase C
+training scripts filter pairs by `validator_version` so a
+downgrade does not poison the training corpus; it just shrinks
+the eligible window until enough rc4 scores accumulate.
