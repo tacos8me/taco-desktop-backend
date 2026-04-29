@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy as _copy
 import json as _json_mod
+import os
 import subprocess
 import time
 import torch
@@ -2784,6 +2785,133 @@ async def set_sampler_config(request: Request) -> JSONResponse:
     elif sampler == "cfg_pp":
         split_model_manager._gen_config["stage2_sigmas"] = [0.85, 0.725, 0.4219, 0.0]
     return JSONResponse(content={"status": "ok", "sampler": sampler})
+
+
+# ---------------------------------------------------------------------------
+# Phase C — production LoRA rollback (v1.18.0-rc3)
+#
+# One-click rollback when a candidate LoRA promoted by ab_decision.py
+# starts producing regressions in the field. Sets `deprecated_at = now()`
+# on the matching `training_runs` row and rewrites the
+# `MCP_PRODUCTION_LORA` line in `.env` to the previous good run_id (or
+# empty string if there's no prior production). Audit trail in logs.
+# ---------------------------------------------------------------------------
+
+
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
+
+
+def _read_env_lora() -> str:
+    """Best-effort read of MCP_PRODUCTION_LORA from .env.
+
+    Falls back to the env var (process-loaded value) when the file is
+    unreadable. Returns empty string when neither is set.
+    """
+    val = os.environ.get("MCP_PRODUCTION_LORA", "")
+    if _ENV_PATH.exists():
+        try:
+            for line in _ENV_PATH.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("MCP_PRODUCTION_LORA="):
+                    return stripped.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    return val
+
+
+def _write_env_lora(new_value: str) -> None:
+    """Rewrite (or append) MCP_PRODUCTION_LORA= in .env atomically."""
+    lines: list[str] = []
+    found = False
+    if _ENV_PATH.exists():
+        for line in _ENV_PATH.read_text().splitlines():
+            if line.strip().startswith("MCP_PRODUCTION_LORA="):
+                lines.append(f"MCP_PRODUCTION_LORA={new_value}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"MCP_PRODUCTION_LORA={new_value}")
+    tmp = _ENV_PATH.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(_ENV_PATH)
+    os.environ["MCP_PRODUCTION_LORA"] = new_value
+
+
+@app.post("/v1/system/lora/rollback")
+async def lora_rollback(request: Request) -> JSONResponse:
+    """Roll back the current production LoRA to the previous good one.
+
+    Body: ``{"lora_id": str, "reason": str | None}``. ``lora_id`` MUST
+    match the currently-deployed value in MCP_PRODUCTION_LORA — guards
+    against accidentally deprecating a non-production candidate.
+
+    Behavior:
+      1. Verify ``lora_id`` is the current production LoRA.
+      2. Set ``training_runs.deprecated_at = now()`` for that run_id.
+      3. Find the previous deployed-and-not-deprecated training run.
+      4. Update MCP_PRODUCTION_LORA env var + .env file to the previous
+         run_id (or empty string if there's no prior production).
+      5. Return audit summary.
+
+    NOTE: rolled-back-to value applies on the NEXT taco-backend / mcp
+    process restart that re-reads .env. The endpoint does not hot-swap
+    in-process state.
+    """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "invalid_json")
+    lora_id = (body.get("lora_id") or "").strip()
+    reason = body.get("reason")
+    if not lora_id:
+        return _error(400, "lora_id_required")
+
+    current = _read_env_lora()
+    if lora_id != current:
+        return _error(
+            409,
+            f"lora_id mismatch: requested={lora_id!r} but current MCP_PRODUCTION_LORA={current!r}",
+        )
+
+    now = time.time()
+    # Mark deprecated. Tolerate missing row — operator might have a
+    # production LoRA registered out-of-band.
+    history._conn.execute(
+        "UPDATE training_runs SET deprecated_at = ? WHERE run_id = ?",
+        (now, lora_id),
+    )
+
+    # Find the previous good production LoRA (deployed, not deprecated,
+    # not the one we just deprecated).
+    prev_row = history._conn.execute(
+        """SELECT run_id FROM training_runs
+           WHERE deployed_at IS NOT NULL
+             AND deprecated_at IS NULL
+             AND run_id != ?
+           ORDER BY deployed_at DESC
+           LIMIT 1""",
+        (lora_id,),
+    ).fetchone()
+    history._conn.commit()
+
+    rolled_back_to = prev_row["run_id"] if prev_row else ""
+    _write_env_lora(rolled_back_to)
+
+    logger.warning(
+        "PRODUCTION LORA ROLLBACK: from=%s to=%s reason=%s",
+        lora_id, rolled_back_to or "<none>", reason,
+    )
+    return JSONResponse(content={
+        "rolled_back_from": lora_id,
+        "rolled_back_to": rolled_back_to,
+        "reason": reason,
+        "applied_at": now,
+        "note": "MCP_PRODUCTION_LORA written to .env; restart mcp/taco-backend to fully apply",
+    })
 
 
 @app.post("/v1/text-to-video")

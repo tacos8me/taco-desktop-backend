@@ -2,6 +2,43 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.18.0-rc3 — 2026-04-29
+
+### Feat: Phase C training infrastructure (preference_pairs ETL + train_dpo_sft + A/B framework + lora_registry rollback)
+
+Closes the v1.18.0 sprint by shipping the **infrastructure** for Phase C SFT-on-chosen LoRA training — pair construction ETL, training script (LoRA-only, paged_adamw_32bit, gradient_checkpointing), A/B decision script, sft_quality_lora.yaml config, and the production LoRA rollback admin endpoint. **Infrastructure-only — no first training run.** The first invocation waits until the corpus crosses ~1000 pairs (~6-8 weeks from now at single-operator volume); operator-driven, not automatic.
+
+User-locked: SFT-on-chosen for v1, Diffusion-DPO deferred to Phase C.1.
+
+**`scripts/construct_preference_pairs.py`** (NEW, ~360 LOC): weekly cron ETL across four signal sources, version-scoped, idempotent. Sources:
+
+- `user_retake` (signal_strength 0.9) — retake winner vs parent via `parent_clip_id` lineage from rc1.
+- `composition_kept` (0.5) — clips kept in a final composition (canonical lineage in `composition_clips`) vs same-`shot_config_key` clips that weren't kept.
+- `validator_pass` (0.7) — pass-tier (≥0.65) vs warn-tier (0.45-0.65) within same shot cohort.
+- `validator_fail` (0.3) — synthetic negatives: pass-tier (≥0.65) vs retake-tier (<0.45) within same cohort.
+
+Each source SELECT filters by `validator_version`, `api_key_metadata.training_opt_in = 1` (privacy gate), and a `since_watermark` epoch (read from `.preference_pairs_watermark`). All inserts use `INSERT OR IGNORE` against the rc1 `idx_pp_unique_pair_source` UNIQUE index `(chosen_clip_id, rejected_clip_id, signal_source)` — re-runs are no-ops. CLI: `--since-watermark` (default), `--full-rebuild`, `--validator-version`, `--dry-run`, `--source` (debug filter).
+
+**`scripts/train_dpo_sft.py`** (NEW, ~360 LOC): SFT-on-chosen training script modeled on `LTX-2/packages/ltx-trainer/scripts/train.py`. Defense-in-depth: **defaults to `dry-run`**; requires explicit `--execute` to consume GPU. Pipeline: SELECT chosen_clip_ids by `signal_strength >= cfg.min_signal_strength` AND `validator_version = cfg.validator_version` AND `used_in_training_run_id IS NULL` (one row per unique chosen — chosen-only SFT) → snapshot dataset to `training_runs/<run_id>/dataset.jsonl` → 90/10 train/eval held-out → load ltx-2.3 base + PEFT `LoraConfig` (rank/alpha/target_modules from yaml) → `LtxvSFTTrainer` (bf16 + paged_adamw_32bit + gradient_checkpointing, LoRA-only) → save artifact + persist `training_runs` row with FULL reproducibility metadata (`training_seed`, `hyperparams_json`, `dataset_snapshot_path`, `code_sha` from `git rev-parse HEAD`, `validator_version_at_train` — all rc1 v4 columns) → `UPDATE preference_pairs SET used_in_training_run_id = run_id` for consumed pairs → register in `lora_registry` as candidate (NOT auto-deployed). Heavy imports (`peft`, `torch`, `ltx_trainer`) are gated behind the `--execute` branch so dry-run + tests don't pull bitsandbytes / training-stack into the import graph.
+
+**`scripts/ab_decision.py`** (NEW, ~270 LOC): weekly cron, paired t-test on per-MV mean validator_score across `_ab_arm = 'candidate'` vs `_ab_arm = 'baseline'` cohorts. MV grouping = `composition_id`. Decision matrix: `promote` if delta ≥ +10% AND p < 0.05; `deprecate` if delta ≤ -5% AND p < 0.05; `insufficient_samples` if <30 MVs/arm; else `no_action`. `AB_AUTO_PROMOTE=1` (default) sets `deployed_at` / `deprecated_at` on `training_runs`; `=0` reports decisions without writing. Reads `AB_CANDIDATE_LORA` from env or `--candidate-lora`. Includes a manual Welch's t-test fallback so the cron isn't gated on scipy availability (regularized incomplete-beta via Lentz's method, sufficient precision for the p<0.05 gate).
+
+**`configs/sft_quality_lora.yaml`** (NEW): v0.0.1 config — rank=64, alpha=64, target_modules=[q_proj, k_proj, v_proj, out_proj], 3 epochs, lr=5e-4, seed=42, paged_adamw_32bit. `validator_version: null` resolves at runtime to `config.VALIDATOR_VERSION` (recommended; pin a literal only when intentionally training against a stale version).
+
+**`POST /v1/system/lora/rollback`** (NEW admin endpoint, ~85 LOC in `server.py`): one-click rollback when a deployed LoRA regresses in the field. Body: `{lora_id: str, reason: str | None}`. Verifies `lora_id == current MCP_PRODUCTION_LORA` (returns `409` on mismatch, guards against deprecating non-production candidates) → sets `training_runs.deprecated_at = now()` → finds the previous deployed-and-not-deprecated training run → rewrites `MCP_PRODUCTION_LORA=<previous>` in `.env` atomically (or empty string when there's no prior production) → returns `{rolled_back_from, rolled_back_to, reason, applied_at, note}`. Audit-trail logged at WARN. **Rolled-back value applies on next process restart** that re-reads `.env` — endpoint does not hot-swap in-process state. `_require_admin` gating mirrors `/v1/system/turbo` and `/v1/system/pause`.
+
+**Privacy gate spine**: every source query filters by `api_key_metadata.training_opt_in = 1`. Opt-out bearers' clips never enter training. Verified by `test_construct_pairs_privacy_gate`.
+
+**Validator-version scoping spine**: cross-version pairs cannot enter training. The schema-v4 UNIQUE index keys on `(chosen, rejected, signal_source)`; the `validator_version` column is checked in the SELECT before INSERT. Verified by `test_construct_pairs_version_scoping`.
+
+15 new tests in `tests/test_v1_18_phase_c.py`: `test_construct_pairs_user_retake_source`, `test_construct_pairs_composition_kept_source`, `test_construct_pairs_validator_pass_source`, `test_construct_pairs_validator_fail_source`, `test_construct_pairs_version_scoping`, `test_construct_pairs_dedup_via_unique_index`, `test_construct_pairs_privacy_gate`, `test_construct_pairs_idempotent`, `test_train_dpo_sft_dry_run_no_writes`, `test_train_dpo_sft_metadata_persistence`, `test_ab_decision_insufficient_samples`, `test_ab_decision_promotes_clear_winner`, `test_ab_decision_deprecates_clear_loser`, `test_lora_rollback_updates_env_and_db`, `test_lora_rollback_mismatch_returns_409`. Suite is now 245 green (was 230).
+
+**Live-DB smoke** (run today against the 4-week-accumulated `history.db`): all four sources return 0 — no `parent_clip_id` rows, no `shot_config_key` rows, validator scores all on `1.17.0-rc2` (current is `rc5`). This is expected: capture-side wiring (rc1 retake provenance + shot_config_key writes) shipped, but pre-rc1 history rows have NULL in those columns; new rows accumulate behind the rc5 validator. Pair construction will start finding signal once the rc5+ corpus crosses ~100 retakes.
+
+**Operator runbook**: see `docs/PHASE_C_TRAINING_RUNBOOK.md` for pre-flight, weekly cron config, first training run, A/B monitoring, rollback CLI.
+
+No restart required for the scripts (they invoke as one-shots). The `/v1/system/lora/rollback` endpoint is the only `server.py` change in rc3 — restart taco-backend to pick it up.
+
 ## v1.18.0-rc2 — 2026-04-29
 
 ### Feat: Phase B retrieval backend (sqlite-vec + embeddings + 3 new endpoints + lora persistence)

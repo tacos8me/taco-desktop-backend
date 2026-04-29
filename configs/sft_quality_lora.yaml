@@ -1,0 +1,43 @@
+# SFT quality LoRA config — v0.0.1 (Phase C v1)
+#
+# First training run waits until the corpus crosses ~1000 pairs.
+# Run with:
+#   uv run python scripts/train_dpo_sft.py --config configs/sft_quality_lora.yaml
+# (defaults to dry-run; pass --execute to actually train; ~50-60 GPU-hours)
+
+run_id: "sft-quality-v0.0.1"
+base_model_path: "/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/ltx-2.3-22b-distilled-1.1.safetensors"
+
+# null → resolve at runtime to config.VALIDATOR_VERSION (recommended;
+# pin to a literal only when intentionally training against a stale
+# validator version).
+validator_version: null
+min_signal_strength: 0.5
+
+# LoRA hyperparams
+rank: 64
+alpha: 64
+target_modules:
+  - q_proj
+  - v_proj
+  - k_proj
+  - out_proj
+
+# Training
+epochs: 3
+learning_rate: 5.0e-4
+seed: 42
+gradient_accumulation_steps: 4
+per_device_train_batch_size: 1
+
+# Frozen at training time into training_runs.hyperparams_json for
+# downstream reproducibility / postmortem analysis.
+hyperparams:
+  rank: 64
+  alpha: 64
+  epochs: 3
+  learning_rate: 5e-4
+  optimizer: paged_adamw_32bit
+  bf16: true
+  gradient_checkpointing: true
+  seed: 42
