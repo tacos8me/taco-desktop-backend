@@ -1464,6 +1464,19 @@ def _resolve_lora(body) -> tuple[str | None, float] | JSONResponse:
     return str(lora_registry.resolve_path(body.lora.id)), body.lora.strength
 
 
+def _lora_applied_pair(body) -> tuple[str | None, float | None]:
+    """Return (lora_id, strength) for history persistence, or (None, None).
+
+    v1.18.0-rc2 — Phase B `recommend_loras` reads `generations.lora_applied_id`
+    so we capture the *registry id* (not the path) at submit time. The id is
+    stable across moves; the path is not.
+    """
+    lora = getattr(body, "lora", None)
+    if not lora:
+        return None, None
+    return lora.id, lora.strength
+
+
 def _resolve_flux_lora(body) -> tuple[str | None, float] | JSONResponse:
     """Resolve optional Flux LoRA from request. Returns (path, strength) or JSONResponse on error."""
     if not getattr(body, "lora", None):
@@ -1647,10 +1660,33 @@ async def system_metrics(request: Request) -> JSONResponse:
     s = _validator_dispatch_counter["success"]
     f = _validator_dispatch_counter["failure"]
     rate = (100.0 * f / max(1, s + f)) if (s + f) > 0 else 0.0
+
+    # v1.18.0-rc2 — Phase B retrieval counters
+    em = _embeddings_metrics
+    avg_results = (
+        em["embeddings_search_results_sum"] / em["embeddings_search_results_count"]
+        if em["embeddings_search_results_count"] > 0
+        else 0.0
+    )
     return JSONResponse(content={
         "validator_dispatch": {
             **_validator_dispatch_counter,
             "failure_rate_pct": round(rate, 2),
+        },
+        "embeddings": {
+            "embeddings_search_total": em["embeddings_search_total"],
+            "embeddings_search_success": em["embeddings_search_success"],
+            "embeddings_search_failure": em["embeddings_search_failure"],
+            "embeddings_search_rate_limited": em["embeddings_search_rate_limited"],
+            "embeddings_search_results_avg": round(avg_results, 2),
+            "embeddings_search_latency_p50_ms": round(
+                _percentile(_embeddings_search_latencies_ms, 50.0), 2
+            ),
+            "embeddings_search_latency_p95_ms": round(
+                _percentile(_embeddings_search_latencies_ms, 95.0), 2
+            ),
+            "recommend_loras_total": em["recommend_loras_total"],
+            "bulk_revalidate_total": em["bulk_revalidate_total"],
         },
     })
 
@@ -3654,10 +3690,13 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
     num_frames = _duration_to_frames(body.duration, body.fps)
     prompt = _build_prompt(body.prompt, body.camera_motion)
     seed = random.randint(0, 2**32 - 1)
+    lora_applied_id, lora_applied_strength = _lora_applied_pair(body)
     params = dict(prompt=prompt, model=body.model, width=width, height=height,
                   num_frames=num_frames, fps=body.fps, seed=seed, generate_audio=body.generate_audio,
                   lora_path=lora_path, lora_strength=lora_strength,
-                  enhance_prompt=body.enhance_prompt)
+                  enhance_prompt=body.enhance_prompt,
+                  lora_applied_id=lora_applied_id,
+                  lora_applied_strength=lora_applied_strength)
     return _submit_job(JobType.TEXT_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3676,12 +3715,15 @@ async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSON
         return lora_result
     lora_path, lora_strength = lora_result
     seed = random.randint(0, 2**32 - 1)
+    lora_applied_id, lora_applied_strength = _lora_applied_pair(body)
     params = dict(prompt=body.prompt, keyframes=keyframe_inputs, segment_path=segment_path,
                   model=body.model,
                   width=width, height=height, num_frames=num_frames, fps=body.fps,
                   seed=seed, generate_audio=body.generate_audio,
                   lora_path=lora_path, lora_strength=lora_strength,
-                  enhance_prompt=body.enhance_prompt)
+                  enhance_prompt=body.enhance_prompt,
+                  lora_applied_id=lora_applied_id,
+                  lora_applied_strength=lora_applied_strength)
     return _submit_job(JobType.IMAGE_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3701,12 +3743,15 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
     segment_path = resolved["segment_path"] if isinstance(resolved, dict) else None
     keyframe_inputs = resolved if isinstance(resolved, list) else None
     seed = random.randint(0, 2**32 - 1)
+    lora_applied_id, lora_applied_strength = _lora_applied_pair(body)
     params = dict(prompt=body.prompt, audio_path=audio_path, image_path=None,
                   keyframes=keyframe_inputs, segment_path=segment_path,
                   model=body.model, width=width, height=height, num_frames=num_frames,
                   fps=body.fps, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength,
-                  enhance_prompt=body.enhance_prompt)
+                  enhance_prompt=body.enhance_prompt,
+                  lora_applied_id=lora_applied_id,
+                  lora_applied_strength=lora_applied_strength)
     return _submit_job(JobType.AUDIO_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3730,10 +3775,13 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
         parent_clip_id = history.find_id_by_result_uri(body.video_uri)
     except Exception:
         logger.warning("retake parent lookup failed for %s", body.video_uri, exc_info=True)
+    lora_applied_id, lora_applied_strength = _lora_applied_pair(body)
     params = dict(video_path=video_path, start_time=body.start_time,
                   duration=body.duration, mode=body.mode, prompt=prompt, seed=seed,
                   lora_path=lora_path, lora_strength=lora_strength,
-                  parent_clip_id=parent_clip_id)
+                  parent_clip_id=parent_clip_id,
+                  lora_applied_id=lora_applied_id,
+                  lora_applied_strength=lora_applied_strength)
     return _submit_job(JobType.RETAKE, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3756,6 +3804,7 @@ async def v2_video_outpaint(body: VideoOutpaintRequest, request: Request) -> JSO
     width, height = _resolution_to_dims(body.target_resolution)
     num_frames = _duration_to_frames(body.duration, body.fps)
     seed = body.seed if body.seed else random.randint(0, 2**32 - 1)
+    lora_applied_id, lora_applied_strength = _lora_applied_pair(body)
     params = dict(
         video_path=video_path, prompt=body.prompt,
         target_width=width, target_height=height, position=body.position,
@@ -3766,6 +3815,8 @@ async def v2_video_outpaint(body: VideoOutpaintRequest, request: Request) -> JSO
         enhance_prompt=body.enhance_prompt,
         # History-only fields (stripped before generate_outpaint call):
         width=width, height=height, model="ic-lora-outpaint",
+        lora_applied_id=lora_applied_id,
+        lora_applied_strength=lora_applied_strength,
     )
     return _submit_job(JobType.VIDEO_OUTPAINT, params, request, raw=body.model_dump(mode="json"))
 
@@ -3810,6 +3861,7 @@ async def v2_video_hdr(body: VideoHdrRequest, request: Request) -> JSONResponse:
     num_frames = _duration_to_frames(body.duration, body.fps)
     seed = body.seed if body.seed else random.randint(0, 2**32 - 1)
 
+    lora_applied_id, lora_applied_strength = _lora_applied_pair(body)
     params = dict(
         video_path=video_path, prompt=body.prompt,
         target_width=target_w, target_height=target_h, position="center",
@@ -3820,6 +3872,8 @@ async def v2_video_hdr(body: VideoHdrRequest, request: Request) -> JSONResponse:
         enhance_prompt=body.enhance_prompt,
         # History-only fields (stripped before generate_outpaint call):
         width=target_w, height=target_h, model="ic-lora-hdr",
+        lora_applied_id=lora_applied_id,
+        lora_applied_strength=lora_applied_strength,
     )
     return _submit_job(JobType.VIDEO_HDR, params, request, raw=body.model_dump(mode="json"))
 
@@ -4658,6 +4712,478 @@ async def v2_analyze_motion(body: AnalyzeMotionRequest, request: Request) -> JSO
     except Exception as exc:
         logger.exception("analyze-motion failed for %s", body.video_uri)
         return _error(500, f"analyze_motion_failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# v1.18.0-rc2 — Phase B retrieval backend
+#
+# Three new endpoints (`/v2/embeddings/search`, `/v2/embeddings/recommend-loras`,
+# `/v2/system/bulk-revalidate`), per-API-key token-bucket rate-limit
+# middleware, and process-local metrics counters. Privacy gate: every
+# query is filtered by `api_key_hash`, fail-closed when API_KEYS is set.
+# Backed by sqlite-vec virtual table `clip_embeddings`; endpoints return
+# 503 with a clear message when the extension didn't load.
+# ---------------------------------------------------------------------------
+
+
+# Token-bucket rate-limit state. Keyed by sha256(api_key) so raw bearers
+# never land in heap dumps. Limit: 10 req/sec/key, applied only to the
+# new /v2/embeddings/* and /v2/system/bulk-revalidate paths so existing
+# endpoints stay un-affected. Tokens refill at 10/s up to capacity 10.
+_EMBEDDINGS_RATE_LIMIT_PER_SEC = 10
+_EMBEDDINGS_RATE_LIMIT_BURST = 10
+_embeddings_buckets: dict[str, tuple[float, float]] = {}
+_RATE_LIMITED_PATH_PREFIXES = (
+    "/v2/embeddings/",
+    "/v2/system/bulk-revalidate",
+)
+
+
+def _embeddings_rate_limit_check(api_key: str) -> tuple[bool, float]:
+    """Token-bucket gate. Returns ``(allowed, retry_after_seconds)``.
+
+    Empty key short-circuits to allowed (auth-disabled deployments). The
+    per-key bucket is keyed by sha256(api_key) and lives in process
+    memory only — restart resets counters.
+    """
+    if not api_key:
+        return True, 0.0
+    import hashlib as _hl
+    key_hash = _hl.sha256(api_key.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    tokens, last = _embeddings_buckets.get(
+        key_hash, (float(_EMBEDDINGS_RATE_LIMIT_BURST), now)
+    )
+    elapsed = max(0.0, now - last)
+    tokens = min(
+        float(_EMBEDDINGS_RATE_LIMIT_BURST),
+        tokens + elapsed * _EMBEDDINGS_RATE_LIMIT_PER_SEC,
+    )
+    if tokens < 1.0:
+        # Fractional tokens: time-to-1 = (1 - tokens) / refill_rate
+        retry = (1.0 - tokens) / _EMBEDDINGS_RATE_LIMIT_PER_SEC
+        _embeddings_buckets[key_hash] = (tokens, now)
+        return False, retry
+    tokens -= 1.0
+    _embeddings_buckets[key_hash] = (tokens, now)
+    return True, 0.0
+
+
+@app.middleware("http")
+async def embeddings_rate_limit(request: Request, call_next):
+    """Per-API-key 10 req/sec gate on Phase B endpoints.
+
+    Applies to `/v2/embeddings/*` and `/v2/system/bulk-revalidate` only.
+    Fails open when API_KEYS is empty (parity with `check_api_key`).
+    Returns 429 + ``Retry-After`` header on exhaustion. Other paths pass
+    through unchanged.
+    """
+    path = request.url.path
+    if request.method == "OPTIONS" or not any(
+        path.startswith(p) for p in _RATE_LIMITED_PATH_PREFIXES
+    ):
+        return await call_next(request)
+    if not config.API_KEYS:
+        return await call_next(request)
+    api_key = _extract_api_key(request) or ""
+    allowed, retry = _embeddings_rate_limit_check(api_key)
+    if not allowed:
+        _embeddings_metrics["embeddings_search_rate_limited"] += 1
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limited",
+                "message": (
+                    f"Per-key rate limit "
+                    f"({_EMBEDDINGS_RATE_LIMIT_PER_SEC}/sec) exceeded; "
+                    f"retry in {retry:.2f}s."
+                ),
+            },
+            headers={"Retry-After": f"{max(1, int(retry) + 1)}"},
+        )
+    return await call_next(request)
+
+
+# Process-local Phase B metrics. Reset on restart. Latency stored as
+# ring buffers of last 1000 calls so /v1/system/metrics can compute
+# rolling p50 / p95 without a time-series DB.
+_EMBEDDINGS_LATENCY_WINDOW = 1000
+_embeddings_metrics: dict[str, int] = {
+    "embeddings_search_total": 0,
+    "embeddings_search_success": 0,
+    "embeddings_search_failure": 0,
+    "embeddings_search_rate_limited": 0,
+    "embeddings_search_results_sum": 0,
+    "embeddings_search_results_count": 0,
+    "recommend_loras_total": 0,
+    "bulk_revalidate_total": 0,
+}
+_embeddings_search_latencies_ms: list[float] = []
+
+
+def _record_search_latency(latency_ms: float) -> None:
+    _embeddings_search_latencies_ms.append(latency_ms)
+    overflow = len(_embeddings_search_latencies_ms) - _EMBEDDINGS_LATENCY_WINDOW
+    if overflow > 0:
+        del _embeddings_search_latencies_ms[:overflow]
+
+
+def _percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    idx = max(0, min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1)))))
+    return s[idx]
+
+
+class EmbeddingsSearchRequest(BaseModel):
+    prompt: str = Field(min_length=5, max_length=2000)
+    k: int = Field(default=5, ge=1, le=20)
+    min_validator_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    validator_version_filter: str | None = None
+    genre: str | None = None
+
+
+class RecommendLorasRequest(BaseModel):
+    prompt: str = Field(min_length=5, max_length=2000)
+    motion_intent: str | None = Field(default=None, max_length=200)
+    k: int = Field(default=3, ge=1, le=10)
+    min_validator_score: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class BulkRevalidateRequest(BaseModel):
+    target_validator_version: str = Field(min_length=1, max_length=64)
+    dry_run: bool = True
+    limit: int = Field(default=100, ge=1, le=10000)
+
+
+def _require_sqlite_vec() -> JSONResponse | None:
+    """503 with a clear message when sqlite-vec didn't load."""
+    from history_store import SQLITE_VEC_AVAILABLE, SQLITE_VEC_LOAD_ERROR
+    if not SQLITE_VEC_AVAILABLE:
+        return _error(
+            503,
+            "embedding search not available — install sqlite-vec extension"
+            + (f" ({SQLITE_VEC_LOAD_ERROR})" if SQLITE_VEC_LOAD_ERROR else ""),
+        )
+    return None
+
+
+def _embedding_query_bytes_to_blob(b: bytes) -> bytes:
+    """Pass-through; sqlite-vec accepts float32-LE bytes directly via parameter binding."""
+    return b
+
+
+@app.post("/v2/embeddings/search")
+async def v2_embeddings_search(
+    body: EmbeddingsSearchRequest, request: Request
+) -> JSONResponse:
+    """Semantic search over the caller's own past clips.
+
+    Privacy gate: every query is filtered by ``api_key_hash`` of the
+    caller — bearer A cannot ever surface bearer B's rows. When
+    ``API_KEYS`` is empty (auth disabled deployment) the gate degrades
+    to a single global tenant.
+
+    Returns up to ``k`` ranked similar shots. Ranking formula (50/35/10/5):
+      ``0.50 * similarity + 0.35 * validator_norm + 0.10 * recency
+       + 0.05 * composition_kept``.
+    """
+    blocker = _require_sqlite_vec()
+    if blocker is not None:
+        return blocker
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    else:
+        # Auth-disabled deployments: still honor a Bearer header when
+        # present so single-tenant test fixtures can scope rows by
+        # bearer. Empty when no header given.
+        api_key = _extract_api_key(request) or ""
+
+    _embeddings_metrics["embeddings_search_total"] += 1
+    t0 = time.perf_counter()
+    try:
+        # 1. embed the query prompt
+        try:
+            query_blob = await chat.embed(body.prompt)
+        except (httpx_lib_error_types()) as exc:  # type: ignore[misc]
+            _embeddings_metrics["embeddings_search_failure"] += 1
+            logger.warning("embeddings.search: embed failed: %s", exc)
+            return _error(503, "embedding service unavailable")
+
+        # 2. resolve the validator-version filter
+        version_filter = (
+            body.validator_version_filter
+            if body.validator_version_filter
+            else config.VALIDATOR_VERSION
+        )
+
+        # 3. vector search — privacy gate via api_key_hash binding
+        from history_store import _hash_key
+        key_hash = _hash_key(api_key) if api_key else ""
+        # NOTE: api_key_hash filter is NOT optional. When auth is disabled
+        # there's still only a single global tenant, but we keep the WHERE
+        # clause structurally present so future multi-tenant migrations
+        # don't accidentally widen visibility.
+        sql = """
+            SELECT g.id, g.prompt, g.validator_score, g.created_at,
+                   g.lora_applied_id, g.lora_applied_strength, g.model,
+                   g.composition_id, g.shot_uuid,
+                   vec_distance_l2(ce.embedding, ?) AS distance
+            FROM clip_embeddings ce
+            JOIN generations g ON ce.id = g.id
+            WHERE g.api_key_hash = ?
+              AND COALESCE(g.validator_score, 0) >= ?
+              AND g.validator_version = ?
+            ORDER BY distance ASC
+            LIMIT ?
+        """
+        try:
+            rows = history._conn.execute(
+                sql,
+                (
+                    _embedding_query_bytes_to_blob(query_blob),
+                    key_hash,
+                    body.min_validator_score,
+                    version_filter,
+                    max(body.k * 4, body.k),
+                ),
+            ).fetchall()
+        except Exception as exc:  # sqlite-vec extension errors land here
+            _embeddings_metrics["embeddings_search_failure"] += 1
+            logger.warning("embeddings.search: query failed: %s", exc)
+            return _error(500, "embedding search failed")
+
+        # 4. rank by composite formula
+        now = time.time()
+        results = []
+        for row in rows:
+            d = float(row["distance"])
+            # L2 distance → similarity in [0, 1]: smaller is better. We
+            # squash to (0, 1] via 1/(1+d). For Gemma normalized embeddings
+            # this stays well-behaved.
+            similarity = 1.0 / (1.0 + d)
+            vscore = float(row["validator_score"] or 0.0)
+            v_norm = max(0.0, vscore - 0.5) / 0.5
+            age_days = max(0.0, (now - float(row["created_at"])) / 86400.0)
+            import math
+            recency = math.exp(-age_days / 30.0)
+            comp_kept = 1.0 if row["composition_id"] else 0.0
+            final_score = (
+                0.50 * similarity
+                + 0.35 * v_norm
+                + 0.10 * recency
+                + 0.05 * comp_kept
+            )
+            results.append({
+                "shot_id": row["id"],
+                "prompt": row["prompt"],
+                "similarity_score": round(similarity, 6),
+                "validator_score": vscore,
+                "lora_applied_id": row["lora_applied_id"],
+                "lora_applied_strength": row["lora_applied_strength"],
+                "model": row["model"],
+                "shot_uuid": row["shot_uuid"],
+                "in_final_composition": bool(row["composition_id"]),
+                "created_at": row["created_at"],
+                "final_score": round(final_score, 6),
+            })
+        results.sort(key=lambda r: r["final_score"], reverse=True)
+        results = results[: body.k]
+
+        _embeddings_metrics["embeddings_search_success"] += 1
+        _embeddings_metrics["embeddings_search_results_sum"] += len(results)
+        _embeddings_metrics["embeddings_search_results_count"] += 1
+        return JSONResponse(content={
+            "validator_version_filter": version_filter,
+            "results": results,
+        })
+    finally:
+        _record_search_latency((time.perf_counter() - t0) * 1000.0)
+
+
+def httpx_lib_error_types():  # placed here to avoid import cycles at module load
+    import httpx as _httpx
+    return (_httpx.HTTPError, _httpx.RequestError, RuntimeError)
+
+
+@app.post("/v2/embeddings/recommend-loras")
+async def v2_embeddings_recommend_loras(
+    body: RecommendLorasRequest, request: Request
+) -> JSONResponse:
+    """Aggregate LoRA performance over the caller's similar shots.
+
+    Returns ranked LoRAs by ``0.7 * mean_score + 0.3 * expected_boost``
+    where ``expected_boost`` is ``mean_score - no_lora_mean_score`` over
+    the top-50 similar shots filtered to opt-in clips.
+    """
+    blocker = _require_sqlite_vec()
+    if blocker is not None:
+        return blocker
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    else:
+        api_key = _extract_api_key(request) or ""
+
+    _embeddings_metrics["recommend_loras_total"] += 1
+    try:
+        try:
+            query_blob = await chat.embed(body.prompt)
+        except (httpx_lib_error_types()) as exc:  # type: ignore[misc]
+            logger.warning("recommend_loras: embed failed: %s", exc)
+            return _error(503, "embedding service unavailable")
+
+        from history_store import _hash_key
+        key_hash = _hash_key(api_key) if api_key else ""
+
+        sql = """
+            SELECT g.id, g.lora_applied_id, g.lora_applied_strength,
+                   g.validator_score, g.created_at,
+                   vec_distance_l2(ce.embedding, ?) AS distance
+            FROM clip_embeddings ce
+            JOIN generations g ON ce.id = g.id
+            WHERE g.api_key_hash = ?
+              AND COALESCE(g.validator_score, 0) >= ?
+              AND g.validator_version = ?
+            ORDER BY distance ASC
+            LIMIT 50
+        """
+        try:
+            rows = history._conn.execute(
+                sql,
+                (
+                    _embedding_query_bytes_to_blob(query_blob),
+                    key_hash,
+                    body.min_validator_score,
+                    config.VALIDATOR_VERSION,
+                ),
+            ).fetchall()
+        except Exception as exc:
+            logger.warning("recommend_loras: query failed: %s", exc)
+            return _error(500, "embedding search failed")
+
+        if not rows:
+            return JSONResponse(content={"recommendations": [], "total_samples": 0})
+
+        # Aggregate per LoRA. Treat NULL lora_applied_id as the "no_lora"
+        # baseline group so we can compute expected_boost.
+        per_lora: dict[str | None, dict[str, Any]] = {}
+        for row in rows:
+            lid = row["lora_applied_id"]
+            bucket = per_lora.setdefault(
+                lid, {"sum": 0.0, "count": 0, "sum_strength": 0.0}
+            )
+            bucket["sum"] += float(row["validator_score"] or 0.0)
+            bucket["count"] += 1
+            bucket["sum_strength"] += float(row["lora_applied_strength"] or 0.0)
+
+        no_lora = per_lora.get(None)
+        no_lora_mean = (
+            no_lora["sum"] / no_lora["count"] if no_lora and no_lora["count"] else 0.0
+        )
+
+        recs = []
+        for lid, agg in per_lora.items():
+            if lid is None:
+                continue
+            mean_score = agg["sum"] / agg["count"]
+            mean_strength = agg["sum_strength"] / agg["count"]
+            expected_boost = mean_score - no_lora_mean
+            rank = 0.7 * mean_score + 0.3 * max(0.0, expected_boost)
+            recs.append({
+                "lora_id": lid,
+                "mean_validator_score": round(mean_score, 4),
+                "sample_count": agg["count"],
+                "mean_strength": round(mean_strength, 3),
+                "expected_boost": round(expected_boost, 4),
+                "rank_score": round(rank, 4),
+            })
+        recs.sort(key=lambda r: r["rank_score"], reverse=True)
+        recs = recs[: body.k]
+        return JSONResponse(content={
+            "recommendations": recs,
+            "total_samples": len(rows),
+            "no_lora_baseline_mean": round(no_lora_mean, 4),
+        })
+    except Exception as exc:
+        logger.exception("recommend_loras failed")
+        return _error(500, f"recommend_loras_failed: {exc}")
+
+
+@app.post("/v2/system/bulk-revalidate")
+async def v2_system_bulk_revalidate(
+    body: BulkRevalidateRequest, request: Request
+) -> JSONResponse:
+    """Admin: re-run validator on rows where ``validator_version`` differs.
+
+    Default ``dry_run=true`` returns the count of rows that would be
+    revalidated without writing. Set ``dry_run=false`` to actually run
+    — fire-and-forget tasks per row, capped at ``limit``.
+    """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    _embeddings_metrics["bulk_revalidate_total"] += 1
+
+    target = body.target_validator_version
+    # Rows that need revalidation: validator_version differs OR is NULL
+    # AND a result_uri is present (so the validator has something to
+    # actually run against).
+    select_sql = """
+        SELECT id, api_key_hash, result_uri, prompt, job_type
+        FROM generations
+        WHERE result_uri IS NOT NULL
+          AND (validator_version IS NULL OR validator_version != ?)
+        ORDER BY created_at DESC
+        LIMIT ?
+    """
+    rows = history._conn.execute(select_sql, (target, body.limit)).fetchall()
+    if body.dry_run:
+        return JSONResponse(content={
+            "dry_run": True,
+            "would_revalidate": len(rows),
+            "target_validator_version": target,
+            "sample_ids": [r["id"] for r in rows[:10]],
+        })
+
+    # Real run: spawn fire-and-forget validator dispatches per row. Each
+    # task updates the row's validator_score / validator_payload_json /
+    # validator_version itself via `_dispatch_validator`'s UPDATE path.
+    queued = 0
+    for row in rows:
+        # Fabricate a minimal Job-like for _dispatch_validator. We only
+        # need .id, .result_uri, .params (for prompt), .raw_request.
+        from job_queue import Job, JobType, JobStatus
+        try:
+            job_type_enum = JobType(row["job_type"])
+        except ValueError:
+            continue
+        synthetic = Job(
+            id=row["id"],
+            type=job_type_enum,
+            status=JobStatus.COMPLETED,
+            api_key=None,
+            result_uri=row["result_uri"],
+            params={"prompt": row["prompt"]},
+            raw_request={"prompt": row["prompt"]},
+        )
+        try:
+            asyncio.create_task(_dispatch_validator(synthetic))
+            queued += 1
+        except RuntimeError:
+            # No event loop — shouldn't happen inside a request, but be
+            # defensive in case the endpoint is ever called from a
+            # synchronous test harness.
+            break
+    return JSONResponse(content={
+        "dry_run": False,
+        "queued": queued,
+        "target_validator_version": target,
+    })
 
 
 # ---------------------------------------------------------------------------
