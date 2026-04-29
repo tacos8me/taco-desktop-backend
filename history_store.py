@@ -16,7 +16,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 # Blob caps — a single rogue request can easily serialize multi-MB payloads
 # (LoRA paths list, keyframe images-as-bytes if a caller mis-uses the field,
@@ -484,6 +484,15 @@ class HistoryStore:
             - ``prompt_embedding``      — Phase B: lazy-fill via llama-swap
                                           /v1/embeddings once that endpoint
                                           is wired (~3584-dim float32).
+                                          **DEPRECATED as of v1.18.0-rc1**:
+                                          embeddings will live in the
+                                          ``clip_embeddings`` sqlite-vec
+                                          virtual table (Phase B). The BLOB
+                                          column on ``generations`` is
+                                          retained nullable for backward
+                                          compat but never written to.
+                                          Removal candidate for v1.19+
+                                          once zero readers confirmed.
             - ``validator_artifact_uri`` — populated when sapiens-sidecar
                                           real inference writes pose.npz /
                                           flow.npz / overlay.mp4 (currently
@@ -494,6 +503,62 @@ class HistoryStore:
                                           the request body but doesn't
                                           persist it post-fusion).
             - ``lora_applied_strength`` — same.
+
+        v4 (v1.18.0-rc1) — keystone migration for Phase B retrieval +
+        Phase C SFT LoRA training. Purely additive; pre-v4 sessions resume
+        cleanly with NULL in new columns; v4 DBs opened by pre-v4 code
+        silently ignore the extra columns (additive safety verified by
+        ``test_v4_db_loaded_by_v3_code_silently_ignores_extra_columns``).
+
+          On ``generations`` (additive nullable):
+            - ``motion_intent``          — Phase B: per-clip motion intent
+                                          (e.g. "static", "slow drift",
+                                          "rapid action") used by the
+                                          tier-3 Gemma judge. WRITTEN by
+                                          the validator pipeline (wiring
+                                          ships in v1.18.0-rc2+).
+            - ``embedding_model_version`` — Phase B: tracks which embedding
+                                          model produced the row's
+                                          embedding (for migration safety
+                                          when llama-swap rolls a new
+                                          model). WRITTEN by Phase B
+                                          ``clip_embeddings`` virtual table
+                                          flow (forward-looking for rc1).
+
+          On ``preference_pairs`` (additive + 2 new indexes):
+            - ``validator_version``      — scope pairs to a single judge
+                                          version so cross-version pairs
+                                          don't corrupt training. WRITTEN
+                                          by Phase C
+                                          ``construct_preference_pairs.py``
+                                          script (forward-looking for rc1).
+            - ``idx_pp_validator_version`` index for fast version-scoped
+              filtering at training time.
+            - ``idx_pp_unique_pair_source`` UNIQUE INDEX on
+              ``(chosen_clip_id, rejected_clip_id, signal_source)``
+              supports ``INSERT OR IGNORE`` idempotence in Phase C pair
+              construction (multi-source aggregation: same pair via
+              user_retake AND validator_pass lands as two rows with
+              different signal_source).
+
+          On ``training_runs`` (reproducibility — all 5 columns WRITTEN by
+          Phase C ``train_dpo_sft.py`` script, forward-looking for rc1):
+            - ``training_seed``                — RNG seed for the training
+                                                 run.
+            - ``hyperparams_json``             — full hyperparam snapshot
+                                                 (lr, batch_size, epochs,
+                                                 ...).
+            - ``dataset_snapshot_path``        — path to frozen JSONL of
+                                                 pairs at training time
+                                                 (point-in-time corpus).
+            - ``code_sha``                     — git SHA of taco-backend at
+                                                 training run.
+            - ``validator_version_at_train``   — validator_version of the
+                                                 pairs trained on; future
+                                                 operators can detect when
+                                                 a deployed LoRA was
+                                                 trained against an old
+                                                 validator and warn.
         """
         current = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if current >= CURRENT_SCHEMA_VERSION:
@@ -536,6 +601,71 @@ class HistoryStore:
                 )
                 self._conn.executescript(_SCHEMA_V3_TABLES)
                 self._maybe_seed_api_key_metadata()
+            if current < 4:
+                # v4 (v1.18.0-rc1) — keystone migration for Phase B + Phase C.
+                # All ALTER TABLE / CREATE INDEX statements are idempotent:
+                # ALTER guarded by PRAGMA table_info reflection (additive only
+                # ever runs once per upgrade ladder); indexes use IF NOT EXISTS.
+                gen_cols = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(generations)"
+                    ).fetchall()
+                }
+                if "motion_intent" not in gen_cols:
+                    self._conn.execute(
+                        "ALTER TABLE generations ADD COLUMN motion_intent TEXT"
+                    )
+                if "embedding_model_version" not in gen_cols:
+                    self._conn.execute(
+                        "ALTER TABLE generations ADD COLUMN embedding_model_version TEXT"
+                    )
+
+                pp_cols = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(preference_pairs)"
+                    ).fetchall()
+                }
+                if "validator_version" not in pp_cols:
+                    self._conn.execute(
+                        "ALTER TABLE preference_pairs ADD COLUMN validator_version TEXT"
+                    )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pp_validator_version "
+                    "ON preference_pairs(validator_version)"
+                )
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pp_unique_pair_source "
+                    "ON preference_pairs(chosen_clip_id, rejected_clip_id, signal_source)"
+                )
+
+                tr_cols = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(training_runs)"
+                    ).fetchall()
+                }
+                if "training_seed" not in tr_cols:
+                    self._conn.execute(
+                        "ALTER TABLE training_runs ADD COLUMN training_seed INTEGER"
+                    )
+                if "hyperparams_json" not in tr_cols:
+                    self._conn.execute(
+                        "ALTER TABLE training_runs ADD COLUMN hyperparams_json TEXT"
+                    )
+                if "dataset_snapshot_path" not in tr_cols:
+                    self._conn.execute(
+                        "ALTER TABLE training_runs ADD COLUMN dataset_snapshot_path TEXT"
+                    )
+                if "code_sha" not in tr_cols:
+                    self._conn.execute(
+                        "ALTER TABLE training_runs ADD COLUMN code_sha TEXT"
+                    )
+                if "validator_version_at_train" not in tr_cols:
+                    self._conn.execute(
+                        "ALTER TABLE training_runs ADD COLUMN validator_version_at_train TEXT"
+                    )
             self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
             self._conn.commit()
             logger.info(

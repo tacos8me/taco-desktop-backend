@@ -2,6 +2,36 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.18.0-rc1 — 2026-04-29
+
+### Feat: schema v4 — additive columns for Phase B + Phase C lineage
+
+Keystone migration for the 4-week Phase B (retrieval) + Phase C (SFT LoRA training) sprint. **This rc1 ships ONLY the schema** — no feature wiring, no new endpoints, no extension loads. Downstream feature ships (sqlite-vec extension load, embeddings endpoint, retrieval MCP tools, pair construction script, training pipeline, A/B framework) land in v1.18.0-rc2+. Both Phase B and Phase C build against this schema in parallel, hence the keystone ordering.
+
+`history_store.CURRENT_SCHEMA_VERSION 3 → 4`. Single additive migration in `_migrate()` (mirrors the v3 idempotent ALTER pattern from v1.17.0-rc1). Pre-v4 sessions resume cleanly with NULL in new columns. v4 DBs opened by pre-v4 code silently ignore the extra columns (additive safety verified by `test_v4_db_loaded_by_v3_code_silently_ignores_extra_columns`). Operator restarts taco-backend once to apply on next boot — no backfill required.
+
+**On `generations`** (additive nullable, 2 new columns):
+- `motion_intent TEXT` — per-clip motion intent (e.g. "static", "slow drift", "rapid action") used by the tier-3 Gemma judge. WRITTEN by the validator pipeline (wiring ships in v1.18.0-rc2+).
+- `embedding_model_version TEXT` — tracks which embedding model produced the row's embedding (migration safety when llama-swap rolls a new model). WRITTEN by Phase B `clip_embeddings` virtual table flow (forward-looking for rc1).
+
+**On `preference_pairs`** (additive + 2 new indexes):
+- `validator_version TEXT` — scopes pairs to a single judge version so cross-version pairs don't corrupt training. WRITTEN by Phase C pair construction script.
+- `idx_pp_validator_version` index for fast version-scoped filtering at training time.
+- `idx_pp_unique_pair_source` UNIQUE INDEX on `(chosen_clip_id, rejected_clip_id, signal_source)` supports `INSERT OR IGNORE` idempotence in Phase C pair construction (multi-source aggregation: same pair via `user_retake` AND `validator_pass` lands as two rows with different `signal_source`).
+
+**On `training_runs`** (reproducibility — all 5 columns WRITTEN by Phase C `train_dpo_sft.py`, forward-looking for rc1):
+- `training_seed INTEGER` — RNG seed for the training run.
+- `hyperparams_json TEXT` — full hyperparam snapshot (lr, batch_size, epochs, …).
+- `dataset_snapshot_path TEXT` — frozen JSONL of pairs at training time (point-in-time corpus).
+- `code_sha TEXT` — git SHA of taco-backend at training run.
+- `validator_version_at_train TEXT` — validator_version of pairs trained on; future operators detect when a deployed LoRA was trained against an old validator and warn.
+
+**Dead-letter status** of `generations.prompt_embedding` BLOB column documented in the `_migrate()` docstring: at 14KB/row × 1M rows = 14GB the BLOB approach exceeds SQLite's practical column-storage envelope, and Phase B will land embeddings in a sqlite-vec virtual table (`clip_embeddings`) instead. The column is retained nullable for backward compat but never written to from v1.18.0-rc1 forward. Removal candidate for v1.19+ once zero readers confirmed.
+
+10 new regression tests in `tests/test_v1_18_schema.py`: `test_schema_v4_migration_runs_clean`, `test_schema_v4_migration_idempotent`, `test_schema_v3_to_v4_upgrade_preserves_rows`, `test_motion_intent_column_nullable`, `test_preference_pairs_validator_version_index_works`, `test_preference_pairs_unique_pair_source_constraint`, `test_training_runs_reproducibility_columns`, `test_v3_db_loaded_by_v4_code_works`, `test_v4_db_loaded_by_v3_code_silently_ignores_extra_columns`, `test_existing_v3_test_suite_still_passes`. Three v17 tests had hardcoded `user_version == 3` literal assertions; updated to `== CURRENT_SCHEMA_VERSION` so the v3-surface intent survives every future ladder bump. Suite is now 217 green (was 207).
+
+No client-side changes required. Restart taco-backend to migrate on next boot.
+
 ## v1.17.0-rc5 — 2026-04-29
 
 ### Fix: motion_intent wire-through + dispatch metrics + dead-column docs
