@@ -95,7 +95,10 @@ def test_schema_v3_migration_runs_clean(tmp_path: Path) -> None:
         assert required in tables, f"missing table: {required}"
 
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == CURRENT_SCHEMA_VERSION == 3
+    # v1.18.0-rc1 bumped CURRENT_SCHEMA_VERSION 3→4; the v3 surface this
+    # test asserts is still present, but the DB ladders all the way up.
+    assert user_version == CURRENT_SCHEMA_VERSION
+    assert CURRENT_SCHEMA_VERSION >= 3
 
 
 def test_schema_v3_migration_idempotent(tmp_path: Path) -> None:
@@ -105,7 +108,7 @@ def test_schema_v3_migration_idempotent(tmp_path: Path) -> None:
     store._migrate()
     store._migrate()
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == 3
+    assert user_version == CURRENT_SCHEMA_VERSION
     # Duplicate-create-table guards work.
     cols = _table_columns(store._conn, "generations")
     assert "validator_score" in cols
@@ -128,7 +131,9 @@ def test_schema_v3_existing_v2_db_upgrades(tmp_path: Path) -> None:
 
     store = HistoryStore(db_path=db)
     user_version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert user_version == 3
+    # Ladder migrates v2 → CURRENT_SCHEMA_VERSION (4 as of v1.18.0-rc1),
+    # touching every intermediate version's ALTERs in order.
+    assert user_version == CURRENT_SCHEMA_VERSION
 
     row = store._conn.execute(
         "SELECT id, prompt, validator_score, parent_clip_id, params_json "
