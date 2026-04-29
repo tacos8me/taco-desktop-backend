@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""v1.18.0-rc3 — Phase C A/B decision script.
+"""v1.18.0-rc3 — Phase C A/B decision script (v1.18.0-rc5: column-based).
 
-Weekly cron. Reads MV-level ``_ab_arm`` tags out of session metadata
-(populated by mcp orchestrator's ``_normalize_input`` when
-``AB_TEST_ACTIVE=1``) and computes paired t-test on per-MV mean
-validator_score across baseline vs candidate arms.
+Weekly cron. Reads MV-level ``ab_arm`` tags from
+``generations.ab_arm`` (schema v6 column populated by every video v2
+endpoint when MCP forwards ``_ab_arm`` in the request body — see
+``_HISTORY_ONLY_PARAMS`` in server.py) and computes paired t-test on
+per-MV mean validator_score across baseline vs candidate arms.
+
+Pre-rc5 versions inferred the cohort from ``lora_applied_id`` —
+brittle because non-A/B candidates could share the LoRA id. The
+column-based form is the load-bearing fix.
 
 Promotion thresholds (per the plan):
 
@@ -45,6 +50,7 @@ if str(_ROOT) not in sys.path:
 
 import config  # noqa: E402
 from history_store import HistoryStore  # noqa: E402
+from _ab_stats import welch_ttest as _welch_ttest_lib  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,75 +87,12 @@ class ABResult:
 
 
 def _welch_ttest(a: list[float], b: list[float]) -> tuple[float, float]:
-    """Welch's t-test (two-sample, unequal variance). Returns (t, p)."""
-    try:
-        from scipy import stats  # type: ignore
-        result = stats.ttest_ind(a, b, equal_var=False)
-        return float(result.statistic), float(result.pvalue)
-    except ImportError:
-        # Manual fallback so the cron is not gated on scipy availability
-        # in production environments. Math: Welch's t with Satterthwaite df.
-        from math import sqrt, lgamma, log, exp
-        if len(a) < 2 or len(b) < 2:
-            return 0.0, 1.0
-        ma = sum(a) / len(a)
-        mb = sum(b) / len(b)
-        va = sum((x - ma) ** 2 for x in a) / (len(a) - 1)
-        vb = sum((x - mb) ** 2 for x in b) / (len(b) - 1)
-        se = sqrt(va / len(a) + vb / len(b)) if (va or vb) else 1e-9
-        t = (ma - mb) / se if se else 0.0
-        df = (va / len(a) + vb / len(b)) ** 2 / (
-            (va / len(a)) ** 2 / (len(a) - 1) + (vb / len(b)) ** 2 / (len(b) - 1)
-        ) if (va or vb) else max(len(a), len(b)) - 1
+    """Welch's t-test (two-sample, unequal variance). Returns (t, p).
 
-        # Two-sided p-value via incomplete beta (regularized).
-        # Approximation acceptable for the gate threshold (p<0.05 hits well
-        # within numerical tolerance even for the fallback). Use scipy if
-        # higher precision matters.
-        x = df / (df + t * t)
-        # log-betacf truncated continued fraction (Numerical Recipes shape)
-        a_, b_ = df / 2.0, 0.5
-        # Use simple series acceleration: Lentz's method with 50 iters
-        FPMIN = 1e-30
-        qab = a_ + b_
-        qap = a_ + 1.0
-        qam = a_ - 1.0
-        c = 1.0
-        d = 1.0 - qab * x / qap
-        if abs(d) < FPMIN:
-            d = FPMIN
-        d = 1.0 / d
-        h = d
-        for m in range(1, 100):
-            m2 = 2 * m
-            aa = m * (b_ - m) * x / ((qam + m2) * (a_ + m2))
-            d = 1.0 + aa * d
-            if abs(d) < FPMIN:
-                d = FPMIN
-            c = 1.0 + aa / c
-            if abs(c) < FPMIN:
-                c = FPMIN
-            d = 1.0 / d
-            h *= d * c
-            aa = -(a_ + m) * (qab + m) * x / ((a_ + m2) * (qap + m2))
-            d = 1.0 + aa * d
-            if abs(d) < FPMIN:
-                d = FPMIN
-            c = 1.0 + aa / c
-            if abs(c) < FPMIN:
-                c = FPMIN
-            d = 1.0 / d
-            del_ = d * c
-            h *= del_
-            if abs(del_ - 1.0) < 3e-7:
-                break
-        bt = exp(
-            lgamma(a_ + b_) - lgamma(a_) - lgamma(b_)
-            + a_ * log(x) + b_ * log(1.0 - x)
-        ) if 0 < x < 1 else 0.0
-        p_one = bt * h / a_
-        p = min(1.0, 2.0 * p_one)
-        return t, p
+    Thin wrapper preserved for back-compat with existing tests; delegates
+    to the shared helper in ``_ab_stats``.
+    """
+    return _welch_ttest_lib(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -161,38 +104,32 @@ def _fetch_arm_means(
     history: HistoryStore, *, arm: str, candidate_lora: str, limit: int
 ) -> list[float]:
     """Per-MV (composition) mean validator_score for clips tagged with
-    ``_ab_arm = arm`` in their gen_config_json or session metadata.
+    ``ab_arm = arm`` (v1.18.0-rc5+ schema v6 column).
 
     The MV grouping uses ``composition_id`` (set by export). Clips
     without ``composition_id`` aren't yet part of a finalized MV and
     don't enter the comparison.
+
+    v1.18.0-rc5: switched from ``lora_applied_id``-based cohort
+    inference to the explicit ``generations.ab_arm`` column. The new
+    column is written by every video v2 endpoint when MCP forwards
+    ``_ab_arm`` in the request body. The ``candidate_lora`` arg is now
+    advisory — preserved in the function signature for backward-
+    compat with the caller in ``run_decision()`` but no longer load-
+    bearing.
     """
+    del candidate_lora  # no longer used; ab_arm column is the cohort key.
     rows = history._conn.execute(
         """SELECT composition_id, AVG(validator_score) AS mean_score
            FROM generations
            WHERE composition_id IS NOT NULL
              AND validator_score IS NOT NULL
-             AND lora_applied_id = ?
-             AND created_at > 0
+             AND ab_arm = ?
            GROUP BY composition_id
            ORDER BY composition_id DESC
            LIMIT ?""",
-        (candidate_lora if arm == "candidate" else "", limit),
+        (arm, limit),
     ).fetchall()
-    # Note: the ``arm == 'baseline'`` path uses lora_applied_id = '' or NULL.
-    # SQLite treats NULL != '' so we re-query for NULL when arm is baseline.
-    if arm == "baseline":
-        rows = history._conn.execute(
-            """SELECT composition_id, AVG(validator_score) AS mean_score
-               FROM generations
-               WHERE composition_id IS NOT NULL
-                 AND validator_score IS NOT NULL
-                 AND (lora_applied_id IS NULL OR lora_applied_id = '')
-               GROUP BY composition_id
-               ORDER BY composition_id DESC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
     return [float(r["mean_score"]) for r in rows if r["mean_score"] is not None]
 
 

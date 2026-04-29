@@ -366,6 +366,10 @@ async def worker_loop(
                     composition_id=_params.get("composition_id"),
                     lora_applied_id=_params.get("lora_applied_id"),
                     lora_applied_strength=_params.get("lora_applied_strength"),
+                    # v1.18.0-rc5: A/B harness cohort marker. MCP
+                    # `_apply_ab_routing` stamps `_ab_arm` on the per-shot
+                    # body; server.py threads it through `_HISTORY_ONLY_PARAMS`.
+                    ab_arm=_params.get("ab_arm"),
                 )
                 _job_id_for_log = job.id
                 _result_uri = job.result_uri

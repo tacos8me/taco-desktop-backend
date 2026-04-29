@@ -16,7 +16,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 # v1.18.0-rc2 — sqlite-vec extension for vector search. Loaded BEFORE
 # `PRAGMA journal_mode=WAL` per sqlite-vec docs (extension load must
@@ -754,6 +754,24 @@ class HistoryStore:
                             embedding_model_version TEXT
                         )"""
                     )
+            if current < 6:
+                # v6 (v1.18.0-rc5) — `ab_arm` capture column for Phase C
+                # A/B harness. WRITTEN by every video v2 endpoint when the
+                # client (MCP `_apply_ab_routing`) forwards `_ab_arm` in the
+                # body. NULL for non-A/B clips. Read by
+                # `scripts/ab_decision.py` weekly cron to t-test
+                # candidate-vs-baseline cohorts on `validator_score` per MV.
+                # Additive nullable; pre-v6 rows stay valid.
+                gen_cols_v6 = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(generations)"
+                    ).fetchall()
+                }
+                if "ab_arm" not in gen_cols_v6:
+                    self._conn.execute(
+                        "ALTER TABLE generations ADD COLUMN ab_arm TEXT"
+                    )
             self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
             self._conn.commit()
             logger.info(
@@ -832,6 +850,7 @@ class HistoryStore:
         composition_id: str | None = None,
         lora_applied_id: str | None = None,
         lora_applied_strength: float | None = None,
+        ab_arm: str | None = None,
     ) -> None:
         thumb_uri = None
         if result_bytes and result_uri:
@@ -868,9 +887,9 @@ class HistoryStore:
                 status, result_uri, thumbnail_uri, created_at, completed_at, error,
                 params_json, gen_config_json, seed, enhanced_prompt,
                 parent_clip_id, shot_uuid, shot_config_key, composition_id,
-                lora_applied_id, lora_applied_strength)
+                lora_applied_id, lora_applied_strength, ab_arm)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job_id,
                 _hash_key(api_key),
@@ -896,6 +915,7 @@ class HistoryStore:
                 composition_id,
                 lora_applied_id,
                 lora_applied_strength,
+                ab_arm,
             ),
         )
         self._conn.commit()

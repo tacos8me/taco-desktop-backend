@@ -694,6 +694,165 @@ input[type="range"]::-moz-range-track {
 .worker-card .wc-idle { font-size: 0.72rem; color: var(--text-dim); font-style: italic; }
 .worker-card .wc-progress { height: 4px; background: var(--bg-hover); border-radius: 2px; margin-top: 8px; overflow: hidden; }
 .worker-card .wc-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
+
+/* v1.18.0-rc3 — B-dash panels (Quality / Experiments / Training / pair badge / failures) */
+.panel-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.panel-empty { color: var(--text-dim); font-size: 0.8rem; padding: 16px; text-align: center; font-style: italic; }
+.panel-error { color: var(--danger); font-size: 0.78rem; padding: 12px 16px; }
+
+/* Quality panel */
+.qual-row { display: flex; gap: 18px; align-items: stretch; flex-wrap: wrap; }
+.qual-hist-wrap { flex: 1 1 360px; min-width: 280px; }
+.qual-stats { flex: 0 0 auto; min-width: 180px; display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+.qual-stat-row { display: flex; justify-content: space-between; gap: 14px; font-size: 0.84rem; }
+.qual-stat-row .lbl { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.7rem; }
+.qual-stat-row .val { font-family: var(--mono); font-weight: 600; }
+.qual-hist svg { display: block; width: 100%; height: 140px; }
+.qual-hist .bucket { cursor: pointer; transition: opacity 0.2s; }
+.qual-hist .bucket:hover { opacity: 0.75; }
+.qual-hist .bucket-label { fill: var(--text-dim); font-family: var(--mono); font-size: 9px; }
+.qual-hist .bucket-count { fill: var(--text); font-family: var(--mono); font-size: 9px; font-weight: 600; }
+.qual-hist .axis { stroke: var(--border); stroke-width: 1; }
+.qual-versions { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+.qual-version-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 14px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  font-size: 0.75rem; font-family: var(--mono);
+}
+.qual-version-pill .v-name { color: var(--text); }
+.qual-version-pill .v-mean { color: var(--text-muted); }
+.qual-version-pill .v-count { color: var(--text-dim); }
+
+/* Validator failures banner */
+.fail-banner {
+  background: oklch(0.30 0.10 25);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+  color: oklch(0.92 0.10 25);
+}
+.fail-banner-head { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+.fail-banner-head .arrow { transition: transform 0.2s; display: inline-block; }
+.fail-banner-head.open .arrow { transform: rotate(90deg); }
+.fail-banner-head .spacer { flex: 1; }
+.fail-banner-dismiss {
+  background: transparent; border: 1px solid var(--danger); color: oklch(0.92 0.10 25);
+  font-size: 0.7rem; padding: 2px 8px; border-radius: 4px; cursor: pointer;
+}
+.fail-banner-dismiss:hover { background: oklch(0.40 0.12 25); }
+.fail-banner-list { display: none; margin-top: 10px; max-height: 220px; overflow-y: auto; }
+.fail-banner-list.open { display: block; }
+.fail-banner-list ol { list-style: decimal inside; padding-left: 4px; }
+.fail-banner-list li {
+  font-family: var(--mono); font-size: 0.72rem; color: oklch(0.88 0.06 25);
+  padding: 4px 0; border-top: 1px dashed oklch(0.40 0.10 25);
+  word-break: break-word;
+}
+.fail-banner-list li:first-child { border-top: none; }
+
+/* Experiments table */
+.exp-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.exp-table th, .exp-table td {
+  padding: 8px 10px; text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.exp-table th { color: var(--text-muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.7rem; }
+.exp-table td { font-family: var(--mono); color: var(--text); }
+.exp-table .cell-mean { white-space: nowrap; }
+.exp-table .delta-pos { color: var(--success); }
+.exp-table .delta-neg { color: var(--danger); }
+.exp-table .pval-sig { color: var(--success); font-weight: 600; }
+.exp-table .pval-ns  { color: var(--text-muted); }
+.exp-spark svg { display: block; }
+.exp-status {
+  font-size: 0.65rem; padding: 2px 8px; border-radius: 10px;
+  letter-spacing: 0.04em; text-transform: uppercase; font-family: var(--font);
+}
+.exp-status.in_progress { background: oklch(0.30 0.10 250); color: oklch(0.85 0.13 250); }
+.exp-status.promoted    { background: oklch(0.30 0.10 150); color: oklch(0.85 0.13 150); }
+.exp-status.deprecated  { background: oklch(0.30 0.10 25);  color: oklch(0.85 0.13 25);  }
+.exp-status.aborted     { background: oklch(0.28 0.04 280); color: var(--text-muted); }
+.exp-history {
+  margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border);
+}
+.exp-history-toggle {
+  cursor: pointer; user-select: none; font-size: 0.78rem; color: var(--text-muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.exp-history-toggle .arrow { transition: transform 0.2s; display: inline-block; font-size: 0.7rem; }
+.exp-history-toggle.open .arrow { transform: rotate(90deg); }
+.exp-history-body { display: none; margin-top: 10px; }
+.exp-history-body.open { display: block; }
+
+/* Training table */
+.train-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.train-table th, .train-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+.train-table th { color: var(--text-muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.7rem; }
+.train-table td { font-family: var(--mono); color: var(--text); }
+.train-table tbody tr { cursor: pointer; transition: background 0.15s; }
+.train-table tbody tr:hover { background: var(--bg-hover); }
+.train-spark svg { display: block; }
+.train-status {
+  font-size: 0.65rem; padding: 2px 8px; border-radius: 10px; font-family: var(--font);
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.train-status.running   { background: oklch(0.30 0.10 250); color: oklch(0.85 0.13 250); }
+.train-status.completed { background: oklch(0.30 0.10 150); color: oklch(0.85 0.13 150); }
+.train-status.failed    { background: oklch(0.30 0.10 25);  color: oklch(0.85 0.13 25);  }
+
+/* Generic modal */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+  display: none; align-items: center; justify-content: center; z-index: 100;
+  padding: 24px;
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  max-width: 720px; width: 100%; max-height: 85vh; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.modal-head {
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-head h3 { font-size: 0.95rem; font-weight: 600; }
+.modal-close {
+  background: transparent; border: none; color: var(--text-muted); cursor: pointer;
+  font-size: 1.4rem; line-height: 1; padding: 0 4px;
+}
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 18px; overflow-y: auto; }
+.modal-body dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 0.84rem; }
+.modal-body dt { color: var(--text-muted); }
+.modal-body dd { font-family: var(--mono); }
+
+/* Pair counter badge in header */
+.pair-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px; border-radius: 14px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  font-size: 0.78rem; font-family: var(--mono); cursor: pointer;
+  transition: border-color 0.2s;
+  margin-left: 12px;
+}
+.pair-badge:hover { border-color: var(--accent); }
+.pair-badge .pair-count { color: var(--text); font-weight: 600; }
+.pair-badge .pair-suffix { color: var(--text-muted); }
+@keyframes pair-pulse {
+  0%   { box-shadow: 0 0 0 0 oklch(0.65 0.15 150 / 0.5); }
+  50%  { box-shadow: 0 0 0 10px oklch(0.65 0.15 150 / 0); }
+  100% { box-shadow: 0 0 0 0 oklch(0.65 0.15 150 / 0); }
+}
+.pair-badge.pulse { animation: pair-pulse 1.4s ease-out 4; border-color: var(--success); }
 </style>
 </head>
 <body>
@@ -701,7 +860,7 @@ input[type="range"]::-moz-range-track {
 
 <!-- Header -->
 <header>
-  <h1>taco-backend <span>v1.2 — GPU Dashboard</span></h1>
+  <h1>taco-backend <span>v1.2 — GPU Dashboard</span><span id="pairBadge" class="pair-badge" title="Preference pairs collected" style="display:none" onclick="openPairModal()"><span class="pair-count">0</span><span class="pair-suffix">pairs</span></span></h1>
   <div class="conn-status">
     <div class="conn-dot" id="connDot"></div>
     <span id="connLabel">Connecting...</span>
@@ -799,6 +958,75 @@ input[type="range"]::-moz-range-track {
   <h2>Live Workers <span id="workerCount" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
   <div id="workersGrid" class="workers-grid"></div>
 </section>
+
+<!-- Section 3.6: Quality (v1.18.0-rc3, B-dash panel #1 + #5 banner) -->
+<section>
+  <h2>Quality <span id="qualMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+  <div id="failBanner" class="fail-banner" style="display:none"></div>
+  <div class="panel-card" id="qualPanel">
+    <div class="panel-empty" id="qualEmpty">No validator scores in window.</div>
+    <div id="qualBody" style="display:none">
+      <div class="qual-row">
+        <div class="qual-hist-wrap">
+          <div class="qual-hist" id="qualHist"></div>
+        </div>
+        <div class="qual-stats" id="qualStats"></div>
+      </div>
+      <div class="qual-versions" id="qualVersions"></div>
+    </div>
+  </div>
+</section>
+
+<!-- Section 3.7: Experiments (v1.18.0-rc3, B-dash panel #2) -->
+<section>
+  <h2>Experiments <span id="expMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+  <div class="panel-card" id="expPanel">
+    <div class="panel-empty" id="expEmpty">No experiments yet (admin-gated).</div>
+    <div id="expBody" style="display:none">
+      <table class="exp-table" id="expTable">
+        <thead><tr>
+          <th>Candidate</th><th>n (b/c)</th><th>Mean (b → c)</th>
+          <th>p</th><th>Trend</th><th>Status</th><th>Action</th>
+        </tr></thead>
+        <tbody id="expTbody"></tbody>
+      </table>
+      <div class="exp-history" id="expHistoryWrap" style="display:none">
+        <div class="exp-history-toggle" id="expHistoryToggle" onclick="toggleExpHistory()">
+          <span class="arrow">&#9654;</span><span id="expHistoryLabel">Resolved (0)</span>
+        </div>
+        <div class="exp-history-body" id="expHistoryBody"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Section 3.8: Training (v1.18.0-rc3, B-dash panel #3) -->
+<section>
+  <h2>Training <span id="trainMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+  <div class="panel-card" id="trainPanel">
+    <div class="panel-empty" id="trainEmpty">No training runs yet (admin-gated).</div>
+    <div id="trainBody" style="display:none">
+      <table class="train-table" id="trainTable">
+        <thead><tr>
+          <th>Run</th><th>Candidate LoRA</th><th>Status</th><th>Step</th>
+          <th>ETA</th><th>Eval Loss</th>
+        </tr></thead>
+        <tbody id="trainTbody"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- Generic modal (v1.18.0-rc3) -->
+<div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modalTitle">—</h3>
+      <button class="modal-close" onclick="closeModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
 
 <!-- Section 4: Controls -->
 <section>
@@ -1951,6 +2179,482 @@ function renderWorkers(d) {
     : `<div class="wc-idle" style="padding:12px">No active workers. Enable turbo or scale the remote pool.</div>`;
 }
 
+// ---------------------------------------------------------------------------
+// v1.18.0-rc3 — B-dash panels (Quality / Experiments / Training / Pair badge / Failures)
+// ---------------------------------------------------------------------------
+
+// Pause poll callbacks while tab hidden — saves req budget on every panel.
+function _tabVisible() { return document.visibilityState !== "hidden"; }
+
+function _fmtNum(n) { return Number(n).toLocaleString(); }
+function _fmtPct(n) { return (n * 100).toFixed(1) + "%"; }
+function _fmtFixed(n, d=3) { return (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d); }
+
+// Generic modal helpers
+function openModal(title, htmlBody) {
+  document.getElementById("modalTitle").textContent = title;
+  document.getElementById("modalBody").innerHTML = htmlBody;
+  document.getElementById("modalOverlay").classList.add("open");
+}
+function closeModal() {
+  document.getElementById("modalOverlay").classList.remove("open");
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+
+// ----- Panel #1: Quality (validator-stats histogram) -----
+
+function _bucketColor(idx) {
+  // bucket idx 0..9 = score range [idx*0.1, idx*0.1+0.1)
+  // [0,0.45) = danger, [0.45,0.65) = warning, [0.65,1.0] = success
+  const lo = idx * 0.1;
+  if (lo < 0.45) return "var(--danger)";
+  if (lo < 0.65) return "var(--warning)";
+  return "var(--success)";
+}
+
+function renderQualityHistogram(hist) {
+  const total = hist.reduce((a, b) => a + b, 0);
+  const max = Math.max(1, ...hist);
+  const W = 520, H = 140, padL = 28, padR = 8, padT = 12, padB = 22;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const bw = innerW / 10;
+  let bars = "";
+  for (let i = 0; i < 10; i++) {
+    const v = hist[i];
+    const h = max ? (v / max) * innerH : 0;
+    const x = padL + i * bw + 2;
+    const y = padT + innerH - h;
+    const w = bw - 4;
+    const lo = (i / 10).toFixed(1);
+    const hi = ((i + 1) / 10).toFixed(1);
+    bars += `<rect class="bucket" data-bucket="${i}" data-lo="${lo}" data-hi="${hi}" data-count="${v}" `
+          + `x="${x}" y="${y}" width="${w}" height="${h}" rx="2" fill="${_bucketColor(i)}">`
+          + `<title>[${lo}, ${hi}) — ${v} clips (${total ? ((v / total) * 100).toFixed(1) : 0}%)</title></rect>`;
+    if (v > 0) {
+      bars += `<text class="bucket-count" x="${x + w / 2}" y="${y - 3}" text-anchor="middle">${v}</text>`;
+    }
+    if (i % 2 === 0) {
+      bars += `<text class="bucket-label" x="${x}" y="${H - 6}" text-anchor="start">${lo}</text>`;
+    }
+  }
+  bars += `<text class="bucket-label" x="${W - padR}" y="${H - 6}" text-anchor="end">1.0</text>`;
+  bars += `<line class="axis" x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}"/>`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${bars}</svg>`;
+}
+
+async function pollValidatorStats() {
+  if (!_tabVisible()) return;
+  let data;
+  try {
+    const r = await fetch("/v1/system/validator-stats?window=24h", { headers: getAuthHeaders() });
+    if (!r.ok) {
+      document.getElementById("qualEmpty").textContent = `Error: HTTP ${r.status}`;
+      return;
+    }
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("qualEmpty").textContent = "Error: " + e.message;
+    return;
+  }
+  const meta = document.getElementById("qualMeta");
+  const empty = document.getElementById("qualEmpty");
+  const body = document.getElementById("qualBody");
+  meta.textContent = `(window 24h)`;
+  if (!data.count) {
+    empty.style.display = ""; body.style.display = "none";
+    empty.textContent = "No validator scores in window.";
+    return;
+  }
+  empty.style.display = "none"; body.style.display = "";
+  document.getElementById("qualHist").innerHTML = renderQualityHistogram(data.histogram || [0,0,0,0,0,0,0,0,0,0]);
+  // Wire bucket click → modal
+  document.querySelectorAll("#qualHist .bucket").forEach(rect => {
+    rect.addEventListener("click", () => {
+      const lo = rect.getAttribute("data-lo");
+      const hi = rect.getAttribute("data-hi");
+      const cnt = rect.getAttribute("data-count");
+      const html = `<dl>
+        <dt>Range</dt><dd>[${lo}, ${hi})</dd>
+        <dt>Count</dt><dd>${cnt} clips</dd>
+        <dt>Window</dt><dd>last 24 h</dd>
+      </dl>
+      <p style="margin-top:14px;color:var(--text-muted);font-size:0.78rem">
+        History filtering by validator_score is not yet exposed via /v2/history.
+        Drill-down details land in v1.19.0-rc1.
+      </p>`;
+      openModal(`Bucket [${lo}, ${hi})`, html);
+    });
+  });
+  document.getElementById("qualStats").innerHTML = `
+    <div class="qual-stat-row"><span class="lbl">mean</span><span class="val">${_fmtFixed(data.mean)}</span></div>
+    <div class="qual-stat-row"><span class="lbl">p50</span><span class="val">${_fmtFixed(data.p50)}</span></div>
+    <div class="qual-stat-row"><span class="lbl">p95</span><span class="val">${_fmtFixed(data.p95)}</span></div>
+    <div class="qual-stat-row"><span class="lbl">count</span><span class="val">${_fmtNum(data.count)}</span></div>
+  `;
+  const versions = data.by_version || {};
+  const vKeys = Object.keys(versions);
+  document.getElementById("qualVersions").innerHTML = vKeys.length
+    ? vKeys.sort().map(v => {
+        const s = versions[v];
+        return `<span class="qual-version-pill" title="${_escapeHtml(v)}">
+          <span class="v-name">${_escapeHtml(v)}</span>
+          <span class="v-mean">μ ${_fmtFixed(s.mean)}</span>
+          <span class="v-count">·  n=${_fmtNum(s.count)}</span>
+        </span>`;
+      }).join("")
+    : "";
+}
+
+// ----- Panel #5: Validator failures ticker (banner inside Quality) -----
+
+let _failBannerDismissed = false;
+
+async function pollValidatorFailures() {
+  if (!_tabVisible()) return;
+  if (_failBannerDismissed) return;
+  let data;
+  try {
+    const r = await fetch("/v1/system/validator-failures?window=1h", { headers: getAuthHeaders() });
+    if (!r.ok) return; // admin-gated; quietly hide if 401/403
+    data = await r.json();
+  } catch (e) { return; }
+  const banner = document.getElementById("failBanner");
+  if (!data.count) {
+    banner.style.display = "none";
+    return;
+  }
+  banner.style.display = "";
+  const items = (data.recent || []).map(it => {
+    const ts = it.ts ? new Date(it.ts * 1000).toISOString().replace("T", " ").replace("Z", "") : "—";
+    const tier = it.tier || it.stage || "—";
+    const err = (it.error || it.message || "").toString().slice(0, 200);
+    return `<li>${_escapeHtml(ts)} · ${_escapeHtml(tier)} → ${_escapeHtml(err)}</li>`;
+  }).join("");
+  banner.innerHTML = `
+    <div class="fail-banner-head" id="failBannerHead">
+      <span class="arrow">&#9654;</span>
+      <strong>${data.count} validator failure${data.count === 1 ? "" : "s"}</strong> in last 1h
+      <span class="spacer"></span>
+      <button class="fail-banner-dismiss" onclick="dismissFailBanner(event)">dismiss</button>
+    </div>
+    <div class="fail-banner-list" id="failBannerList"><ol>${items}</ol></div>
+  `;
+  document.getElementById("failBannerHead").addEventListener("click", e => {
+    if (e.target.closest(".fail-banner-dismiss")) return;
+    document.getElementById("failBannerHead").classList.toggle("open");
+    document.getElementById("failBannerList").classList.toggle("open");
+  });
+}
+function dismissFailBanner(e) {
+  e && e.stopPropagation();
+  _failBannerDismissed = true;
+  document.getElementById("failBanner").style.display = "none";
+}
+
+// ----- Panel #2: Experiments -----
+
+function _expSparkline(deltaSeries) {
+  // Cumulative-mean delta sparkline. deltaSeries = [v0, v1, ...] cumulative.
+  if (!deltaSeries || deltaSeries.length < 2) return "";
+  const W = 80, H = 22;
+  const lo = Math.min(...deltaSeries, 0);
+  const hi = Math.max(...deltaSeries, 0);
+  const range = (hi - lo) || 1;
+  const pts = deltaSeries.map((v, i) => {
+    const x = (i / (deltaSeries.length - 1)) * (W - 2) + 1;
+    const y = H - 1 - ((v - lo) / range) * (H - 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const last = deltaSeries[deltaSeries.length - 1];
+  const color = last >= 0 ? "var(--success)" : "var(--danger)";
+  // Zero baseline
+  const zeroY = H - 1 - ((0 - lo) / range) * (H - 2);
+  return `<svg class="exp-spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+    <line x1="0" y1="${zeroY.toFixed(1)}" x2="${W}" y2="${zeroY.toFixed(1)}" stroke="var(--text-dim)" stroke-width="0.5" stroke-dasharray="2,2"/>
+    <polyline fill="none" stroke="${color}" stroke-width="1.5" points="${pts}"/>
+  </svg>`;
+}
+
+function _abortBtn(exp) {
+  // Endpoint pending v1.19.0-rc2 — render disabled with tooltip.
+  return `<button class="btn" disabled style="font-size:0.7rem;padding:4px 10px;opacity:0.5;cursor:not-allowed"
+    title="Abort endpoint pending v1.19.0-rc2">Abort</button>`;
+}
+
+function _renderExpRow(exp) {
+  const dC = exp.mean_c - exp.mean_b;
+  const dPct = exp.mean_b ? (dC / exp.mean_b) * 100 : 0;
+  const dCls = dC >= 0 ? "delta-pos" : "delta-neg";
+  const pSig = exp.p_value < 0.05 ? "pval-sig" : "pval-ns";
+  const pTip = "Welch's t-test (per-MV mean validator_score)";
+  // Synthetic sparkline from current delta — shows direction only without time-series API
+  const spark = _expSparkline([0, dC * 0.3, dC * 0.6, dC]);
+  const cand = (exp.candidate_lora || "").slice(0, 22);
+  return `<tr>
+    <td title="${_escapeHtml(exp.candidate_lora || '')}">${_escapeHtml(cand)}</td>
+    <td>${exp.n_b}/${exp.n_c}</td>
+    <td class="cell-mean">${_fmtFixed(exp.mean_b)} → ${_fmtFixed(exp.mean_c)}
+        <span class="${dCls}">(${dC >= 0 ? "+" : ""}${dPct.toFixed(1)}%)</span></td>
+    <td class="${pSig}" title="${pTip}">${_fmtFixed(exp.p_value, 4)}</td>
+    <td>${spark}</td>
+    <td><span class="exp-status ${exp.status}">${exp.status}</span></td>
+    <td>${exp.status === "in_progress" ? _abortBtn(exp) : ""}</td>
+  </tr>`;
+}
+
+async function pollExperiments() {
+  if (!_tabVisible()) return;
+  let data;
+  try {
+    const r = await fetch("/v1/system/ab-status", { headers: getAuthHeaders() });
+    if (!r.ok) {
+      const empty = document.getElementById("expEmpty");
+      if (r.status === 401 || r.status === 403) empty.textContent = "Admin auth required to view experiments.";
+      else empty.textContent = `Error: HTTP ${r.status}`;
+      empty.style.display = "";
+      document.getElementById("expBody").style.display = "none";
+      return;
+    }
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("expEmpty").textContent = "Error: " + e.message;
+    return;
+  }
+  const all = data.experiments || [];
+  const active = all.filter(e => e.status === "in_progress");
+  const resolved = all.filter(e => e.status !== "in_progress");
+  const meta = document.getElementById("expMeta");
+  const empty = document.getElementById("expEmpty");
+  const body = document.getElementById("expBody");
+  meta.textContent = all.length ? `(${active.length} active · ${resolved.length} resolved)` : "";
+  if (!all.length) {
+    empty.style.display = ""; body.style.display = "none";
+    empty.textContent = "No experiments yet.";
+    return;
+  }
+  empty.style.display = "none"; body.style.display = "";
+  document.getElementById("expTbody").innerHTML = active.length
+    ? active.map(_renderExpRow).join("")
+    : `<tr><td colspan="7" style="text-align:center;color:var(--text-dim);padding:14px">No active experiments.</td></tr>`;
+  const histWrap = document.getElementById("expHistoryWrap");
+  if (resolved.length) {
+    histWrap.style.display = "";
+    document.getElementById("expHistoryLabel").textContent = `Resolved (${resolved.length})`;
+    document.getElementById("expHistoryBody").innerHTML = `
+      <table class="exp-table">
+        <thead><tr>
+          <th>Candidate</th><th>n (b/c)</th><th>Mean (b → c)</th>
+          <th>p</th><th>Trend</th><th>Status</th><th>Action</th>
+        </tr></thead>
+        <tbody>${resolved.map(_renderExpRow).join("")}</tbody>
+      </table>`;
+  } else {
+    histWrap.style.display = "none";
+  }
+}
+function toggleExpHistory() {
+  document.getElementById("expHistoryToggle").classList.toggle("open");
+  document.getElementById("expHistoryBody").classList.toggle("open");
+}
+
+// ----- Panel #3: Training -----
+
+function _trainSpark(values) {
+  if (!values || values.length < 2) return "";
+  const W = 100, H = 22;
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  const range = (hi - lo) || 1;
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * (W - 2) + 1;
+    const y = H - 1 - ((v - lo) / range) * (H - 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg class="train-spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+    <polyline fill="none" stroke="var(--accent)" stroke-width="1.5" points="${pts}"/>
+  </svg>`;
+}
+
+function _trainStatusFor(run) {
+  if (run.deprecated_at) return "failed";
+  if (run.deployed_at) return "completed";
+  // No "running" signal in current schema (synchronous train script writes once).
+  return "completed";
+}
+
+function _trainEvalSeries(metrics) {
+  // eval_metrics_json shape varies; try common keys.
+  if (!metrics) return [];
+  if (Array.isArray(metrics)) return metrics.filter(v => typeof v === "number").slice(-20);
+  const candidates = ["eval_loss", "val_loss", "loss", "history", "losses"];
+  for (const k of candidates) {
+    if (Array.isArray(metrics[k])) {
+      return metrics[k].filter(v => typeof v === "number").slice(-20);
+    }
+  }
+  return [];
+}
+
+function _renderTrainRow(run) {
+  const runId = (run.run_id || "").slice(0, 12);
+  const cand = (run.lora_registry_id || "—").slice(0, 22);
+  const status = _trainStatusFor(run);
+  const series = _trainEvalSeries(run.eval_metrics);
+  const spark = series.length ? _trainSpark(series) : "—";
+  const last = series.length ? _fmtFixed(series[series.length - 1], 4) : "—";
+  // ETA: not available in current schema (no current_step / total_steps fields)
+  const eta = "—";
+  const step = run.num_pairs ? `${run.num_pairs} pairs` : "—";
+  return `<tr data-run-id="${_escapeHtml(run.run_id || '')}">
+    <td title="${_escapeHtml(run.run_id || '')}">${_escapeHtml(runId)}…</td>
+    <td title="${_escapeHtml(run.lora_registry_id || '')}">${_escapeHtml(cand)}</td>
+    <td><span class="train-status ${status}">${status}</span></td>
+    <td>${_escapeHtml(step)}</td>
+    <td>${eta}</td>
+    <td>${spark} <span style="margin-left:6px;color:var(--text-muted)">${last}</span></td>
+  </tr>`;
+}
+
+let _trainRunsCache = [];
+
+async function pollTrainingRuns() {
+  if (!_tabVisible()) return;
+  let data;
+  try {
+    const r = await fetch("/v1/system/training-runs", { headers: getAuthHeaders() });
+    if (!r.ok) {
+      const empty = document.getElementById("trainEmpty");
+      if (r.status === 401 || r.status === 403) empty.textContent = "Admin auth required to view training runs.";
+      else empty.textContent = `Error: HTTP ${r.status}`;
+      empty.style.display = "";
+      document.getElementById("trainBody").style.display = "none";
+      return;
+    }
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("trainEmpty").textContent = "Error: " + e.message;
+    return;
+  }
+  const runs = data.runs || [];
+  _trainRunsCache = runs;
+  const meta = document.getElementById("trainMeta");
+  const empty = document.getElementById("trainEmpty");
+  const body = document.getElementById("trainBody");
+  meta.textContent = runs.length ? `(${runs.length} run${runs.length === 1 ? "" : "s"})` : "";
+  if (!runs.length) {
+    empty.style.display = ""; body.style.display = "none";
+    empty.textContent = "No training runs yet.";
+    return;
+  }
+  empty.style.display = "none"; body.style.display = "";
+  const tbody = document.getElementById("trainTbody");
+  tbody.innerHTML = runs.map(_renderTrainRow).join("");
+  tbody.querySelectorAll("tr").forEach(tr => {
+    tr.addEventListener("click", () => openTrainModal(tr.getAttribute("data-run-id")));
+  });
+}
+
+function openTrainModal(runId) {
+  const run = _trainRunsCache.find(r => r.run_id === runId);
+  if (!run) return;
+  const series = _trainEvalSeries(run.eval_metrics);
+  // Larger chart in modal
+  let chart = "";
+  if (series.length >= 2) {
+    const W = 600, H = 220, padL = 40, padR = 12, padT = 14, padB = 28;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const lo = Math.min(...series);
+    const hi = Math.max(...series);
+    const range = (hi - lo) || 1;
+    const pts = series.map((v, i) => {
+      const x = padL + (i / (series.length - 1)) * innerW;
+      const y = padT + innerH - ((v - lo) / range) * innerH;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    chart = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:240px;background:var(--bg-input);border-radius:4px">
+      <line x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}" stroke="var(--border)"/>
+      <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + innerH}" stroke="var(--border)"/>
+      <text x="${padL - 6}" y="${padT + 4}" text-anchor="end" fill="var(--text-dim)" font-size="10" font-family="monospace">${_fmtFixed(hi, 4)}</text>
+      <text x="${padL - 6}" y="${padT + innerH}" text-anchor="end" fill="var(--text-dim)" font-size="10" font-family="monospace">${_fmtFixed(lo, 4)}</text>
+      <polyline fill="none" stroke="var(--accent)" stroke-width="1.5" points="${pts}"/>
+    </svg>`;
+  } else {
+    chart = `<div class="panel-empty">No eval-loss series available.</div>`;
+  }
+  const html = `
+    <dl>
+      <dt>run_id</dt><dd>${_escapeHtml(run.run_id || "—")}</dd>
+      <dt>base_model</dt><dd>${_escapeHtml(run.base_model || "—")}</dd>
+      <dt>base_model_sha</dt><dd>${_escapeHtml((run.base_model_sha || "").slice(0, 16))}</dd>
+      <dt>lora_registry_id</dt><dd>${_escapeHtml(run.lora_registry_id || "—")}</dd>
+      <dt>num_pairs</dt><dd>${_fmtNum(run.num_pairs || 0)}</dd>
+      <dt>val_loss</dt><dd>${_fmtFixed(run.val_loss, 4)}</dd>
+      <dt>trained_at</dt><dd>${run.trained_at ? new Date(run.trained_at * 1000).toISOString() : "—"}</dd>
+      <dt>deployed_at</dt><dd>${run.deployed_at ? new Date(run.deployed_at * 1000).toISOString() : "—"}</dd>
+      <dt>deprecated_at</dt><dd>${run.deprecated_at ? new Date(run.deprecated_at * 1000).toISOString() : "—"}</dd>
+    </dl>
+    <h4 style="margin-top:18px;margin-bottom:8px;color:var(--text-muted);font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em">Eval Loss</h4>
+    ${chart}
+  `;
+  openModal(`Training run · ${(run.run_id || "").slice(0, 16)}`, html);
+}
+
+// ----- Panel #4: Pair counter badge -----
+
+let _pairCache = null;
+
+async function pollPairCount() {
+  if (!_tabVisible()) return;
+  let data;
+  try {
+    const r = await fetch("/v1/system/preference-pairs-count", { headers: getAuthHeaders() });
+    if (!r.ok) {
+      document.getElementById("pairBadge").style.display = "none";
+      return;
+    }
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("pairBadge").style.display = "none";
+    return;
+  }
+  _pairCache = data;
+  const badge = document.getElementById("pairBadge");
+  badge.style.display = "";
+  badge.querySelector(".pair-count").textContent = _fmtNum(data.total || 0);
+  // First-cross-1000 pulse, sessionStorage gated
+  if ((data.total || 0) >= 1000) {
+    if (!sessionStorage.getItem("taco_pair_pulsed")) {
+      sessionStorage.setItem("taco_pair_pulsed", "1");
+      badge.classList.add("pulse");
+      setTimeout(() => badge.classList.remove("pulse"), 1400 * 4 + 500);
+    }
+  }
+}
+
+function openPairModal() {
+  const d = _pairCache;
+  if (!d) return;
+  const bs = d.by_source || {};
+  const rows = Object.keys(bs).sort().map(k =>
+    `<dt>${_escapeHtml(k)}</dt><dd>${_fmtNum(bs[k])}</dd>`
+  ).join("");
+  const html = `
+    <dl>
+      <dt><strong>Total</strong></dt><dd><strong>${_fmtNum(d.total || 0)}</strong></dd>
+      <dt>last 24 h</dt><dd>${_fmtNum(d.last_24h || 0)}</dd>
+      <dt>last 7 d</dt><dd>${_fmtNum(d.last_7d || 0)}</dd>
+    </dl>
+    <h4 style="margin-top:14px;margin-bottom:8px;color:var(--text-muted);font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em">By signal source</h4>
+    ${rows ? `<dl>${rows}</dl>` : `<div class="panel-empty" style="padding:8px">No signal sources yet.</div>`}
+    <p style="margin-top:14px;color:var(--text-muted);font-size:0.78rem">
+      First Phase C training run waits until corpus crosses ~1,000 pairs (~6-8 weeks at single-operator volume).
+    </p>
+  `;
+  openModal("Preference pairs", html);
+}
+
 // Start polling
 pollHealth();
 setInterval(pollHealth, 2000);
@@ -1964,6 +2668,24 @@ setInterval(pollPool, 5000);
 // v1.13.0 live workers (2s cadence — fast enough for phase transitions)
 pollWorkers();
 setInterval(pollWorkers, 2000);
+
+// v1.18.0-rc3 B-dash panels — staggered cadences per spec.
+pollValidatorStats();      setInterval(pollValidatorStats,    30000);
+pollValidatorFailures();   setInterval(pollValidatorFailures, 30000);
+pollExperiments();         setInterval(pollExperiments,       10000);
+pollTrainingRuns();         setInterval(pollTrainingRuns,      30000);
+pollPairCount();            setInterval(pollPairCount,         30000);
+
+// Re-poll immediately when tab becomes visible (avoid stale UI on tab switch).
+document.addEventListener("visibilitychange", () => {
+  if (_tabVisible()) {
+    pollValidatorStats();
+    pollValidatorFailures();
+    pollExperiments();
+    pollTrainingRuns();
+    pollPairCount();
+  }
+});
 </script>
 </body>
 </html>

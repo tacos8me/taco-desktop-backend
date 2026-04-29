@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 import config
 import split_model_manager
@@ -354,6 +354,9 @@ async def _run_music_job(job: Job) -> None:
 _HISTORY_ONLY_PARAMS = (
     "parent_clip_id", "shot_uuid", "shot_config_key",
     "composition_id", "lora_applied_id", "lora_applied_strength",
+    # v1.18.0-rc5: A/B harness cohort. Stamped by MCP `_apply_ab_routing`,
+    # forwarded in the per-shot HTTP body, persisted to `generations.ab_arm`.
+    "ab_arm",
 )
 
 
@@ -843,6 +846,7 @@ ImageModelName = Literal["flux2-dev", "flux2-klein", "joyai-edit", "ernie-image"
 
 
 class TextToVideoRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     prompt: str = Field(max_length=10000)
     model: ModelName
     resolution: Resolution
@@ -852,6 +856,16 @@ class TextToVideoRequest(BaseModel):
     camera_motion: str | None = Field(default=None, max_length=200)
     lora: LoRAInput | None = None
     enhance_prompt: bool = False
+    # v1.18.0-rc5: A/B harness cohort marker forwarded by MCP
+    # `_apply_ab_routing`. Persisted to `generations.ab_arm` for the
+    # weekly `scripts/ab_decision.py` t-test cohort comparison.
+    ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)
+    # v1.18.0-rc6: lineage markers forwarded by MCP per-shot bodies.
+    # Persisted to `generations.shot_uuid` / `generations.shot_config_key`
+    # for the rc1 lineage tables. Pre-rc6 these were silently dropped by
+    # Pydantic `extra="ignore"` because the fields weren't declared.
+    shot_uuid: str | None = Field(default=None, max_length=64)
+    shot_config_key: str | None = Field(default=None, max_length=128)
 
 
 class KeyframeInput(BaseModel):
@@ -861,6 +875,7 @@ class KeyframeInput(BaseModel):
 
 
 class ImageToVideoRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     prompt: str = Field(max_length=10000)
     image_uri: str | None = None
     image_strength: float = Field(default=0.85, ge=0.0, le=1.0)
@@ -874,6 +889,9 @@ class ImageToVideoRequest(BaseModel):
     generate_audio: bool = False
     lora: LoRAInput | None = None
     enhance_prompt: bool = False
+    ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)
+    shot_uuid: str | None = Field(default=None, max_length=64)
+    shot_config_key: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def _check_i2v_exclusive(self) -> "ImageToVideoRequest":
@@ -919,6 +937,10 @@ class AudioToVideoRequest(BaseModel):
     fps: float = Field(default=24.0, gt=0, le=60)
     lora: LoRAInput | None = None
     enhance_prompt: bool = False
+    ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)
+    shot_uuid: str | None = Field(default=None, max_length=64)
+    shot_config_key: str | None = Field(default=None, max_length=128)
+    model_config = ConfigDict(populate_by_name=True)
 
     @model_validator(mode="after")
     def _check_keyframes_exclusive(self) -> "AudioToVideoRequest":
@@ -939,12 +961,16 @@ class AudioToVideoRequest(BaseModel):
 
 
 class RetakeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
     video_uri: str
     start_time: float = Field(ge=0)
     duration: float = Field(gt=0, le=30)
     mode: RetakeMode
     prompt: str | None = Field(default=None, max_length=10000)
     lora: LoRAInput | None = None
+    ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)
+    shot_uuid: str | None = Field(default=None, max_length=64)
+    shot_config_key: str | None = Field(default=None, max_length=128)
 
 
 OutpaintPosition = Literal[
@@ -966,6 +992,7 @@ class VideoOutpaintRequest(BaseModel):
     with IC-LoRA conditioning, stage 2 upsamples + refines). Set
     `skip_stage_2=true` for a faster half-resolution preview.
     """
+    model_config = ConfigDict(populate_by_name=True)
     video_uri: str
     prompt: str = Field(max_length=10000)
     target_resolution: Resolution
@@ -977,6 +1004,9 @@ class VideoOutpaintRequest(BaseModel):
     lora: LoRAInput | None = None
     conditioning_strength: float = Field(default=1.0, ge=0.0, le=1.0)
     skip_stage_2: bool = False
+    ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)
+    shot_uuid: str | None = Field(default=None, max_length=64)
+    shot_config_key: str | None = Field(default=None, max_length=128)
 
 
 class VideoHdrRequest(BaseModel):
@@ -994,6 +1024,7 @@ class VideoHdrRequest(BaseModel):
     half-resolution preview that exactly matches upstream's reference
     LoRA-active stage-1 behavior.
     """
+    model_config = ConfigDict(populate_by_name=True)
     video_uri: str
     prompt: str = Field(max_length=10000)
     duration: float = Field(gt=0, le=30)
@@ -1003,6 +1034,9 @@ class VideoHdrRequest(BaseModel):
     lora: LoRAInput | None = None
     conditioning_strength: float = Field(default=1.0, ge=0.0, le=1.0)
     skip_stage_2: bool = False
+    ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)
+    shot_uuid: str | None = Field(default=None, max_length=64)
+    shot_config_key: str | None = Field(default=None, max_length=128)
 
 
 class ExtractFramesRequest(BaseModel):
@@ -1690,6 +1724,279 @@ async def system_metrics(request: Request) -> JSONResponse:
             "bulk_revalidate_total": em["bulk_revalidate_total"],
         },
     })
+
+
+# ---------------------------------------------------------------------------
+# v1.19 — operator console stats endpoints (Stream B1).
+#
+# Six read endpoints + one read/write pair, all under /v1/system/ or
+# /v1/api-keys/. Each ≤ 60 LOC, follows the existing /v1/system/metrics
+# auth pattern. All data already lives in SQLite — no schema migration.
+# Rate-limit middleware coverage extended to these paths.
+# ---------------------------------------------------------------------------
+
+
+def _parse_window_seconds(window: str | None, default: float) -> float:
+    """Accept ``"24h"`` / ``"7d"`` / ``"1h"`` / ``"30m"`` / ``"15s"`` or raw seconds."""
+    if not window:
+        return default
+    s = window.strip().lower()
+    try:
+        if s.endswith("d"):
+            return float(s[:-1]) * 86400.0
+        if s.endswith("h"):
+            return float(s[:-1]) * 3600.0
+        if s.endswith("m"):
+            return float(s[:-1]) * 60.0
+        if s.endswith("s"):
+            return float(s[:-1])
+        return float(s)
+    except ValueError:
+        return default
+
+
+@app.get("/v1/system/validator-stats")
+async def system_validator_stats(request: Request) -> JSONResponse:
+    """Histogram + percentiles of validator scores in a recent window.
+
+    Query: ``?window=24h`` (default). Buckets are 10 equal-width slots
+    [0.0, 0.1) ... [0.9, 1.0]. ``by_version`` breaks down mean+count
+    per ``validator_version`` so version drifts surface immediately.
+    """
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    window = _parse_window_seconds(request.query_params.get("window"), 86400.0)
+    cutoff = time.time() - window
+    rows = history._conn.execute(
+        """SELECT validator_score, validator_version FROM generations
+           WHERE created_at > ? AND validator_score IS NOT NULL""",
+        (cutoff,),
+    ).fetchall()
+    scores = [float(r["validator_score"]) for r in rows]
+    histogram = [0] * 10
+    for s in scores:
+        b = min(9, max(0, int(s * 10)))
+        histogram[b] += 1
+    by_version: dict[str, dict[str, float]] = {}
+    for r in rows:
+        v = r["validator_version"] or "unknown"
+        slot = by_version.setdefault(v, {"_sum": 0.0, "count": 0})
+        slot["_sum"] += float(r["validator_score"])
+        slot["count"] += 1
+    by_version_out = {
+        v: {"mean": round(s["_sum"] / s["count"], 4), "count": int(s["count"])}
+        for v, s in by_version.items()
+    }
+    from _ab_stats import percentile
+    return JSONResponse(content={
+        "histogram": histogram,
+        "mean": round(sum(scores) / len(scores), 4) if scores else 0.0,
+        "p50": round(percentile(scores, 50.0), 4),
+        "p95": round(percentile(scores, 95.0), 4),
+        "count": len(scores),
+        "by_version": by_version_out,
+        "window_seconds": window,
+    })
+
+
+@app.get("/v1/system/ab-status")
+async def system_ab_status(request: Request) -> JSONResponse:
+    """Active A/B experiments — per-arm n + means + Welch's t-test p-value.
+
+    Admin-gated: experiment metadata can leak candidate-LoRA identity
+    before promotion. One row per training_runs candidate; status is
+    ``promoted`` / ``deprecated`` / ``in_progress`` based on the
+    deployed_at + deprecated_at columns. Cohort grouping uses the
+    schema-v6 ``generations.ab_arm`` column.
+    """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    runs = history._conn.execute(
+        """SELECT run_id, lora_registry_id, trained_at, deployed_at, deprecated_at
+           FROM training_runs ORDER BY trained_at DESC LIMIT 50"""
+    ).fetchall()
+    from _ab_stats import welch_ttest
+    base_rows = history._conn.execute(
+        """SELECT composition_id, AVG(validator_score) AS m FROM generations
+           WHERE composition_id IS NOT NULL AND validator_score IS NOT NULL
+             AND ab_arm = 'baseline'
+           GROUP BY composition_id"""
+    ).fetchall()
+    b_means = [float(x["m"]) for x in base_rows if x["m"] is not None]
+    experiments: list[dict] = []
+    for r in runs:
+        candidate_lora = r["lora_registry_id"] or r["run_id"]
+        cand_rows = history._conn.execute(
+            """SELECT composition_id, AVG(validator_score) AS m FROM generations
+               WHERE composition_id IS NOT NULL AND validator_score IS NOT NULL
+                 AND ab_arm = 'candidate' AND lora_applied_id = ?
+               GROUP BY composition_id""",
+            (candidate_lora,),
+        ).fetchall()
+        c_means = [float(x["m"]) for x in cand_rows if x["m"] is not None]
+        if not c_means and not b_means:
+            continue
+        if len(c_means) >= 2 and len(b_means) >= 2:
+            _, p = welch_ttest(c_means, b_means)
+        else:
+            p = 1.0
+        if r["deprecated_at"]:
+            status = "deprecated"
+        elif r["deployed_at"]:
+            status = "promoted"
+        else:
+            status = "in_progress"
+        experiments.append({
+            "id": r["run_id"],
+            "baseline_lora": "default",
+            "candidate_lora": candidate_lora,
+            "n_b": len(b_means),
+            "n_c": len(c_means),
+            "mean_b": round(sum(b_means) / len(b_means), 4) if b_means else 0.0,
+            "mean_c": round(sum(c_means) / len(c_means), 4) if c_means else 0.0,
+            "p_value": round(float(p), 4),
+            "status": status,
+            "started_at": r["trained_at"],
+        })
+    return JSONResponse(content={"experiments": experiments})
+
+
+@app.get("/v1/system/training-runs")
+async def system_training_runs(request: Request) -> JSONResponse:
+    """List recent training_runs rows + parsed eval_metrics_json (admin)."""
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    rows = history._conn.execute(
+        """SELECT run_id, base_model, base_model_sha, lora_output_path,
+                  lora_registry_id, num_pairs, val_loss, eval_metrics_json,
+                  trained_at, deployed_at, deprecated_at
+           FROM training_runs ORDER BY trained_at DESC LIMIT 50"""
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        try:
+            metrics = _json_mod.loads(r["eval_metrics_json"]) if r["eval_metrics_json"] else None
+        except (ValueError, TypeError):
+            metrics = None
+        out.append({
+            "run_id": r["run_id"],
+            "base_model": r["base_model"],
+            "base_model_sha": r["base_model_sha"],
+            "lora_output_path": r["lora_output_path"],
+            "lora_registry_id": r["lora_registry_id"],
+            "num_pairs": r["num_pairs"],
+            "val_loss": r["val_loss"],
+            "eval_metrics": metrics,
+            "trained_at": r["trained_at"],
+            "deployed_at": r["deployed_at"],
+            "deprecated_at": r["deprecated_at"],
+        })
+    return JSONResponse(content={"runs": out})
+
+
+@app.get("/v1/system/preference-pairs-count")
+async def system_preference_pairs_count(request: Request) -> JSONResponse:
+    """Pair counts: total + by signal_source + last 24h/7d (auth-gated)."""
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    by_src_rows = history._conn.execute(
+        "SELECT signal_source, COUNT(*) AS n FROM preference_pairs GROUP BY signal_source"
+    ).fetchall()
+    by_source = {r["signal_source"] or "unknown": int(r["n"]) for r in by_src_rows}
+    total = sum(by_source.values())
+    now = time.time()
+    last_24h = history._conn.execute(
+        "SELECT COUNT(*) AS n FROM preference_pairs WHERE created_at > ?",
+        (now - 86400.0,),
+    ).fetchone()["n"]
+    last_7d = history._conn.execute(
+        "SELECT COUNT(*) AS n FROM preference_pairs WHERE created_at > ?",
+        (now - 7 * 86400.0,),
+    ).fetchone()["n"]
+    return JSONResponse(content={
+        "total": int(total),
+        "by_source": by_source,
+        "last_24h": int(last_24h),
+        "last_7d": int(last_7d),
+    })
+
+
+@app.get("/v1/system/validator-failures")
+async def system_validator_failures(request: Request) -> JSONResponse:
+    """Recent validator dispatch failures from the in-memory ring buffer (admin).
+
+    Process-local; resets on restart. Default window 1h. Each entry
+    carries a 500-char-truncated traceback excerpt.
+    """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    window = _parse_window_seconds(request.query_params.get("window"), 3600.0)
+    import _validator_failures
+    items = _validator_failures.recent(window)
+    return JSONResponse(content={"count": len(items), "recent": items})
+
+
+@app.get("/v1/api-keys/me/training-opt-in")
+async def api_keys_me_training_opt_in_get(request: Request) -> JSONResponse:
+    """Read the calling bearer's ``training_opt_in`` flag.
+
+    Auth-gated (NOT admin). Single-tenant default is opted-in; the
+    rc1 v3 migration seeded ``.api_keys`` bearers with 1. Unknown
+    bearers default to ``False`` per ``_is_training_opted_in``'s
+    fail-closed contract.
+    """
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    else:
+        api_key = _extract_api_key(request) or ""
+    return JSONResponse(content={"opted_in": _is_training_opted_in(api_key)})
+
+
+@app.post("/v1/api-keys/me/training-opt-in")
+async def api_keys_me_training_opt_in_set(request: Request) -> JSONResponse:
+    """Toggle the calling bearer's ``training_opt_in`` flag.
+
+    Body: ``{"opted_in": bool}``. Writes (or upserts) the
+    ``api_key_metadata`` row keyed by ``sha256(bearer)``. Takes effect
+    on the next ``_dispatch_validator`` call — the lookup hits SQLite
+    per-job (no in-process cache to invalidate).
+    """
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    else:
+        api_key = _extract_api_key(request) or ""
+    if not api_key:
+        return _error(400, "Bearer required for opt-in toggle")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "JSON body required")
+    if "opted_in" not in body or not isinstance(body["opted_in"], bool):
+        return _error(422, "Body must be {opted_in: bool}")
+    from history_store import _hash_key
+    now = time.time()
+    history._conn.execute(
+        """INSERT INTO api_key_metadata
+           (api_key_hash, training_opt_in, tier, notes, created_at, updated_at)
+           VALUES (?, ?, 'pro', NULL, ?, ?)
+           ON CONFLICT(api_key_hash) DO UPDATE SET
+             training_opt_in = excluded.training_opt_in,
+             updated_at = excluded.updated_at""",
+        (_hash_key(api_key), 1 if body["opted_in"] else 0, now, now),
+    )
+    history._conn.commit()
+    return JSONResponse(content={"opted_in": bool(body["opted_in"])})
 
 
 @app.get("/health")
@@ -3677,9 +3984,15 @@ async def _dispatch_validator(job: Job) -> None:
     + `validator_version` so /v2/history/{id} reads back the score.
 
     v1.17.0-rc5: increments `_validator_dispatch_counter["success"|"failure"]`
-    for /v1/system/metrics observability. Passive dispatch does NOT carry
-    `motion_intent` (only the synchronous /v2/video/analyze-motion endpoint
-    receives that value from MCP).
+    for /v1/system/metrics observability.
+
+    v1.18.0-rc5: passive dispatch now also carries `motion_intent`. The
+    field is already a column on `generations` since rc4 — but only the
+    synchronous /v2/video/analyze-motion endpoint was forwarding it to
+    `validator.run_all_tiers()`. Now we look it up by job.id from the
+    history row so the tier-3 Gemma judge can reconcile against operator
+    intent on every passively-validated clip too. NULL → unchanged
+    behavior (Gemma judge omits the intent line, byte-identical to rc4).
     """
     if not job.result_uri:
         _validator_dispatch_counter["failure"] += 1
@@ -3688,12 +4001,26 @@ async def _dispatch_validator(job: Job) -> None:
         from validator import run_all_tiers
         path = uploads.resolve(job.result_uri)
         prompt = (job.params or {}).get("prompt") or job.raw_request and job.raw_request.get("prompt") or ""
+        # v1.18.0-rc5: fetch motion_intent from the matching history row.
+        # Best-effort — NULL / lookup failure → motion_intent=None, which
+        # keeps tier-3 prompt byte-identical to rc4.
+        motion_intent: str | None = None
+        try:
+            row = history._conn.execute(
+                "SELECT motion_intent FROM generations WHERE id = ?",
+                (job.id,),
+            ).fetchone()
+            if row is not None:
+                motion_intent = row["motion_intent"] if hasattr(row, "keys") else row[0]
+        except Exception:
+            logger.warning("validator dispatch: motion_intent lookup failed for %s", job.id, exc_info=True)
         payload = await run_all_tiers(
             video_uri=job.result_uri,
             video_path=str(path),
             prompt=prompt,
             chat=chat,
             history=history,
+            motion_intent=motion_intent,
         )
         # Update the history row with the score so /v2/history shows it.
         try:
@@ -3713,12 +4040,17 @@ async def _dispatch_validator(job: Job) -> None:
         except Exception:
             logger.warning("validator history.update failed for %s", job.id, exc_info=True)
         _validator_dispatch_counter["success"] += 1
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         _validator_dispatch_counter["failure"] += 1
         logger.info("validator dispatch: result file gone for %s — skipping", job.id)
-    except Exception:
+        import _validator_failures
+        _validator_failures.record(job.id, "dispatch", f"FileNotFoundError: {e}")
+    except Exception as e:
         _validator_dispatch_counter["failure"] += 1
         logger.warning("validator dispatch failed for %s", job.id, exc_info=True)
+        import _validator_failures
+        import traceback as _tb
+        _validator_failures.record(job.id, "dispatch", _tb.format_exc() or repr(e))
 
 
 def _on_job_complete(job: Job) -> None:
@@ -3824,7 +4156,10 @@ async def v2_text_to_video(body: TextToVideoRequest, request: Request) -> JSONRe
                   lora_path=lora_path, lora_strength=lora_strength,
                   enhance_prompt=body.enhance_prompt,
                   lora_applied_id=lora_applied_id,
-                  lora_applied_strength=lora_applied_strength)
+                  lora_applied_strength=lora_applied_strength,
+                  ab_arm=body.ab_arm,
+                  shot_uuid=body.shot_uuid,
+                  shot_config_key=body.shot_config_key)
     return _submit_job(JobType.TEXT_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3851,7 +4186,10 @@ async def v2_image_to_video(body: ImageToVideoRequest, request: Request) -> JSON
                   lora_path=lora_path, lora_strength=lora_strength,
                   enhance_prompt=body.enhance_prompt,
                   lora_applied_id=lora_applied_id,
-                  lora_applied_strength=lora_applied_strength)
+                  lora_applied_strength=lora_applied_strength,
+                  ab_arm=body.ab_arm,
+                  shot_uuid=body.shot_uuid,
+                  shot_config_key=body.shot_config_key)
     return _submit_job(JobType.IMAGE_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3879,7 +4217,10 @@ async def v2_audio_to_video(body: AudioToVideoRequest, request: Request) -> JSON
                   lora_path=lora_path, lora_strength=lora_strength,
                   enhance_prompt=body.enhance_prompt,
                   lora_applied_id=lora_applied_id,
-                  lora_applied_strength=lora_applied_strength)
+                  lora_applied_strength=lora_applied_strength,
+                  ab_arm=body.ab_arm,
+                  shot_uuid=body.shot_uuid,
+                  shot_config_key=body.shot_config_key)
     return _submit_job(JobType.AUDIO_TO_VIDEO, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3909,7 +4250,10 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
                   lora_path=lora_path, lora_strength=lora_strength,
                   parent_clip_id=parent_clip_id,
                   lora_applied_id=lora_applied_id,
-                  lora_applied_strength=lora_applied_strength)
+                  lora_applied_strength=lora_applied_strength,
+                  ab_arm=body.ab_arm,
+                  shot_uuid=body.shot_uuid,
+                  shot_config_key=body.shot_config_key)
     return _submit_job(JobType.RETAKE, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -3945,6 +4289,9 @@ async def v2_video_outpaint(body: VideoOutpaintRequest, request: Request) -> JSO
         width=width, height=height, model="ic-lora-outpaint",
         lora_applied_id=lora_applied_id,
         lora_applied_strength=lora_applied_strength,
+        ab_arm=body.ab_arm,
+        shot_uuid=body.shot_uuid,
+        shot_config_key=body.shot_config_key,
     )
     return _submit_job(JobType.VIDEO_OUTPAINT, params, request, raw=body.model_dump(mode="json"))
 
@@ -4002,6 +4349,9 @@ async def v2_video_hdr(body: VideoHdrRequest, request: Request) -> JSONResponse:
         width=target_w, height=target_h, model="ic-lora-hdr",
         lora_applied_id=lora_applied_id,
         lora_applied_strength=lora_applied_strength,
+        ab_arm=body.ab_arm,
+        shot_uuid=body.shot_uuid,
+        shot_config_key=body.shot_config_key,
     )
     return _submit_job(JobType.VIDEO_HDR, params, request, raw=body.model_dump(mode="json"))
 
@@ -4864,6 +5214,13 @@ _embeddings_buckets: dict[str, tuple[float, float]] = {}
 _RATE_LIMITED_PATH_PREFIXES = (
     "/v2/embeddings/",
     "/v2/system/bulk-revalidate",
+    # v1.19 console stats endpoints — same per-key 10/s cap so a runaway
+    # dashboard tab can't hammer the SQLite-backed aggregates.
+    "/v1/system/validator-stats",
+    "/v1/system/ab-status",
+    "/v1/system/training-runs",
+    "/v1/system/preference-pairs-count",
+    "/v1/system/validator-failures",
 )
 
 
@@ -6175,6 +6532,106 @@ async def v2_compositions_get(comp_id: str, request: Request) -> JSONResponse:
     if not item:
         return _error(404, "Composition not found")
     return JSONResponse(content=item)
+
+
+@app.get("/v1/compositions/{comp_id}/clips")
+async def v1_compositions_clips(comp_id: str, request: Request) -> JSONResponse:
+    """Per-clip detail of an exported composition for the portal.
+
+    Privacy-gated by ``api_key_hash``: the bearer must own the composition,
+    else 403. JOINs ``compositions`` ⋈ ``composition_clips`` ⋈ ``generations``
+    so callers see validator score + thumbnail URL alongside the position +
+    historyId/storage_uri lineage. Used by the portal compositions page
+    (Stream B-portal, v1.19).
+    """
+    api_key = _extract_api_key(request)
+    if not api_key and config.API_KEYS:
+        return _error(401, "Missing API key")
+    from history_store import _hash_key
+    caller_hash = _hash_key(api_key) if api_key else ""
+
+    row = compositions._conn.execute(
+        "SELECT id, api_key_hash, data, created_at FROM compositions WHERE id = ?",
+        (comp_id,),
+    ).fetchone()
+    if not row:
+        return _error(404, "Composition not found")
+    if config.API_KEYS and row["api_key_hash"] != caller_hash:
+        return _error(403, "Composition not owned by bearer")
+
+    try:
+        data = _json_mod.loads(row["data"])
+    except (TypeError, ValueError):
+        data = {}
+    persisted_clips = data.get("clips", []) if isinstance(data, dict) else []
+
+    lineage_rows = compositions._conn.execute(
+        """SELECT cc.position, cc.clip_history_id,
+                  g.result_uri, g.validator_score, g.validator_payload_json,
+                  g.composition_id
+           FROM composition_clips cc
+           LEFT JOIN generations g ON g.id = cc.clip_history_id
+           WHERE cc.comp_id = ?
+           ORDER BY cc.position ASC""",
+        (comp_id,),
+    ).fetchall()
+
+    if lineage_rows:
+        clips_out: list[dict] = []
+        for r in lineage_rows:
+            recommendation = None
+            payload = r["validator_payload_json"]
+            if payload:
+                try:
+                    p = _json_mod.loads(payload)
+                    if isinstance(p, dict):
+                        recommendation = p.get("recommendation")
+                except (TypeError, ValueError):
+                    pass
+            hist_id = r["clip_history_id"]
+            clips_out.append({
+                "id": hist_id,
+                "historyId": hist_id,
+                "storage_uri": r["result_uri"],
+                "thumbnail_url": (
+                    f"/v2/history/{hist_id}/thumbnail" if hist_id else None
+                ),
+                "validator_score": r["validator_score"],
+                "validator_recommendation": recommendation,
+                "kept": bool(r["composition_id"]) if hist_id else True,
+                "deprecated_reason": None,
+                "position_in_comp": r["position"],
+            })
+    else:
+        # Fallback: no composition_clips rows recorded (legacy comp or
+        # never-exported draft). Reflect the persisted clip array shape so
+        # the UI still renders something useful.
+        clips_out = []
+        for idx, c in enumerate(persisted_clips):
+            if not isinstance(c, dict):
+                continue
+            hist_id = c.get("historyId") or c.get("history_id")
+            storage_uri = c.get("storage_uri")
+            clips_out.append({
+                "id": hist_id or storage_uri,
+                "historyId": hist_id,
+                "storage_uri": storage_uri,
+                "thumbnail_url": (
+                    f"/v2/history/{hist_id}/thumbnail" if hist_id else None
+                ),
+                "validator_score": None,
+                "validator_recommendation": None,
+                "kept": True,
+                "deprecated_reason": None,
+                "position_in_comp": idx,
+            })
+
+    return JSONResponse(content={
+        "composition_id": comp_id,
+        "exported_at": row["created_at"],
+        "total_clips": len(clips_out),
+        "clips": clips_out,
+    })
 
 
 @app.put("/v2/compositions/{comp_id}")

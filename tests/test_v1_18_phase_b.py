@@ -76,13 +76,17 @@ def _insert_clip(
     prompt: str,
     embedding: bytes,
     validator_score: float = 0.85,
-    validator_version: str = "1.17.0-rc5",
+    validator_version: str | None = None,
     lora_applied_id: str | None = None,
     lora_applied_strength: float | None = None,
     composition_id: str | None = None,
     created_at: float | None = None,
     job_type: str = "text-to-video",
 ) -> None:
+    # Default to the live config so test fixtures track production validator
+    # version bumps without per-version edits. Explicit override is honored.
+    if validator_version is None:
+        validator_version = config.VALIDATOR_VERSION
     now = created_at if created_at is not None else time.time()
     history._conn.execute(
         """INSERT OR REPLACE INTO generations
@@ -170,12 +174,12 @@ def test_embeddings_search_endpoint_happy_path(fresh_history, patch_embed):
     resp = client.post(
         "/v2/embeddings/search",
         json={"prompt": "sunset over open water", "k": 5,
-              "validator_version_filter": "1.17.0-rc5"},
+              "validator_version_filter": config.VALIDATOR_VERSION},
         headers={"Authorization": f"Bearer {api_key}"},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert data["validator_version_filter"] == "1.17.0-rc5"
+    assert data["validator_version_filter"] == config.VALIDATOR_VERSION
     assert len(data["results"]) <= 5
     assert len(data["results"]) > 0
     for r in data["results"]:
@@ -237,7 +241,7 @@ def test_embeddings_search_validator_version_filter(fresh_history, patch_embed):
             embedding=_unit_embed(i + 300),
             validator_version="1.16.0-old",
         )
-    # New validator version
+    # New validator version (the live one — tracks config.VALIDATOR_VERSION).
     for i in range(3):
         _insert_clip(
             fresh_history,
@@ -245,13 +249,13 @@ def test_embeddings_search_validator_version_filter(fresh_history, patch_embed):
             api_key=api_key,
             prompt="new-version clip",
             embedding=_unit_embed(i + 400),
-            validator_version="1.17.0-rc5",
+            validator_version=config.VALIDATOR_VERSION,
         )
 
     resp = client.post(
         "/v2/embeddings/search",
         json={"prompt": "any prompt", "k": 10,
-              "validator_version_filter": "1.17.0-rc5"},
+              "validator_version_filter": config.VALIDATOR_VERSION},
         headers={"Authorization": f"Bearer {api_key}"},
     )
     data = resp.json()
@@ -393,7 +397,7 @@ def test_bulk_revalidate_dry_run_no_writes(fresh_history, patch_embed, monkeypat
 
     resp = client.post(
         "/v2/system/bulk-revalidate",
-        json={"target_validator_version": "1.17.0-rc5", "dry_run": True},
+        json={"target_validator_version": config.VALIDATOR_VERSION, "dry_run": True},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
@@ -422,14 +426,14 @@ def test_bulk_revalidate_real_run_updates_rows(fresh_history, patch_embed, monke
         # Simulate the version bump that the real dispatcher would apply
         fresh_history._conn.execute(
             "UPDATE generations SET validator_version = ? WHERE id = ?",
-            ("1.17.0-rc5", job.id),
+            (config.VALIDATOR_VERSION, job.id),
         )
         fresh_history._conn.commit()
 
     monkeypatch.setattr(server_mod, "_dispatch_validator", fake_dispatch)
     resp = client.post(
         "/v2/system/bulk-revalidate",
-        json={"target_validator_version": "1.17.0-rc5", "dry_run": False, "limit": 10},
+        json={"target_validator_version": config.VALIDATOR_VERSION, "dry_run": False, "limit": 10},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()

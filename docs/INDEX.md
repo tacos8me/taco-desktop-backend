@@ -27,6 +27,7 @@ Full history â†’ [CHANGELOG.md](../CHANGELOG.md). Per-version code highlights â†
 |---|---|
 | spin up a fresh box from scratch | [OPERATOR_QUICKSTART.md](./OPERATOR_QUICKSTART.md) |
 | ship a frontend / SDK client in 5 minutes | [QUICKSTART.md](./QUICKSTART.md) |
+| understand the system as a whole | [SYSTEM_OVERVIEW.md](./SYSTEM_OVERVIEW.md) |
 | understand how the parts fit together | [ARCHITECTURE.md](./ARCHITECTURE.md) |
 | debug a specific failure (429s, 503s, NULL validator scores...) | [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) |
 | tune validator / retrieval / rate-limit / export-quality knobs | [operator-tuning.md](./operator-tuning.md) |

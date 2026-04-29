@@ -2,6 +2,91 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.19.0-rc1 — 2026-04-29
+
+### Feat: validator tier-2 — real Sapiens-2 pose inference (was stub since rc2)
+
+Closes Stream C of `plans/melodic-sniffing-beacon.md`. The sapiens-sidecar at `:8096` ships real top-down pose extraction using `facebook/sapiens2-pose-0.4b` (308-keypoint Sociopticon format) on cuda:1. Stub-mode is over.
+
+**Pipeline** (in `/mnt/nvme-1/servers/sapiens-sidecar/service.py`):
+1. PyAV decode video at native fps, strided sample at `SAMPLE_FPS=4` (every 6th frame on 24fps clips).
+2. DETR-resnet-50 person detection per sampled frame (top-1 highest-confidence bbox tracked).
+3. Sapiens2-pose-0.4b ViT inference: 308 keypoints + per-keypoint confidence per detected person.
+4. Aggregate metrics: `pose_temporal_stability = 1 - mean(L2 displacement) / pose_extent` (clamped [0,1]) + `pose_temporal_variance` + `human_detected` (mean conf > 0.3) + `identity_drift_frames`.
+
+**Latency** (RTX PRO 6000 Blackwell, cuda:1, 81-frame 1080p clip): ~5s cold (model load), ~2.3s warm. Within ≤8s target.
+
+**VRAM**: ~1.78 GB resident with both Sapiens (1.5 GB) + DETR (~280 MB). Lazy-load on first request; idle eviction after `SAPIENS_IDLE_TIMEOUT_S=300` so cuda:1 returns to ACE/JoyAI when validator queue is quiet. On-demand eviction via new `POST /v1/admin/evict`.
+
+**Sapiens upstream package**: editable install of `github.com/facebookresearch/sapiens2` (Python ≥3.12, MIT/Sapiens-2 dual license — venv rebuilt to py3.12; `pyproject.toml` requires-python widened). Cloned to `/mnt/nvme-1/huggingface/sapiens2_repo`.
+
+**Output schema** (validator.composite()-compatible, `stub: false`):
+```
+{ pose_temporal_stability: float ∈ [0,1],
+  pose_temporal_variance: float ≥ 0,
+  human_detected: bool,
+  identity_drift_frames: list[int],
+  frame_count: int, latency_s: float, stub: false,
+  model_version: "sapiens2-pose-0.4b@<sha12>" }
+```
+
+**License attestation**: `sapiens-sidecar/LICENSE_NOTES.md` v1.19.0 model checkpoint section. Internal-use only stands per the operator override (synthetic LTX outputs, single-tenant deploy, no external bearers active, privacy gate via `api_key_metadata.training_opt_in`).
+
+**Wiring changes in taco-backend**:
+- `LOAD_SAPIENS=1` flipped on in `.env` (was unset = `0`). Validator dispatch now hits the real sidecar instead of the no-op skip path.
+- `config.VALIDATOR_VERSION 1.17.0-rc5 → 1.19.0-rc1` — invalidates `validator_runs` cache; on-complete dispatch recomputes for every new clip. Pre-rc1 cached rows remain readable but are no longer hit by the rc1 dispatch path.
+
+**Composite arithmetic delta**: real `pose_temporal_stability ∈ [0.95, 0.999]` on healthy synthetic clips → tier2 contributes `0.2 × stability` (was hardcoded `0.2 × 1.0` for stub). Empirical 10-clip bulk-revalidate against rc5 historical scores: deltas range -0.000 to -0.010, recommendations stable for the sampled middle-of-pack. Real signal will pull middle clips toward warn/retake more aggressively as the corpus diversifies.
+
+**Tests**: 4 new in `tests/test_v1_19_validator.py` exercising `composite()` against real-shape tier2 payloads (delta vs stub, low-stability → warn, variance fallback, [0,1] clamp). Pre-existing `tests/test_v1_17_validator.py` still 38 green — rc1 sidecar shape is a strict superset of the rc2 stub shape, so no regression.
+
+**Operator runbook**: `docs/operator-tuning.md` "Sapiens pose tier-2" section covers `SAPIENS_SAMPLE_FPS` / `SAPIENS_IDLE_TIMEOUT_S` / `SAPIENS_DETECTOR_THRESHOLD` env tuning + `POST /v1/admin/evict` for manual VRAM reclaim. Bulk-revalidate prior corpus via `POST /v2/system/bulk-revalidate {"target_validator_version":"1.19.0-rc1"}` (admin-gated, default dry_run=true).
+
+**Restart sequence**: (1) `bash /mnt/nvme-1/servers/sapiens-sidecar/setup.sh` to stage weights + reinstall sapiens upstream, (2) `systemctl --user restart sapiens-sidecar`, (3) `systemctl --user restart taco-backend` to pick up the version bump and `LOAD_SAPIENS=1`. Sidecar is auto-stopped on turbo entry by `_stop_cuda1_tenants` and auto-restored on turbo exit by `_restore_cuda1_tenants` (LOAD_SAPIENS gating from rc2 unchanged).
+
+## v1.18.0-rc6 — 2026-04-29
+
+### Fix: shot_uuid + shot_config_key persistence — completes rc1 lineage wiring
+
+Latent regression spotted in the rc5 audit: same root cause as rc5's `_ab_arm` fix. MCP forwards `shot_uuid` + `shot_config_key` in every per-shot HTTP body since v0.7.0, but Pydantic v2's default `extra="ignore"` was silently eating them on the v2 video request models because the fields weren't declared. Net effect since rc1 (when those columns landed): every MCP-driven clip persisted `NULL` in `generations.shot_uuid` / `generations.shot_config_key`, breaking the lineage tables they were designed for and starving Phase C `composition_kept` pair construction of its `shot_config_key` join key (the rc3 live-DB smoke noted "no `shot_config_key` rows" — this is why).
+
+**Fix** mirrors the rc5 `ab_arm` pattern verbatim. Each of `TextToVideoRequest`, `ImageToVideoRequest`, `AudioToVideoRequest`, `RetakeRequest`, `VideoOutpaintRequest`, `VideoHdrRequest` gains `shot_uuid: str | None = Field(default=None, max_length=64)` + `shot_config_key: str | None = Field(default=None, max_length=128)` (no alias — MCP sends them under the plain field names; the rc5 `_ab_arm` alias was specific to the underscore-prefix wire shape). Every video v2 endpoint threads `body.shot_uuid` + `body.shot_config_key` into `job.params`. `_HISTORY_ONLY_PARAMS` already listed both names from rc1, so the strip path + the worker_loop save call (`_params.get("shot_uuid")` → `history.save(shot_uuid=...)`) both already worked end-to-end — the only missing link was the Pydantic declaration.
+
+**No schema migration**: the `generations.shot_uuid` / `generations.shot_config_key` columns + the `idx_gen_shot_config_key` index have existed since the rc1 v3 keystone. `history.save` already accepted both kwargs from rc1 forward. Restart-required for the Pydantic model change to take effect, but no DB ladder bump.
+
+**Tests**: 4 new in `tests/test_v1_19_phase_c.py` covering shot_uuid round-trip via MCP-shaped body, shot_config_key round-trip, default-None when both omitted, and a structural assertion that all 6 video request models declare both fields (regression guard so future endpoint additions don't silently drop them again). Suite now 276 green (was 270 from rc5 + 4 phase-B fixes coordinated in parallel).
+
+This release is the natural follow-up to rc5: rc5 closed the `_ab_arm` cohort capture; rc6 closes the rc1 lineage capture. With both shipped, every MCP-driven clip carries its full lineage (`parent_clip_id` + `shot_uuid` + `shot_config_key` + `composition_id`) plus its A/B cohort (`ab_arm`) into `generations`, unblocking `composition_kept` pair construction once the rc6+ corpus accumulates.
+
+Restart taco-backend to load the Pydantic model changes.
+
+## v1.18.0-rc5 — 2026-04-29
+
+### Feat / Fix: Stream A plumbing — `ab_arm` capture + passive-dispatch `motion_intent` + doc/script hygiene
+
+Closes 4 surgical gaps surfaced by the operator-control-plane audit (per `plans/melodic-sniffing-beacon.md` Stream A). Restart-required for schema v6.
+
+**A1 — `_ab_arm` keystone (the load-bearing fix).** Pre-rc5, MCP `_apply_ab_routing` stamped `_ab_arm = "candidate" | "baseline"` on the session input but the value never reached `generations`. `scripts/ab_decision.py` had to infer cohort from `lora_applied_id` — brittle because non-A/B candidates could share a LoRA id; A/B comparisons were structurally impossible.
+
+- `history_store.CURRENT_SCHEMA_VERSION 5 → 6`. New nullable `generations.ab_arm TEXT` column via additive `ALTER TABLE` (idempotent, pre-v6 rows get NULL). Same migration ladder pattern as v3/v4/v5.
+- Every video v2 request model gains `ab_arm: str | None = Field(default=None, alias="_ab_arm", max_length=32)` + `model_config = ConfigDict(populate_by_name=True)` — covers `TextToVideoRequest`, `ImageToVideoRequest`, `AudioToVideoRequest`, `RetakeRequest`, `VideoOutpaintRequest`, `VideoHdrRequest`. The alias is required because Pydantic v2 default `extra="ignore"` was silently eating the underscore-prefixed wire field.
+- `_HISTORY_ONLY_PARAMS` extended with `"ab_arm"`. Every video v2 endpoint threads `body.ab_arm` into `job.params`. `worker_loop` reads `_params.get("ab_arm")` and forwards to `history.save(ab_arm=...)`. New keyword arg on `HistoryStore.save`; INSERT statement extended.
+- `scripts/ab_decision.py:_fetch_arm_means` switched from inferring cohort via `lora_applied_id` to reading `generations.ab_arm = ?` directly. The `candidate_lora` parameter is now advisory (kept for backward-compat with the caller).
+
+**Coordinated MCP ship: noodlefinger-mcp v0.8.1** (patch-completer of v0.8.0). `_build_clip_body` now copies `inp["_ab_arm"]` onto every per-shot HTTP body it produces — at all 4 return points (slideshow i2v, anchor a2v, is_insert pass-through, default a2v). Pre-rc5 the harness was provably incomplete: `_apply_ab_routing` stamped `inp["_ab_arm"]` but the value never reached the wire, so `ab_decision.py` could never find a cohort to compare. Coordinated ship guarantees the loop closes end-to-end. Two new MCP tests in `mcp/tests/test_v08_retrieval_tools.py::test_ab_arm_propagates_into_per_shot_body` + `::test_ab_arm_absent_when_routing_inactive` verify both arms flow through the per-shot body when active and the field stays absent when inactive. The rc5 backend test (`test_v1_19_phase_c.py::test_ab_arm_round_trip`) feeds via a real MCP-shaped body (with `_ab_arm: "candidate"` in the request) for end-to-end coverage in one test. Backend rc5 is dependent on mcp v0.8.1 to actually populate the column with data; ship them together.
+
+**A2 — `motion_intent` passive-dispatch wire-through.** rc5 had wired `motion_intent` through the synchronous `/v2/video/analyze-motion` endpoint, but the passive `_dispatch_validator(job)` callback (fires on every completed video for opted-in bearers) dropped it — every passively-validated clip got tier-3 reasoning without intent reconciliation, weakening the score quality.
+
+- `_dispatch_validator` now SELECTs `motion_intent` from the matching `generations` row by `job.id` (the column has existed on `generations` since rc4) and forwards via `validator.run_all_tiers(motion_intent=...)`. Best-effort lookup — DB miss / NULL → `motion_intent=None` → tier-3 prompt byte-identical to rc4 (the conditional render in `_run_tier3_judge` from rc5 already handles the None case).
+
+**A3 — shot_uuid doc drift.** `docs/DECISIONS.md` ADR-014 + `docs/PRIVACY_GOVERNANCE.md` shot_uuid row both said `secrets.token_hex(16)` (random). Live code in `mcp/orchestrator.py:_shot_uuid_for` is `hashlib.sha256(prompt + image_uri + position).hexdigest()[:32]` — deterministic, by design. Both docs updated to match code with rationale: deterministic so the same shot across resumes hashes identically (load-bearing for rc1 lineage tables — re-attempts of the same shot collapse onto one `shot_uuid` row). Privacy-implication note added: a `shot_uuid` is not random, so anyone who can guess the (prompt, image_uri, position) tuple can re-derive it — operators should treat it with the same sensitivity as the prompt itself.
+
+**A4 — Script hygiene.** `scripts/backfill_prompt_embeddings.py` SELECT now also filters `AND g.status = 'completed'` so in-flight / failed rows never enter the embedding corpus (previously the script's stated contract said this but the SQL didn't enforce it — harmless overcoverage in practice but not contract-correct). `scripts/construct_preference_pairs.py` watermark write was inspected for the dry-run leak the plan flagged; the existing `if not dry_run: set_last_watermark(...)` gate was already correct (no change).
+
+**Tests**: 10 new in `tests/test_v1_19_phase_c.py` covering schema v6, `ab_arm` round-trip via MCP-shaped body (Pydantic alias → params dict → `_HISTORY_ONLY_PARAMS` strip → `history.save` → `generations.ab_arm`), Pydantic alias acceptance for both forms (`_ab_arm` from JSON / `ab_arm` from kwargs), Pydantic default-None when omitted, ab_decision column-based cohort lookup (positive / negative cases), `_dispatch_validator` motion_intent fetch on populated row, NULL-safety on missing row. Backend test suite 266 green from rc5+contemporary streams (was 246 pre-rc5; 4 unrelated `test_v1_18_phase_b` failures from a sibling stream's `VALIDATOR_VERSION` bump are tracked separately). MCP suite 211 green (was 209 pre-v0.8.1).
+
+Restart taco-backend to migrate to schema v6 on next boot. New v1.18.0-rc5+ corpus rows will carry `ab_arm` once the noodlefinger-mcp follow-up ships.
+
 ## v1.18.0-rc4 — 2026-04-29
 
 ### Fix: embedding-dim mismatch — schema rebuild at FLOAT[4096] + model swap to qwen3-embed-8b

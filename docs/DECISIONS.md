@@ -494,7 +494,7 @@ Accept **15-week passive A/B cadence**. The A/B harness routes new sessions to A
 
 ### Context
 
-`shot_uuid` is the opaque correlation handle the orchestrator emits per-shot, threaded into `generations.shot_uuid` and `composition_clips.shot_uuid` for downstream lineage queries. Original format: 16 hex chars (64-bit), constructed via `secrets.token_hex(8)`.
+`shot_uuid` is the opaque correlation handle the orchestrator emits per-shot, threaded into `generations.shot_uuid` and `composition_clips.shot_uuid` for downstream lineage queries. Original format: 16 hex chars (64-bit), constructed via `hashlib.sha256(prompt + image_uri + position).hexdigest()[:16]`. **Deterministic** — the same shot across resumes hashes identically, which is load-bearing for rc1 lineage tables (resume-safety: re-attempts of the same shot collapse onto one shot_uuid row).
 
 At single-operator scale (10k clips/year), 64-bit space (2^64) is overkill — collision probability negligible. But:
 
@@ -504,7 +504,7 @@ At single-operator scale (10k clips/year), 64-bit space (2^64) is overkill — c
 
 ### Decision
 
-mcp v0.8.0 emits **32-char hex shot_uuids** (128-bit, `secrets.token_hex(16)`). Backend accepts **either** 16-char or 32-char as valid `shot_uuid` (regex `^[0-9a-f]{16}$|^[0-9a-f]{32}$`). The contract stays "opaque hex string, exact length not asserted by clients."
+mcp v0.8.0 emits **32-char hex shot_uuids** (128-bit, `hashlib.sha256(prompt + image_uri + position).hexdigest()[:32]` — `_shot_uuid_for` in `orchestrator.py`). Backend accepts **either** 16-char or 32-char as valid `shot_uuid` (regex `^[0-9a-f]{16}$|^[0-9a-f]{32}$`). The contract stays "opaque hex string, exact length not asserted by clients." The derivation stays **deterministic** so a resume produces the identical shot_uuid for the same shot inputs — the lineage tables (`composition_clips`, retake `parent_clip_id` joins) rely on stability across attempts.
 
 ### Consequences
 

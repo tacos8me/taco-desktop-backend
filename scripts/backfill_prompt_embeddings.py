@@ -85,6 +85,7 @@ async def _backfill(
             JOIN api_key_metadata m ON g.api_key_hash = m.api_key_hash
             WHERE g.id NOT IN (SELECT id FROM clip_embeddings)
               AND m.training_opt_in = 1
+              AND g.status = 'completed'
               AND g.prompt IS NOT NULL
               AND g.prompt != ''
             LIMIT ?

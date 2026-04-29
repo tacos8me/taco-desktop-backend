@@ -145,7 +145,7 @@ the same sensitivity as the prompt itself.
 | Column | Type | Populated by | Privacy note |
 |---|---|---|---|
 | `parent_clip_id` | TEXT | `/v2/retake` handler via `find_id_by_result_uri(body.video_uri)` | Retake provenance — links a "rejected" clip to its "chosen" successor |
-| `shot_uuid` | TEXT (16-hex or 32-hex) | MCP `_apply_shot_lineage` → backend `_HISTORY_ONLY_PARAMS` strip → history.save | Opaque random token via `secrets.token_hex(8)` (legacy mcp ≤ v0.7.x, 16-hex) or `secrets.token_hex(16)` (mcp v0.8+, 32-hex). Same shot across sessions hashes identically via `shot_config_key`, not `shot_uuid`. |
+| `shot_uuid` | TEXT (16-hex or 32-hex) | MCP `_apply_shot_lineage` → backend `_HISTORY_ONLY_PARAMS` strip → history.save | **Deterministic** hash via `hashlib.sha256(prompt + image_uri + position).hexdigest()[:16]` (legacy mcp ≤ v0.7.x, 16-hex) or `[:32]` (mcp v0.8+, 32-hex). Load-bearing for resume safety: the same shot across resumes hashes to the same row in lineage tables. Privacy implication: a `shot_uuid` is **not random** — anyone who can guess the (prompt, image_uri, position) tuple can re-derive it. |
 | `shot_config_key` | TEXT (full sha256) | same | DPO pair-matching key (prompt + image_uri + audio_start_s + duration_s + model + lora_id + lora_strength) |
 | `composition_id` | TEXT | **never written** today (denorm convenience) | Forward-looking; redundant with `composition_clips` join |
 | `lora_applied_id` / `lora_applied_strength` | TEXT/REAL | **never written** today | Captures the *actual* fused LoRA at runtime (vs requested) — Phase B candidate |
