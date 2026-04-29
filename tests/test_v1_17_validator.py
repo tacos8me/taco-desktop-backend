@@ -499,3 +499,190 @@ def test_judge_prompt_v1_schema_rejects_score_out_of_range():
     from validator import JudgeResponseV1
     with pytest.raises(Exception):
         JudgeResponseV1.model_validate_json('{"verdict": "pass", "score": 1.5, "reasoning": ""}')
+
+
+# ---------------------------------------------------------------------------
+# v1.17.0-rc4 fixes — tier-1 H/8, tier-3 None-guard, composite false-pass,
+# scrub, artifacts dir.
+# ---------------------------------------------------------------------------
+
+
+def test_tier1_raft_handles_non_square_aspect_ratio(tmp_path):
+    """rc4: 1920x1080 source must produce H divisible by 8 (was crashing
+    with 'input image H and W should be divisible by 8' — h_target=147)."""
+    from validator import _decode_video_frames_for_flow
+
+    captured = {"size": None}
+
+    class _FakeFrame:
+        def __init__(self, h, w):
+            self._h, self._w = h, w
+
+        def to_ndarray(self, format="rgb24"):
+            import numpy as np
+            return np.zeros((self._h, self._w, 3), dtype=np.uint8)
+
+    class _FakeStream:
+        thread_type = None
+
+    class _FakeContainer:
+        streams = type("S", (), {"video": [_FakeStream()]})()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def decode(self, stream):
+            for _ in range(3):
+                yield _FakeFrame(1080, 1920)
+
+    real_resize = None
+
+    def _capture_resize(self, size, *args, **kwargs):
+        captured["size"] = size
+        from PIL import Image
+        return Image.new("RGB", size)
+
+    import av as _av
+    from PIL import Image as _PIL_Image
+    orig_open = _av.open
+    orig_resize = _PIL_Image.Image.resize
+    _av.open = lambda *a, **k: _FakeContainer()
+    _PIL_Image.Image.resize = _capture_resize
+    try:
+        _decode_video_frames_for_flow("ignored.mp4")
+    finally:
+        _av.open = orig_open
+        _PIL_Image.Image.resize = orig_resize
+
+    w, h = captured["size"]
+    assert w % 8 == 0, f"w_target {w} not /8"
+    assert h % 8 == 0, f"h_target {h} not /8 (rc4 regression)"
+    assert h >= 8
+
+
+def test_tier3_judge_handles_tier1_failure_gracefully(tmp_path, monkeypatch):
+    """rc4: empty tier1_summary={} must not crash the prompt builder
+    with TypeError on `None:.3f`. The judge call should still proceed and
+    return a sensible payload."""
+    from validator import _run_tier3_judge
+
+    video = _make_fake_video(tmp_path, "v.mp4", size=64)
+
+    # Stub PyAV frame-count probe via the path that returns num_frames>=1.
+    class _FakeStream:
+        frames = 12
+        average_rate = 24
+        duration = None
+        time_base = 1
+
+    class _FakeContainer:
+        streams = type("S", (), {"video": [_FakeStream()]})()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import av as _av
+    monkeypatch.setattr(_av, "open", lambda *a, **k: _FakeContainer())
+
+    # Stub keyframe extraction so we don't actually decode the fake mp4.
+    from PIL import Image
+    monkeypatch.setattr(
+        "validator._extract_frames_as_pils",
+        lambda video_bytes, indices: [Image.new("RGB", (32, 32)) for _ in indices],
+    )
+
+    judged = {"called": False}
+
+    class _FakeChat:
+        async def generate_chat_completion(self, messages, **kwargs):
+            judged["called"] = True
+            content = '{"verdict": "warn", "score": 0.5, "reasoning": "ok", "retake_hint": null}'
+            return {"choices": [{"message": {"content": content}}]}
+
+    out = asyncio.run(
+        _run_tier3_judge(_FakeChat(), str(video), "a sunset", {}, None)
+    )
+    assert judged["called"], "tier3 must reach LLM even with tier1_summary={}"
+    assert out["verdict"] == "warn"
+    assert out["judge_score"] == pytest.approx(0.5)
+
+
+def test_composite_returns_error_when_all_required_tiers_failed():
+    """rc4: tier1=None + tier3=None + tier2=stub must NOT pass.
+    Previously rescaled to 1.0/pass — the false-pass story."""
+    from validator import composite
+    out = composite(None, {"tier2_skipped": True, "status": "stub"}, None)
+    assert out["recommendation"] == "error"
+    assert out["composite_score"] is None
+    assert "all_required_tiers_failed" in out["reasoning_summary"]
+
+
+def test_composite_returns_pass_when_tier1_and_tier3_present():
+    """Sanity: happy path still works after rc4 guard added."""
+    from validator import composite
+    tier1 = {"dynamic_degree": 4.0}
+    tier3 = {"verdict": "pass", "score": 0.85, "judge_score": 0.85}
+    out = composite(tier1, None, tier3)
+    assert out["recommendation"] == "pass"
+    assert out["composite_score"] is not None
+    assert out["composite_score"] >= 0.65
+
+
+def test_validator_artifacts_dir_created_on_startup(tmp_path, monkeypatch):
+    """rc4: lifespan must mkdir VALIDATOR_ARTIFACTS_DIR if missing."""
+    target = tmp_path / "validator_artifacts_rc4"
+    assert not target.exists()
+    monkeypatch.setattr(config, "VALIDATOR_ARTIFACTS_DIR", target)
+    # Mirror the lifespan body — mkdir is idempotent + not gated on anything else.
+    config.VALIDATOR_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    assert target.exists() and target.is_dir()
+
+
+def test_scrub_removes_buggy_rc2_rows(tmp_path):
+    """rc4: scrub must remove rc2/rc3 rows with tier1/tier3 null payloads
+    AND preserve rc4+ rows (so it's safe to leave running)."""
+    db = tmp_path / "h.db"
+    history = HistoryStore(db_path=db)
+
+    # Buggy rc2 row (tier1 null in payload)
+    history._conn.execute(
+        """INSERT INTO validator_runs
+           (run_id, video_uri, video_sha256, payload_json, latency_s,
+            validator_version, ran_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("r1", "storage://x", "sha-x", '{"tier1": null, "tier2": {}, "tier3": null}',
+         0.1, "1.17.0-rc2", time.time()),
+    )
+    # Healthy rc4 row (tier1 present)
+    history._conn.execute(
+        """INSERT INTO validator_runs
+           (run_id, video_uri, video_sha256, payload_json, latency_s,
+            validator_version, ran_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("r2", "storage://y", "sha-y",
+         '{"tier1": {"dynamic_degree": 3.0}, "tier3": {"verdict": "pass"}}',
+         0.1, "1.17.0-rc4", time.time()),
+    )
+    history._conn.commit()
+
+    # Run the scrub (mirrors lifespan body).
+    history._conn.execute(
+        """DELETE FROM validator_runs
+           WHERE validator_version IN ('1.17.0-rc2', '1.17.0-rc3')
+             AND (payload_json LIKE '%"tier1": null%'
+                  OR payload_json LIKE '%"tier3": null%')"""
+    )
+    history._conn.commit()
+
+    rows = history._conn.execute(
+        "SELECT run_id FROM validator_runs ORDER BY run_id"
+    ).fetchall()
+    ids = [r["run_id"] for r in rows]
+    assert "r1" not in ids, "rc2 buggy row must be deleted"
+    assert "r2" in ids, "rc4 row must be preserved"
