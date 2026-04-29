@@ -193,3 +193,129 @@ curl -sS -H "Authorization: Bearer $KEY" \
 # Confirm libx264 was used and the bitrate is higher than v1.16.1:
 ffprobe -v error -show_entries stream=codec_name,bit_rate /tmp/result.mp4
 ```
+
+## Embeddings + sqlite-vec (v1.18.0-rc2)
+
+Phase B retrieval depends on two pieces: the `sqlite-vec` SQLite
+extension (vector storage + cosine/L2 search) and llama-swap's
+`/v1/embeddings` endpoint (Gemma 3 12B → 3584-dim float32 vectors).
+
+### Install
+
+`sqlite-vec` is a regular pip dep — no system packages:
+
+```bash
+cd /mnt/nvme-1/servers/taco-backend
+uv pip install sqlite-vec   # already in pyproject.toml since rc2
+```
+
+The Python package ships the `.so` and a loader. Verify:
+
+```bash
+uv run --no-sync python -c "
+import sqlite3, sqlite_vec
+c = sqlite3.connect(':memory:')
+c.enable_load_extension(True); sqlite_vec.load(c)
+print(c.execute('SELECT vec_version()').fetchone())
+"
+# → ('v0.1.9',)
+```
+
+After taco-backend restarts the boot log carries one of:
+
+```
+INFO history_store: sqlite-vec extension loaded
+WARN history_store: sqlite-vec extension load failed (...); embedding search endpoints will return 503
+```
+
+### llama-swap `/v1/embeddings`
+
+llama.cpp natively supports `/v1/embeddings` when the Gemma model is
+loaded. Verify:
+
+```bash
+curl -sS -X POST http://192.168.1.80:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "gemma-3-12b-nvfp4", "input": "test"}' | head -c 200
+```
+
+A healthy response is JSON shaped like
+`{"data":[{"embedding":[...3584 floats...],"index":0}],"model":...}`.
+
+If you see HTTP 502 / `unable to start process: upstream command exited
+prematurely`, llama-swap's config is missing the embeddings binding.
+Add to llama-swap's model config:
+
+```yaml
+# In ~/llama-swap/config.yaml under the gemma model:
+gemma-3-12b-nvfp4:
+  cmd: |
+    /path/to/llama-server
+    --model /path/to/gemma-3-12b-Q5_K_M.gguf
+    --embeddings           # ← critical: enables /v1/embeddings
+    --pooling mean
+    -ngl 99
+    --port 8080
+```
+
+`--embeddings` adds the route; `--pooling mean` matches sentence-
+embedding semantics (default for retrieval). Restart llama-swap.
+
+### Backfill historical rows
+
+Once both pieces are working, backfill prompt embeddings for opted-in
+rows:
+
+```bash
+cd /mnt/nvme-1/servers/taco-backend
+uv run --no-sync python scripts/backfill_prompt_embeddings.py --dry-run
+# Inspect the count, then:
+uv run --no-sync python scripts/backfill_prompt_embeddings.py
+```
+
+The script is idempotent and resumable — if it crashes, just re-run.
+Runs at ~30 prompts/sec via batch-of-64 calls; ~4 minutes for 8000
+rows. Add `--sleep-ms 1000` if you want to leave bandwidth for live
+traffic.
+
+### Verification
+
+Issue a search to confirm the surface works:
+
+```bash
+KEY=$(grep -v '^#' .api_keys | grep -v '^$' | head -1)
+curl -sS -X POST http://localhost:8090/v2/embeddings/search \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"prompt": "a dramatic sunset over the ocean", "k": 5}' | jq .
+```
+
+Healthy response shape:
+
+```json
+{
+  "validator_version_filter": "1.17.0-rc5",
+  "results": [
+    {"shot_id": "...", "prompt": "...", "similarity_score": 0.83,
+     "validator_score": 0.91, "final_score": 0.78, ...}
+  ]
+}
+```
+
+### Rate limit (429s)
+
+`/v2/embeddings/*` and `/v2/system/bulk-revalidate` are gated at 10
+req/sec/key with burst 10. Bursts of 11+ in the same instant return
+429 + `Retry-After`. Tune burst/rate via the constants
+`_EMBEDDINGS_RATE_LIMIT_*` in `server.py` if your workload demands
+more — current values are a single-operator sanity floor, not a
+multi-tenant fairness ceiling.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| 503 "embedding search not available — install sqlite-vec extension" | extension not loaded | install sqlite-vec; check boot logs |
+| 503 "embedding service unavailable" on /v2/embeddings/search | llama-swap `/v1/embeddings` returning 5xx or unreachable | verify llama-swap config has `--embeddings`; restart llama-swap |
+| 429 on every request | rate limit too tight for workload | tune `_EMBEDDINGS_RATE_LIMIT_*` |
+| Empty `results: []` despite known clips | privacy gate filter, OR opted-out bearer, OR validator_version filter mismatch | check `api_key_metadata.training_opt_in`; verify `validator_version_filter` matches actual rows |
+| `total_samples: 0` from /recommend-loras | no clips with `lora_applied_id` populated yet | submit a few jobs with `{"lora": {...}}` after rc2 deploy |

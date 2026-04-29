@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 
 CURRENT_SCHEMA_VERSION = 4
 
+# v1.18.0-rc2 — sqlite-vec extension for vector search. Loaded BEFORE
+# `PRAGMA journal_mode=WAL` per sqlite-vec docs (extension load must
+# precede most pragma changes that affect connection state). Set to
+# False when the .so isn't installed, the extension load fails, or
+# when sqlite was built without `enable_load_extension` support
+# (Python `sqlite3` defaults to disabled on macOS system Python — we
+# do `conn.enable_load_extension(True)` defensively but still graceful-
+# degrade so the rest of the server starts cleanly).
+#
+# Endpoints depending on the virtual table check this flag and return
+# 503 with a clear message when False. Backend boot never fails on a
+# missing extension — operator can install + restart out-of-band.
+SQLITE_VEC_AVAILABLE = False
+SQLITE_VEC_LOAD_ERROR: str | None = None
+
 # Blob caps — a single rogue request can easily serialize multi-MB payloads
 # (LoRA paths list, keyframe images-as-bytes if a caller mis-uses the field,
 # gen_config dumps with giant sigma tables). Left uncapped, the history DB
@@ -425,6 +440,13 @@ class HistoryStore:
         self._write_count = 0
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # v1.18.0-rc2 — sqlite-vec extension for vector search.
+        # Loaded BEFORE `PRAGMA journal_mode=WAL` (per sqlite-vec docs).
+        # Mutates module-level SQLITE_VEC_AVAILABLE so endpoints can graceful-
+        # degrade. Failure modes: extension not installed (`sqlite-vec` pip
+        # missing), C extension load disabled at sqlite build time, or .so
+        # ABI mismatch. None should crash backend startup.
+        self._load_sqlite_vec()
         self._conn.executescript(SCHEMA)
         # WAL mode: readers never block the single writer. Without this, the
         # /v2/history list endpoint stalls behind the queue worker's thumbnail
@@ -434,7 +456,54 @@ class HistoryStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.commit()
         self._migrate()
+        # v1.18.0-rc2 — virtual table for prompt embeddings. Created only when
+        # the sqlite-vec extension successfully loaded; otherwise endpoints
+        # that read/write `clip_embeddings` return 503 with a clear message.
+        if SQLITE_VEC_AVAILABLE:
+            try:
+                self._conn.execute(
+                    """CREATE VIRTUAL TABLE IF NOT EXISTS clip_embeddings USING vec0(
+                        id TEXT PRIMARY KEY,
+                        embedding FLOAT[3584],
+                        embedding_model_version TEXT
+                    )"""
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "history_store: clip_embeddings virtual table create failed: %s",
+                    exc,
+                )
         logger.info("History DB opened at %s", self._db_path)
+
+    def _load_sqlite_vec(self) -> None:
+        """Best-effort sqlite-vec extension load. Updates module flags."""
+        global SQLITE_VEC_AVAILABLE, SQLITE_VEC_LOAD_ERROR
+        try:
+            import sqlite_vec  # type: ignore[import-not-found]
+        except ImportError as exc:
+            SQLITE_VEC_LOAD_ERROR = f"sqlite-vec package not installed: {exc}"
+            logger.warning(
+                "history_store: sqlite-vec not installed; embedding search "
+                "endpoints will return 503"
+            )
+            return
+        try:
+            self._conn.enable_load_extension(True)
+            try:
+                sqlite_vec.load(self._conn)
+            finally:
+                self._conn.enable_load_extension(False)
+        except (sqlite3.OperationalError, AttributeError) as exc:
+            SQLITE_VEC_LOAD_ERROR = f"sqlite-vec extension load failed: {exc}"
+            logger.warning(
+                "history_store: sqlite-vec extension load failed (%s); "
+                "embedding search endpoints will return 503",
+                exc,
+            )
+            return
+        SQLITE_VEC_AVAILABLE = True
+        logger.info("history_store: sqlite-vec extension loaded")
 
     def _migrate(self) -> None:
         """Run idempotent schema migrations keyed off ``PRAGMA user_version``.

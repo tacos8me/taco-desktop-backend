@@ -2,7 +2,9 @@
 
 LTX-compatible inference server for noodle-i (image gen) + noodle-v (video gen).
 
-**Version**: v1.18.0-rc1 (2026-04-29).
+**Version**: v1.18.0-rc2 (2026-04-29).
+
+v1.18.0-rc2 highlights: **Phase B retrieval backend** — sqlite-vec virtual table + 3 new endpoints + per-key rate-limit middleware + `lora_applied_id` persistence + Phase B observability counters. Layered on top of the rc1 schema v4 keystone. New `chat_manager.embed` / `embed_batch` proxy llama-swap `/v1/embeddings` (3584-dim Gemma → float32-LE bytes ready for sqlite-vec). `history_store` loads sqlite-vec extension BEFORE `PRAGMA journal_mode=WAL`; module-level `SQLITE_VEC_AVAILABLE` flag propagates failure gracefully (backend boot never crashes on missing extension); `clip_embeddings(id TEXT PK, embedding FLOAT[3584], embedding_model_version TEXT)` virtual table created when load succeeds. Three new endpoints: `POST /v2/embeddings/search` (privacy-gated semantic search over the caller's own clips, ranking `0.50·sim + 0.35·v_norm + 0.10·recency + 0.05·comp_kept`), `POST /v2/embeddings/recommend-loras` (similarity-then-group LoRA aggregation, ranked by `0.7·mean + 0.3·boost`), `POST /v2/system/bulk-revalidate` (admin-gated re-validator on `validator_version != target` rows; default `dry_run=true`). Token-bucket rate-limit middleware: 10 req/sec/key with burst 10, applied only to `/v2/embeddings/*` and `/v2/system/bulk-revalidate`; existing endpoints unaffected. `lora_applied_id` write fix: every video v2 endpoint (text-to-video / image-to-video / audio-to-video / retake / video-outpaint / video-hdr) now captures `body.lora.id` + `body.lora.strength` via `_lora_applied_pair(body)` and threads them into `job.params` via the existing `_HISTORY_ONLY_PARAMS` strip path → `worker_loop.history.save()` writes `generations.lora_applied_id` end-to-end (was silently NULL on every prior rc; required by `recommend_loras`). `/v1/system/metrics` extended with `embeddings` block (search totals + rolling p50/p95 latency over 1000-call window + recommend_loras/bulk_revalidate counters). New `scripts/backfill_prompt_embeddings.py` (idempotent, resumable; `--dry-run` / `--limit N` / `--rebuild` / `--sleep-ms N`). Adds `sqlite-vec>=0.1.9` dep. 13 new tests in `tests/test_v1_18_phase_b.py`; suite now 230 green (was 217). **Privacy gate** is the spine: every search/recommend query filters by `api_key_hash` of caller — bearer A cannot ever surface bearer B's rows; verified by `test_embeddings_search_privacy_gate`. Restart taco-backend, then optionally run the backfill script. See `docs/operator-tuning.md` "Embeddings + sqlite-vec" for setup.
 
 v1.18.0-rc1 highlights: **schema v4 — keystone migration for Phase B (retrieval) + Phase C (SFT LoRA training)**. `history_store.CURRENT_SCHEMA_VERSION 3 → 4`, additive: 2 new nullable columns on `generations` (`motion_intent`, `embedding_model_version`), 1 new column + 2 new indexes on `preference_pairs` (`validator_version`, `idx_pp_validator_version`, `idx_pp_unique_pair_source` UNIQUE on `(chosen_clip_id, rejected_clip_id, signal_source)` for `INSERT OR IGNORE` idempotence in Phase C multi-source aggregation), 5 new columns on `training_runs` for reproducibility (`training_seed`, `hyperparams_json`, `dataset_snapshot_path`, `code_sha`, `validator_version_at_train`). Single-startup migration via the existing `_migrate()` ladder; pre-v4 rows get NULL in new columns; idempotent re-run safe; v4 DBs opened by pre-v4 code silently ignore the extra columns (additive safety verified by `test_v4_db_loaded_by_v3_code_silently_ignores_extra_columns`). **Dead-letter status** of `generations.prompt_embedding` BLOB column documented in `_migrate()` docstring + this file: at 14KB/row × 1M rows it exceeds SQLite's practical column-storage envelope, so Phase B will land embeddings in a sqlite-vec virtual table (`clip_embeddings`) instead. The BLOB column is retained nullable for backward compat but never written to from v1.18.0-rc1 forward — removal candidate for v1.19+ once zero readers confirmed. **This rc1 ships ONLY the schema** — no feature wiring, no new endpoints, no extension loads; downstream Phase B/C feature ships (sqlite-vec extension load, embeddings endpoint, retrieval MCP tools, pair construction script, training pipeline, A/B framework) land in v1.18.0-rc2+. 10 new tests in `tests/test_v1_18_schema.py`; three v17 tests had hardcoded `user_version == 3` literals updated to `== CURRENT_SCHEMA_VERSION` so the v3-surface intent survives every future ladder bump; suite now 217 green (was 207). Restart taco-backend to migrate on next boot.
 
@@ -294,6 +296,104 @@ balloon RAM. Bumping `config.VALIDATOR_VERSION` forces re-runs.
 **Turbo coordination**: `sapiens-sidecar` added to `_stop_cuda1_tenants`
 and `_restore_cuda1_tenants` (gated on `LOAD_SAPIENS`). Mirrors the
 ACE / JoyAI / ERNIE pattern verbatim.
+
+## Retrieval pipeline (v1.18.0-rc2)
+
+Phase B retrieval backend. Three new endpoints + sqlite-vec virtual
+table + per-key rate-limit middleware + `lora_applied_id`
+end-to-end persistence + Phase B observability counters in
+`/v1/system/metrics`. Built on top of the rc1 schema v4 keystone.
+
+**`chat_manager.embed` / `embed_batch`** (chat_manager.py): proxies
+`/v1/embeddings` to llama-swap. Returns float32-LE-packed bytes
+(~14 KB per 3584-dim Gemma embedding) ready to insert directly into
+sqlite-vec. `EMBEDDING_MODEL_VERSION` constant tags every row for
+migration safety. Sorts by response `index` so server-side parallel
+decode reordering doesn't shuffle results.
+
+**sqlite-vec extension** (history_store.py): loaded BEFORE
+`PRAGMA journal_mode=WAL` per sqlite-vec docs. Module-level
+`SQLITE_VEC_AVAILABLE` + `SQLITE_VEC_LOAD_ERROR` propagate failure
+gracefully — backend boot never crashes on missing extension.
+Endpoints depending on the virtual table return 503 with a clear
+message when the load failed. Virtual table:
+
+```
+CREATE VIRTUAL TABLE clip_embeddings USING vec0(
+    id TEXT PRIMARY KEY,
+    embedding FLOAT[3584],
+    embedding_model_version TEXT
+);
+```
+
+**`POST /v2/embeddings/search`**: ranked semantic search over the
+caller's own past clips. **Privacy gate**: every query is filtered
+by `api_key_hash` of the caller — bearer A cannot surface bearer B's
+rows. Ranking formula (50/35/10/5):
+
+```
+final = 0.50 * similarity
+      + 0.35 * max(0, validator_score - 0.5) / 0.5
+      + 0.10 * exp(-age_days / 30)
+      + 0.05 * (1.0 if in_final_composition else 0.0)
+```
+
+Filter knobs: `k ∈ [1,20]`, `min_validator_score ∈ [0,1]`,
+`validator_version_filter` (default = current
+`config.VALIDATOR_VERSION`), optional `genre`.
+
+**`POST /v2/embeddings/recommend-loras`**: aggregates LoRA
+performance via similarity-then-group. Top-50 similar shots →
+group by `lora_applied_id` → ranked by
+`0.7·mean_validator_score + 0.3·max(0, expected_boost)` where
+`expected_boost = lora_mean - no_lora_mean`. Returns `total_samples`
++ `no_lora_baseline_mean` for debugging. Empty list when no rows
+have `lora_applied_id` populated.
+
+**`POST /v2/system/bulk-revalidate`** (admin-gated): re-runs the
+validator pipeline on rows where `validator_version != target`.
+Default `dry_run=true` returns `{would_revalidate, sample_ids}`
+without writing. `dry_run=false` queues fire-and-forget
+`_dispatch_validator(synthetic_job)` per row, capped at `limit`.
+Each dispatch writes `validator_score / validator_payload_json /
+validator_version` via the existing UPDATE path.
+
+**Per-key rate-limit middleware**: token-bucket, in-memory.
+10 req/sec/key with burst 10. Applied ONLY to `/v2/embeddings/*` and
+`/v2/system/bulk-revalidate` paths — existing endpoints unaffected.
+Returns 429 + `Retry-After` header on exhaustion. Bypassed when
+`config.API_KEYS` is empty (parity with `check_api_key`). Buckets
+keyed by `sha256(api_key)` so raw bearers never land in heap dumps.
+
+**`lora_applied_id` write fix**: every video v2 endpoint
+(text-to-video / image-to-video / audio-to-video / retake /
+video-outpaint / video-hdr) now captures `body.lora.id` +
+`body.lora.strength` via `_lora_applied_pair(body)` and threads them
+into `job.params` via the existing `_HISTORY_ONLY_PARAMS` strip path.
+`worker_loop.history.save()` already accepted the kwargs since
+v1.17.0-rc1 — wiring is now complete end-to-end. Required by
+`recommend_loras` aggregation; was silently NULL on every prior rc.
+
+**Observability** (`/v1/system/metrics` extension): new `embeddings`
+block exposes `embeddings_search_total/success/failure/rate_limited`,
+rolling p50/p95 latency over 1000-call window,
+`embeddings_search_results_avg`, `recommend_loras_total`,
+`bulk_revalidate_total`. Process-local; resets on restart.
+
+**Backfill script** (`scripts/backfill_prompt_embeddings.py`):
+idempotent, resumable. Queries opted-in `generations` rows whose `id`
+is not already in `clip_embeddings`, batches at 64 inputs per llama-
+swap call. Args: `--dry-run`, `--limit N`, `--rebuild`,
+`--sleep-ms N`. Operator runs manually post-deploy; not part of
+automated startup.
+
+**Dependency**: `sqlite-vec>=0.1.9` added to `pyproject.toml`. PyPI
+package ships the `.so` and a Python loader. No system packages
+required.
+
+**Operator tuning**: see `docs/operator-tuning.md` "Embeddings +
+sqlite-vec" section for install verification, llama-swap
+`/v1/embeddings` config, and troubleshooting.
 
 ### Dashboard and GPU telemetry (v1.2, advanced controls v1.3)
 

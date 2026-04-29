@@ -16,6 +16,7 @@ dependencies = [
     "torchaudio>=2.11,<2.12",
     "python-multipart>=0.0.22",
     "librosa>=0.10.2",
+    "sqlite-vec>=0.1.9",
 ]
 
 [[tool.uv.index]]
