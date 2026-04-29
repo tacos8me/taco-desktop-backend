@@ -2,6 +2,30 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.17.0-rc4 — 2026-04-29
+
+### Fix: tier-1 H/8 snap, tier-3 None-guard, composite false-pass guard, validator_artifacts dir creation, turbo log emission, scrub of buggy rc2/rc3 rows
+
+End-to-end audit of the rc2 validator pipeline found that **every single dispatch since rc2 was producing a silent false-pass**: tier-1 RAFT crashed on aspect-ratio mismatch, tier-3 Gemma judge crashed on the tier-1 failure summary, tier-2 stub was the only contributor, and `composite()` rescaled the lone 0.2·1.0 contribution to a 1.0 score → recommendation `pass`. Fixing the three downstream bugs and scrubbing the corrupted rows.
+
+1. **Tier-1 RAFT H/8 alignment** (`validator.py` `_decode_video_frames_for_flow`). RAFT requires both H and W divisible by 8. The previous `h_target = int(h * ratio)` left non-square inputs at arbitrary heights — a 1920×1080 source produced `h_target=147`, `w_target=256`, and the model crashed with `RuntimeError: input image H and W should be divisible by 8, instead got 147 (h) and 256 (w)`. Fixed: snap `h_target` and `w_target` to the nearest /8 multiple with a min floor of 8 (`max(8, round(h * ratio / 8) * 8)`).
+
+2. **Tier-3 Gemma judge None-guard** (`validator.py` `_run_tier3_judge`). When tier1 crashed, `tier1_summary` arrived as `{}` and the f-string `f"... {tier1_summary.get('dynamic_degree'):.3f}"` raised `TypeError: unsupported format string passed to NoneType.__format__` → tier3 died before the LLM was ever called. Fixed: pre-extract values with explicit None checks, build a `tier1_block` conditionally, and fall back to `"Tier1 (optical flow): failed (no optical flow data)"` when tier1 didn't produce real data.
+
+3. **Composite false-pass guard** (`validator.py` `composite`). Previously, a stub-only `parts` list (only tier2 contributing 0.2·1.0) had `weight_total=0.2`, `raw=0.2`, `score=raw/weight_total=1.0` → recommendation `pass`. Silent corruption. Fixed: require at least one of tier1 or tier3 to have produced a score; if both are absent, return `{composite_score: None, recommendation: "error", reasoning_summary: "all_required_tiers_failed: ..."}`. Callers can distinguish a real pass from "all the work died, here's a 1.0".
+
+4. **`mkdir -p validator_artifacts/`** at server startup (`server.py` `lifespan`). Previously assumed the dir existed; now created idempotently with parents=True before any tier writes to it.
+
+5. **Turbo log emission** (`server.py` `_stop_cuda1_tenants`, `_restore_cuda1_tenants`). Added enter/exit `logger.info` lines naming the gated unit list so operators can correlate turbo entry/exit with what was actually stopped/restarted.
+
+6. **One-time scrub of buggy rc2/rc3 rows** in `lifespan`. Removes `validator_runs` rows where `validator_version IN ('1.17.0-rc2', '1.17.0-rc3')` AND payload has `tier1: null` or `tier3: null`; clears the corresponding `validator_score` / `validator_payload_json` / `validator_version` columns on `generations`. Bounded by `validator_version` so rc4+ output never matches — safe to leave the scrub in place forever as a no-op. Wrapped in try/except so a scrub failure never breaks startup; logs the row counts on success.
+
+`config.VALIDATOR_VERSION` bumped `1.17.0-rc2 → 1.17.0-rc4` (cache rows from the buggy versions are skipped by both the version-keyed UNIQUE index and the scrub).
+
+6 new regression tests in `tests/test_v1_17_validator.py`: `test_tier1_raft_handles_non_square_aspect_ratio`, `test_tier3_judge_handles_tier1_failure_gracefully`, `test_composite_returns_error_when_all_required_tiers_failed`, `test_composite_returns_pass_when_tier1_and_tier3_present`, `test_validator_artifacts_dir_created_on_startup`, `test_scrub_removes_buggy_rc2_rows`. Suite is now 200 green (was 194).
+
+Operator restarts taco-backend after merge to apply the fixes + run the scrub. The running rc2 instance keeps producing false-passes until restart, but at the current rate that's <10 more rows; not catastrophic.
+
 ## v1.17.0-rc3 — 2026-04-29
 
 ### Fix: training_opt_in docstring + sapiens turbo-stop gating

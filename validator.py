@@ -91,6 +91,7 @@ def _decode_video_frames_for_flow(video_path: str, target_width: int = _RAFT_FLO
 
     frames = []
     h_target = None
+    w_target = max(8, round(target_width / 8) * 8)
     with av.open(video_path, mode="r") as container:
         if not container.streams.video:
             raise ValueError("no_video_stream")
@@ -100,11 +101,15 @@ def _decode_video_frames_for_flow(video_path: str, target_width: int = _RAFT_FLO
             arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
             if h_target is None:
                 h, w = arr.shape[:2]
-                ratio = target_width / max(w, 1)
-                h_target = max(1, int(h * ratio))
+                ratio = w_target / max(w, 1)
+                # RAFT requires both H and W divisible by 8. Snap to nearest
+                # /8 multiple with a min floor of 8 (rc4 fix — non-square clips
+                # were crashing tier-1 with "input image H and W should be
+                # divisible by 8" before the model ever ran).
+                h_target = max(8, round(h * ratio / 8) * 8)
             # Lazy resize via PIL — avoids a hard dep on cv2 / torchvision.transforms.
             from PIL import Image
-            img = Image.fromarray(arr).resize((target_width, h_target), Image.BILINEAR)
+            img = Image.fromarray(arr).resize((w_target, h_target), Image.BILINEAR)
             import numpy as np
             arr = np.asarray(img)  # (h_target, target_width, 3)
             frames.append(arr)
@@ -328,12 +333,25 @@ async def _run_tier3_judge(
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
         )
 
+    # rc4 fix: guard format strings against None — when tier1 crashed and
+    # tier1_summary is {} (or missing keys), `.get(...)` returns None, and
+    # `None:.3f` raises TypeError, which previously killed tier-3 before the
+    # LLM was ever called. Build the tier1 block conditionally instead.
+    tier1_dyn = tier1_summary.get("dynamic_degree") if tier1_summary else None
+    tier1_smooth = tier1_summary.get("motion_smoothness") if tier1_summary else None
+    tier1_windows = tier1_summary.get("flow_windows") if tier1_summary else None
+    if tier1_dyn is not None and tier1_smooth is not None:
+        tier1_block = (
+            f"Tier1 (optical flow):\n"
+            f"  dynamic_degree={tier1_dyn:.3f}\n"
+            f"  flow_windows={tier1_windows}\n"
+            f"  motion_smoothness={tier1_smooth:.3f}\n"
+        )
+    else:
+        tier1_block = "Tier1 (optical flow): failed (no optical flow data)\n"
     summary_text = (
         f'Original prompt: "{prompt}"\n\n'
-        f"Tier1 (optical flow):\n"
-        f"  dynamic_degree={tier1_summary.get('dynamic_degree'):.3f}\n"
-        f"  flow_windows={tier1_summary.get('flow_windows')}\n"
-        f"  motion_smoothness={tier1_summary.get('motion_smoothness'):.3f}\n"
+        f"{tier1_block}"
         f"Tier2 (pose stability): "
         f"{'skipped' if (tier2_summary is None or tier2_summary.get('tier2_skipped')) else json.dumps(tier2_summary)}\n\n"
         f"Below: 3-5 keyframes from the clip in temporal order. Judge whether "
@@ -443,6 +461,22 @@ def composite(
         parts.append(("tier3", 0.4, t3))
     else:
         notes.append("tier3_failed")
+
+    # rc4 fix: require at least one of tier1 or tier3 to have produced a real
+    # score before allowing any positive recommendation. Previously, a
+    # stub-only `parts` list (only tier2 contributing 0.2*1.0) would rescale
+    # to score=1.0 → "pass", a silent false-pass produced by every dispatch
+    # since rc2 when both tier1 and tier3 failed. Now: any time both
+    # required tiers are absent, return composite_score=None and
+    # recommendation="error" so the caller can distinguish from a real pass.
+    has_required_tier = any(name in ("tier1", "tier3") for name, _, _ in parts)
+    if not has_required_tier:
+        notes.insert(0, "all_required_tiers_failed")
+        return {
+            "composite_score": None,
+            "recommendation": "error",
+            "reasoning_summary": ", ".join(notes),
+        }
 
     weight_total = sum(w for _, w, _ in parts) or 1.0
     raw = sum(w * v for _, w, v in parts)

@@ -537,6 +537,51 @@ async def _dispatch_job(job: Job) -> bytes:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _last_gpu_tenant
+
+    # v1.17.0-rc4: ensure validator artifacts dir exists before any tier
+    # writes to it. Best-effort — if the parent path is unwritable we log
+    # and let validator dispatch raise per-job.
+    try:
+        config.VALIDATOR_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("Validator artifacts dir ready: %s", config.VALIDATOR_ARTIFACTS_DIR)
+    except Exception:
+        logger.warning(
+            "Could not create VALIDATOR_ARTIFACTS_DIR=%s",
+            config.VALIDATOR_ARTIFACTS_DIR,
+            exc_info=True,
+        )
+
+    # v1.17.0-rc4: scrub the false-pass rows produced by buggy rc2/rc3
+    # validator dispatches (tier1 + tier3 both failed → composite rescaled
+    # to 1.0/pass). Bounded by validator_version so rc4+ output never
+    # matches; safe to leave the scrub in place forever as a no-op.
+    try:
+        cur = history._conn.execute(
+            """DELETE FROM validator_runs
+               WHERE validator_version IN ('1.17.0-rc2', '1.17.0-rc3')
+                 AND (payload_json LIKE '%"tier1": null%'
+                      OR payload_json LIKE '%"tier3": null%')"""
+        )
+        runs_deleted = cur.rowcount
+        cur = history._conn.execute(
+            """UPDATE generations
+               SET validator_score = NULL,
+                   validator_payload_json = NULL,
+                   validator_version = NULL
+               WHERE validator_version IN ('1.17.0-rc2', '1.17.0-rc3')
+                 AND (validator_payload_json LIKE '%"tier1": null%'
+                      OR validator_payload_json LIKE '%"tier3": null%')"""
+        )
+        gens_scrubbed = cur.rowcount
+        history._conn.commit()
+        if runs_deleted or gens_scrubbed:
+            logger.info(
+                "rc4 scrub: removed %d buggy validator_runs, cleared %d generations rows",
+                runs_deleted, gens_scrubbed,
+            )
+    except Exception:
+        logger.warning("rc4 validator scrub failed (non-fatal)", exc_info=True)
+
     logger.info("Loading LTX pipelines on %s ...", config.GPU_DEVICES)
     manager.load_all()
     logger.info("LTX pipelines ready.")
@@ -1894,6 +1939,8 @@ async def _stop_cuda1_tenants() -> None:
         ("sapiens-sidecar",       config.LOAD_SAPIENS),
         ("ltx-sidecar",           True),  # always stop — may be stale from prior turbo
     ]
+    gated_units = [u for u, flag in units if flag]
+    logger.info("turbo: stopping cuda:1 tenants: %s", gated_units)
     for unit, cfg_flag in units:
         if not cfg_flag:
             continue
@@ -1903,6 +1950,7 @@ async def _stop_cuda1_tenants() -> None:
         except RuntimeError as exc:
             # "not running" is fine; only log
             logger.info("Turbo: systemctl stop %s — %s", unit, exc)
+    logger.info("turbo: cuda:1 tenants stopped")
 
 
 async def _restore_cuda1_tenants() -> None:
@@ -1910,13 +1958,16 @@ async def _restore_cuda1_tenants() -> None:
     configured LOAD_*=1. Inverse of `_stop_cuda1_tenants` (minus ltx-sidecar,
     which is only started during turbo).
     """
-    for unit, cfg_flag in [
+    restore_units = [
         ("ace-step",            config.LOAD_ACE),
         ("joyai-sidecar",       config.LOAD_JOYAI),
         ("ernie-image-sidecar", config.LOAD_ERNIE),
         # v1.17.0-rc2: restore sapiens-sidecar on turbo exit when LOAD_SAPIENS=1.
         ("sapiens-sidecar",     config.LOAD_SAPIENS),
-    ]:
+    ]
+    gated_restore = [u for u, flag in restore_units if flag]
+    logger.info("turbo: restoring cuda:1 tenants: %s", gated_restore)
+    for unit, cfg_flag in restore_units:
         if not cfg_flag:
             continue
         try:
@@ -1924,6 +1975,7 @@ async def _restore_cuda1_tenants() -> None:
             logger.info("Turbo exit: systemctl start %s", unit)
         except RuntimeError as exc:
             logger.warning("Turbo exit: systemctl start %s failed: %s", unit, exc)
+    logger.info("turbo: cuda:1 tenants restored")
 
 
 async def _auto_exit_turbo_on_sidecar_failure() -> None:

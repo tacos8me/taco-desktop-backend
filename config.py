@@ -146,7 +146,7 @@ LOAD_SAPIENS = os.environ.get("LOAD_SAPIENS", "0").lower() in ("1", "true", "yes
 
 # Validator pipeline (v1.17.0-rc2). `validator_runs` cache rows are keyed by
 # (video_sha256, validator_version) — bumping the version forces re-runs.
-VALIDATOR_VERSION = "1.17.0-rc2"
+VALIDATOR_VERSION = "1.17.0-rc4"
 VALIDATOR_ARTIFACTS_DIR = Path(
     os.environ.get(
         "VALIDATOR_ARTIFACTS_DIR",
