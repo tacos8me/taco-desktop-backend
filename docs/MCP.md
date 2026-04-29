@@ -1,11 +1,18 @@
 # noodlefinger-mcp — LLM-driven workflows over the taco-backend API
 
-**v0.2.1** · catalog: [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal) (`mcp/` subdir) · live-validated end-to-end (one MCP `cut_music_video` call → real H.264+AAC MP4 in 82 s at draft quality).
+**v0.6.0** · catalog: [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal) (`mcp/` subdir) · live-validated end-to-end (one MCP `cut_music_video` call → real H.264+AAC MP4).
 
 A single Python MCP server that wraps `api.noodlefinger.io` for LLM clients (Claude Code, Cursor, Continue, Codex CLI, OpenCode). Two tiers:
 
 - **Tier-0** (anonymous, 6 tools + 3 resources): docs lookup. Always available.
-- **Tier-1** (authenticated, 14 tools): submit jobs, upload files, run the `cut_music_video` macro. Registers iff `NOODLEFINGER_API_KEY` is set.
+- **Tier-1** (authenticated, 23 tools): submit jobs, upload files, run the `cut_music_video` macro, browse + apply LTX/Flux LoRAs, beat-grid analysis, shot-list authoring helpers. Registers iff `NOODLEFINGER_API_KEY` is set.
+
+Notable shipped behavior since v0.2:
+
+- **v0.4.4** — DAG-aware parallel clip dispatch in `cut_music_video` (auto-scales to live worker count via `GET /v1/system/workers`).
+- **v0.4.6** — chain-mode default flipped from `seamless-segment` (hard-pin, motion-suppressing) to `keyframes` (soft-guide, motion-friendly). The MV motion fix.
+- **v0.5.0** — opt-in beat-aligned audio slicing for `cut_music_video` via `slice_strategy="beats"|"downbeats"` + `beat_analyzer="auto"|"madmom"|"librosa"`. Wraps `POST /v1/music/analyze`.
+- **v0.6.0** — LoRA browse + apply: `list_loras` / `get_lora` / `search_loras` / `rescan_flux_loras` tier-1 tools, plus top-level + per-shot `lora: {id, strength}` field on `cut_music_video`. Both LTX and Flux registries.
 
 See also: [docs/API.md](API.md) (canonical HTTP contract) · [docs/QUICKSTART.md](QUICKSTART.md) · [noodle-portal repo](https://github.com/tacos8me/noodle-portal).
 
@@ -52,13 +59,13 @@ For non-Claude-Code clients, advanced env vars, or pinning to a specific commit 
 
 A single `noodlefinger-mcp` binary, distributed as a Python wheel via `uvx --from git+...`, speaking the [Model Context Protocol](https://modelcontextprotocol.io) over stdio. It bundles:
 
-- **Endpoint catalog** — 77 endpoints across 13 groups. Same data that powers `portal.noodlefinger.io/docs`.
-- **Flow walkthroughs** — 16 step-by-step recipes (`text-to-video`, `audio-to-video`, `video-hdr`, `cut-music-video`, …).
+- **Endpoint catalog** — 77+ endpoints across 13 groups. Same data that powers `portal.noodlefinger.io/docs`.
+- **Flow walkthroughs** — 17+ step-by-step recipes (`text-to-video`, `audio-to-video`, `video-hdr`, `cut-music-video`, `lora-browse-apply`, …).
 - **CHANGELOG** — for cross-referencing endpoint `since_version`.
 
 | Surface | Tier-0 (anonymous) | Tier-1 (`NOODLEFINGER_API_KEY` required) |
 |---|---|---|
-| **Tools (20)** | 6: `search_endpoints`, `get_endpoint`, `list_groups`, `list_flows`, `get_flow`, `get_changelog` | 14: `submit_job`, `get_job`, `wait_for_job`, `cancel_job`, `download_job_result`, `download_storage_uri`, `upload_file`, `extract_segment`, `create_composition`, `export_composition`, `get_changelog_for_endpoint`, `cut_music_video`, `resume_music_video`, `list_sessions` |
+| **Tools (29)** | 6: `search_endpoints`, `get_endpoint`, `list_groups`, `list_flows`, `get_flow`, `get_changelog` | 23: `submit_job`, `get_job`, `wait_for_job`, `cancel_job`, `download_job_result`, `download_storage_uri`, `upload_file`, `extract_segment`, `create_composition`, `export_composition`, `get_changelog_for_endpoint`, `cut_music_video`, `resume_music_video`, `list_sessions`, `get_beat_grid`, `plan_shot_list`, `match_cut_prompt_pair`, `weave_inserts`, `apply_section_palette`, `list_loras`, `get_lora`, `search_loras`, `rescan_flux_loras` |
 | **Resources (3)** | `noodlefinger://endpoints`, `noodlefinger://flows`, `noodlefinger://changelog` | — |
 
 When tier-1 is enabled, the server submits jobs against `api.noodlefinger.io`, polls them to completion, downloads results, and runs the `cut_music_video` macro: music → N a2v clips with seamless chain conditioning → composition → export, all in one tool call with session-resume on failure.
@@ -572,9 +579,18 @@ For the full theory (Murch's Rule of Six, Goodwin's synaesthesia, the atomic-vs-
 | `create_composition` | `name: str`, `clips?: array`, `transitions?: array`, `audio_uri?: str`, `chain_mode?: "hardcut"\|"seamless"\|"seamless-segment"` | POST `/v2/compositions`. Returns `{composition_id, name, clip_count}`. |
 | `export_composition` | `comp_id: str`, `audio_uri?: str` | Enqueue export → ffmpeg concat + audio overlay → final H.264+AAC MP4. |
 | `get_changelog_for_endpoint` | `endpoint_id: str` | Cross-reference an endpoint's `since_version` with the CHANGELOG. |
-| `cut_music_video` | `prompt`, `music_prompt`, `duration_s`, `num_clips?=5`, `quality?="preview"`, `subject_anchor_uri?`, `shot_list?`, `music_lyrics?`, `music_style?`, `chain_mode?="seamless-segment"`, `session_id?` | The orchestrator. Music → N a2v clips with chained segments → composition → export. Blocking; checkpointed. |
+| `cut_music_video` | `prompt`, `music_prompt`, `duration_s`, `num_clips?=5`, `quality?="preview"`, `subject_anchor_uri?`, `shot_list?`, `music_lyrics?`, `music_style?`, `music_bpm?`, `chain_mode?="keyframes"`, `parallel_clips?="auto"`, `slice_strategy?="uniform"`, `beat_analyzer?="auto"`, `min_clip_duration_s?=0.5`, `lora?={id,strength}`, `enhance_prompt?=false`, `session_id?` | The orchestrator. Music → N a2v clips with chained keyframes → composition → export. v0.4.4: parallel clip dispatch. v0.4.6 default chain mode flipped to `"keyframes"` (soft pin via `VideoConditionByKeyframeIndex`). v0.5: opt-in beat-aligned slicing via `slice_strategy="downbeats"`. v0.6: top-level + per-shot `lora` (per-shot wins). Blocking; checkpointed; resume-safe. |
 | `resume_music_video` | `session_id: str` | Resume a `cut_music_video` session that failed or was interrupted. Skips completed steps. |
 | `list_sessions` | — | List locally cached MV sessions. Auto-prunes entries >7 days old. |
+| `get_beat_grid` | `audio_uri: str`, `analyzer?: "librosa"\|"madmom"="librosa"` | Wraps `POST /v1/music/analyze`. Returns `{bpm, beats[], downbeats[], onsets[], rms_envelope[][2], duration_s, confidence, analyzer_used?}`. Used by `cut_music_video` v0.5 beat-align internally; also user-callable for hand-authoring beat-aligned shot lists. |
+| `plan_shot_list` | `audio_summary: dict`, `prompt: str`, `genre?: str="modern-pop"`, `num_beats_per_shot?: int=8`, `sections?: array` | Pure helper: density-driven, section-aware shot-list authoring with genre presets. Returns shots with `prompt`, `duration_s`, `audioStart_s`, `section`, `palette`, `scale`, `camera`, `transition_to_next` per item. Pair with `get_beat_grid` for beat-aware authoring. |
+| `match_cut_prompt_pair` | `subject: str`, `motif: str` | Pure helper: returns prompt pair `{a, b}` for a beat-aligned match-cut (J-cut / L-cut continuity through a visual motif). |
+| `weave_inserts` | `primary_shots: array`, `inserts: array`, `cadence?: int=4` | Pure helper: interleaves insert / b-roll shots into a primary shot list at the given cadence. |
+| `apply_section_palette` | `shots: array`, `palette: dict` | Pure helper: applies per-section color palette + grade hints to shots. |
+| `list_loras` | `family?: "ltx"\|"flux"\|"all"="all"`, `strategy?: str` | v0.6: wraps `GET /v1/loras` and/or `GET /v1/flux-loras`. Returns `{ltx: [...], flux: [...], count: {...}}` with full registry metadata (id, name, strategy, trigger_word, description). |
+| `get_lora` | `lora_id: str`, `family?: "ltx"\|"flux"="ltx"` | v0.6: single-LoRA lookup with full metadata. Use to inspect `trigger_word` before authoring prompts that need it. |
+| `search_loras` | `query: str`, `family?: "ltx"\|"flux"\|"all"="all"`, `limit?: int=20` | v0.6: substring search over `name`, `description`, `trigger_word`. Sort: name > trigger_word > description. |
+| `rescan_flux_loras` | — | v0.6: wraps `POST /v1/flux-loras/rescan`. Tells the backend to reindex `flux_loras/` after dropping a new `.safetensors`. |
 
 ### Tool → endpoint mapping
 
@@ -597,18 +613,28 @@ Each tool's full inputSchema and result projection live in [`mcp/_phase2/01-tool
 
 ## 7. Roadmap
 
-v0.3 candidates — each one is gated on something either upstream (taco-backend) or in the MCP itself:
+### Shipped between v0.2 and v0.6
+
+| # | Feature | Status |
+|---|---|---|
+| **B1** | `get_beat_grid(audio_uri)` — BPM + downbeat + onset extraction. | **Shipped v0.4.0** as `get_beat_grid` (wraps `POST /v1/music/analyze`). v0.5.0 wires it into `cut_music_video` automatically when `slice_strategy="downbeats"` is passed. |
+| — | Parallel clip dispatch in `cut_music_video`. | **Shipped v0.4.4** — DAG-aware executor auto-scales to live worker count via `GET /v1/system/workers`. |
+| — | Chain-mode soft-pin default (motion fix). | **Shipped v0.4.6** — flipped from `seamless-segment` (hard-pin propagation suppressed motion in first ~3s of every follower clip) to `keyframes` (soft-guide via `VideoConditionByKeyframeIndex`). |
+| — | LoRA browse + apply in `cut_music_video`. | **Shipped v0.6.0** — `list_loras` / `get_lora` / `search_loras` / `rescan_flux_loras` tier-1 tools + top-level + per-shot `lora` schema fields. |
+
+### Open candidates
 
 | # | Feature | Blocker |
 |---|---|---|
-| **B1** | `get_audio_grid(audio_uri)` — BPM + downbeat + onset extraction so `cut_music_video` aligns clip cuts to the beat instead of uniform `duration_s/num_clips`. | Backend: needs a new `POST /v2/audio/analyze` returning `{bpm, downbeats, peaks}`. ~100 LOC of librosa. |
 | **B4** | Lyric timestamps: `lyrics_timestamps: [{line, start_s, end_s}]` on music job results so a shot can pin to lyric line N. | Backend: ACE Step already knows where vocals land — needs to surface them in the music job result payload. |
-| **B7** | `share_to_gallery(comp_id, label)` — one-click "publish a draft to the portal gallery" so the user can review without leaving the LLM session. | MCP only: thin wrapper over `POST /v1/approved-images`. Trivial; deferred to keep v0.2 surface tight. |
+| **B7** | `share_to_gallery(comp_id, label)` — one-click "publish a draft to the portal gallery" so the user can review without leaving the LLM session. | MCP only: thin wrapper over `POST /v1/approved-images`. Trivial; deferred to keep v0.6 surface tight. |
+| — | Auto-`trigger_word` injection — when `lora` is set, automatically prepend `trigger_word` to the per-clip prompt if it's not already present. | MCP only: ~30 LOC opt-in flag. Deferred to v0.6.1. |
 | — | SSE `wait_for_job` variant — instead of polling, open `/v2/jobs/{id}/stream` and consume server-sent events. ~10× lower poll volume on long jobs. | MCP only: `httpx.stream()` complexity. Not user-facing important. |
-| — | Parallel-independent clip mode — when `chain_mode="independent"`, `cut_music_video` could submit all clips at once via `asyncio.gather` and finish in `max(clip_t)` not `sum(clip_t)`. | Backend: needs the queue + remote pool to handle 5-20 concurrent video jobs. v1.13 gave us 14 concurrent workers, so this is unblocked — just engineering. |
+| — | Phrase-boundary-aware slicing (beyond beats / downbeats). | Backend: needs an `allin1`-style sidecar or extension to madmom; current `/v1/music/analyze` doesn't return phrase markers. |
+| — | LoRA upload tool (`POST /v1/loras` multipart from MCP). | MCP only: multipart-from-tool-call is operationally awkward. v0.6 deferred to ops via curl/dashboard. |
 | — | PyPI publish under `noodlefinger-mcp` for signed-by-PyPI distribution + simpler `uvx noodlefinger-mcp` invocation (no git URL). | None — release engineering only. |
 
-If you have a use case for a v0.3 feature, file an issue at [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal).
+If you have a use case for one of these, file an issue at [github.com/tacos8me/noodle-portal](https://github.com/tacos8me/noodle-portal).
 
 ---
 
@@ -618,7 +644,7 @@ If you have a use case for a v0.3 feature, file an issue at [github.com/tacos8me
 Check that `uvx` is in your PATH. `which uvx` should print a path. If not, install [astral-sh/uv](https://docs.astral.sh/uv/getting-started/installation/) — the MCP launches via `uvx` from a git URL on every start. The first launch downloads the wheel (~5 s); subsequent launches are cached and start in <1 s.
 
 **Tier-1 tools missing — `mcp__noodlefinger__submit_job` returns "tool not found".**
-Set `NOODLEFINGER_API_KEY` in the env config of your client's MCP entry and restart the client. The 14 tier-1 tools are conditionally registered at `list_tools()` time; if the env var is unset at server start, they never appear in the tool list. Run `mcp__noodlefinger__list_groups` (tier-0) to confirm the server is otherwise healthy.
+Set `NOODLEFINGER_API_KEY` in the env config of your client's MCP entry and restart the client. The 23 tier-1 tools are conditionally registered at `list_tools()` time; if the env var is unset at server start, they never appear in the tool list. Run `mcp__noodlefinger__list_groups` (tier-0) to confirm the server is otherwise healthy.
 
 **`wait_for_job` returns `timeout: job did not complete in 600s`.**
 The backend may be in turbo mode (music + image gen blocked, video only) or a sidecar may be down. Check `https://api.noodlefinger.io/health` first. For long jobs (final-quality 4K outpaint, 30 s retake) bump `timeout_s` to 1800. If the job actually completed but the timeout fired first, re-run `get_job(job_id)` — the result is still cached server-side for 30 days.

@@ -1,42 +1,46 @@
 # Operator tuning — rate limits, concurrency, fd ceilings, export quality
 
-> Server version: v1.16.2 (2026-04-28).
+> Server version: v1.16.4 (2026-04-29).
 > Audience: backend operator / on-call. Frontend / SDK callers should look at [API.md](./API.md) instead.
 
-This file documents the runtime-tunable knobs introduced (or rebalanced) in **v1.16.1** after a real-world MV submission pattern (28 sequential a2v jobs at 1.5 s pacing) tripped `per_key_queue_full` on 24/28 first-pass submissions and surfaced `Connection reset by peer` on concurrent client polls.
+This file documents the runtime-tunable knobs originally introduced in **v1.16.1** (after a 28 a2v / 1.5 s-pacing submission tripped `per_key_queue_full` on 24/28 first-pass submissions) and rescaled in **v1.16.4** for heavy-MV operators running 200-clip `cut_music_video` sessions with mcp v0.4.4+ parallel clip dispatch.
 
-## What's tuned in v1.16.1
+## What's tuned
 
-Three layers were touched:
+Three layers, all env-overridable:
 
 1. **Application layer** — per-bearer + global queue caps in `config.py`.
 2. **HTTP layer** — uvicorn `--limit-concurrency` + `--backlog` flags in `run.sh`.
 3. **System layer** — `LimitNOFILE` in the systemd user unit.
 
-All three are environment-overridable; nothing is baked into a binary. To roll back to v1.15.x behavior, set the env vars in `.env` to the pre-v1.16.1 numbers and restart the unit.
+To roll back, set the env vars in `.env` and restart the unit.
 
 ## Per-key job queue caps (application layer)
 
-`config.py` exposes four ceilings. Each accepts an env-var override of the same name; missing or unparsable values fall back to the default.
+`config.py` exposes five ceilings. Each accepts an env-var override of the same name; missing or unparsable values fall back to the default.
 
-| Knob | v1.15.x default | v1.16.1 default | What it caps |
-|---|---|---|---|
-| `PER_KEY_QUEUE_CAP` | 3 | **15** | In-flight v2 video jobs per bearer (text-to-video, image-to-video, audio-to-video, retake, video-outpaint, video-hdr). Returns `429 per_key_queue_full` + `Retry-After: 30` when exceeded. |
-| `PER_KEY_MUSIC_CAP` | 2 | **5** | In-flight music submissions per bearer (`/v2/music`). |
-| `PER_KEY_BATCH_CAP` | 2 | **5** | In-flight batch submissions per bearer (`/v2/batch`). |
-| `MAX_QUEUE_DEPTH` | 10 | **30** | Global queue ceiling across all bearers. Returns `429 queue_full`. |
+| Knob | v1.15.x | v1.16.1 | v1.16.4 default | What it caps |
+|---|---|---|---|---|
+| `PER_KEY_QUEUE_CAP` | 3 | 15 | **100** | In-flight v2 video jobs per bearer (text-to-video, image-to-video, audio-to-video, retake, video-outpaint, video-hdr). Returns `429 per_key_queue_full` + `Retry-After: 30` when exceeded. |
+| `PER_KEY_MUSIC_CAP` | 2 | 5 | **20** | In-flight music submissions per bearer (`/v2/music`). |
+| `PER_KEY_BATCH_CAP` | 2 | 5 | **20** | In-flight batch submissions per bearer (`/v2/batch`). |
+| `MAX_QUEUE_DEPTH` | 10 | 30 | **200** | Global queue ceiling across all bearers. Returns `429 queue_full`. v1.16.4 made this env-overridable (was hardcoded). |
+| `MAX_BATCH_QUEUE_DEPTH` | 5 | 5 | **30** | Concurrent batch submissions (`/v2/batch`). v1.16.4 made this env-overridable (was hardcoded). |
 
-`PER_KEY_QUEUE_CAP` was the proximate cause of the v1.16.1 regression — 28 sequential video submissions from one bearer overflowed a 3-slot per-key cap before the queue worker could drain even one. The new ceiling fits a 28-job batch + retry headroom while still leaving the global cap (30) at 2× the per-key cap, so a single bearer can't fully starve another.
+The half-global ratio (per-key 100 vs global 200) preserves the v1.16.1 single-tenant-protection rationale: a single bearer can saturate up to half the queue, but never starve other tenants. A 200-clip `cut_music_video` session with parallel dispatch fits comfortably under 100 in-flight per-bearer.
+
+`PER_KEY_QUEUE_CAP` was the proximate cause of the v1.16.0 regression — 28 sequential video submissions from one bearer overflowed a 3-slot per-key cap. v1.16.1 fixed that for typical 28-job MVs; v1.16.4 scales to 200-clip sessions without forcing operators to hand-tune env vars.
 
 ### Override pattern
 
 In `.env` (or any env source loaded by `run.sh`):
 
 ```
-PER_KEY_QUEUE_CAP=8
-PER_KEY_MUSIC_CAP=3
-PER_KEY_BATCH_CAP=3
-MAX_QUEUE_DEPTH=20
+PER_KEY_QUEUE_CAP=50
+PER_KEY_MUSIC_CAP=10
+PER_KEY_BATCH_CAP=10
+MAX_QUEUE_DEPTH=100
+MAX_BATCH_QUEUE_DEPTH=15
 ```
 
 Then `systemctl --user restart taco-backend`. No code edit required.
@@ -82,10 +86,11 @@ To run more conservatively in a constrained environment (a small VPS, a noisy mu
 
 1. Lower the per-key caps in `.env`:
    ```
-   PER_KEY_QUEUE_CAP=4
-   PER_KEY_MUSIC_CAP=2
-   PER_KEY_BATCH_CAP=2
-   MAX_QUEUE_DEPTH=12
+   PER_KEY_QUEUE_CAP=15
+   PER_KEY_MUSIC_CAP=5
+   PER_KEY_BATCH_CAP=5
+   MAX_QUEUE_DEPTH=30
+   MAX_BATCH_QUEUE_DEPTH=5
    ```
 2. Optionally lower the uvicorn limits in `run.sh` (edit `--limit-concurrency` and `--backlog`).
 3. Optionally lower `LimitNOFILE` in the systemd unit and `systemctl --user daemon-reload && systemctl --user restart taco-backend`.
