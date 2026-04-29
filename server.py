@@ -350,11 +350,27 @@ async def _run_music_job(job: Job) -> None:
             asyncio.create_task(_save())
 
 
+_HISTORY_ONLY_PARAMS = (
+    "parent_clip_id", "shot_uuid", "shot_config_key",
+    "composition_id", "lora_applied_id", "lora_applied_strength",
+)
+
+
+def _strip_history_params(p: dict) -> dict:
+    """Return a copy of ``p`` with v1.17.0-rc1 history-lineage fields removed.
+
+    These fields ride in ``job.params`` so ``worker_loop`` can persist them
+    on the history row at completion time, but no manager method accepts
+    them as kwargs.
+    """
+    return {k: v for k, v in p.items() if k not in _HISTORY_ONLY_PARAMS}
+
+
 async def _dispatch_job(job: Job) -> bytes:
     """Route a job to the correct manager and return result bytes."""
     if _paused:
         raise RuntimeError("System is paused for maintenance")
-    p = job.params
+    p = _strip_history_params(job.params)
 
     def on_progress(progress: float, phase: str | None = None) -> None:
         # Guard against stale callbacks firing after a DELETE /v2/jobs/{id}
@@ -1936,7 +1952,7 @@ async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> by
     client = ltx_remote_sidecars.get(provider)
     if client is None:
         raise RuntimeError(f"remote_sidecar_not_configured: {provider}")
-    p = job.params
+    p = _strip_history_params(job.params)
 
     import base64
 
@@ -2099,7 +2115,7 @@ async def _dispatch_job_turbo(job: Job) -> bytes:
     """
     if job.type not in _VIDEO_JOB_TYPES:
         raise ValueError(f"Turbo worker cannot handle {job.type} — only video jobs supported")
-    p = job.params
+    p = _strip_history_params(job.params)
     try:
         return await ltx_sidecar.generate(
             job_type=job.type,
@@ -3471,9 +3487,21 @@ async def v2_retake(body: RetakeRequest, request: Request) -> JSONResponse:
     video_path = str(uploads.resolve(body.video_uri))
     prompt = body.prompt or ""
     seed = random.randint(0, 2**32 - 1)
+    # v1.17.0-rc1: link this retake to its source clip so DPO pair
+    # construction can join (chosen=kept, rejected=retake) downstream.
+    # The source URI is passed in by the client verbatim; we look up the
+    # matching history row by its result_uri. NULL when the source isn't a
+    # known generation (legacy clip, retention-expired row, or a raw upload
+    # that never produced a history entry) — that's not an error.
+    parent_clip_id = None
+    try:
+        parent_clip_id = history.find_id_by_result_uri(body.video_uri)
+    except Exception:
+        logger.warning("retake parent lookup failed for %s", body.video_uri, exc_info=True)
     params = dict(video_path=video_path, start_time=body.start_time,
                   duration=body.duration, mode=body.mode, prompt=prompt, seed=seed,
-                  lora_path=lora_path, lora_strength=lora_strength)
+                  lora_path=lora_path, lora_strength=lora_strength,
+                  parent_clip_id=parent_clip_id)
     return _submit_job(JobType.RETAKE, params, request, raw=body.model_dump(mode="json"))
 
 
@@ -5308,6 +5336,13 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
         "audio_uri": audio_uri,
         "quality": quality,
     }
+    # v1.17.0-rc1: write inverted-index lineage rows (composition_clips)
+    # before submitting the job. Best-effort — failure here doesn't block
+    # the export, the lineage is just for downstream training-data joins.
+    try:
+        history.record_composition_clips(comp_id, params["clips"])
+    except Exception:
+        logger.warning("composition_clips lineage write failed for %s", comp_id, exc_info=True)
     return _submit_job(JobType.EXPORT_COMPOSITION, params, request)
 
 

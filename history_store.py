@@ -16,7 +16,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # Blob caps — a single rogue request can easily serialize multi-MB payloads
 # (LoRA paths list, keyframe images-as-bytes if a caller mis-uses the field,
@@ -51,6 +51,66 @@ CREATE TABLE IF NOT EXISTS generations (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_api_key_hash ON generations(api_key_hash, created_at DESC);
+"""
+
+# v3 (v1.17.0-rc1): five new tables created during _migrate() on the
+# first user_version 2→3 bump. Each uses CREATE TABLE IF NOT EXISTS so
+# re-running the migration after a partial failure is safe.
+_SCHEMA_V3_TABLES = """
+CREATE TABLE IF NOT EXISTS composition_clips (
+    comp_id TEXT NOT NULL,
+    clip_history_id TEXT,
+    position INTEGER NOT NULL,
+    was_final INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (comp_id, clip_history_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_comp_clips_clip ON composition_clips(clip_history_id);
+
+CREATE TABLE IF NOT EXISTS validator_runs (
+    run_id TEXT PRIMARY KEY,
+    video_uri TEXT,
+    video_sha256 TEXT,
+    payload_json TEXT,
+    latency_s REAL,
+    validator_version TEXT,
+    ran_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_validator_runs_video_version
+    ON validator_runs(video_sha256, validator_version);
+
+CREATE TABLE IF NOT EXISTS preference_pairs (
+    pair_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chosen_clip_id TEXT,
+    rejected_clip_id TEXT,
+    signal_source TEXT,
+    signal_strength REAL,
+    used_in_training_run_id TEXT,
+    created_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS training_runs (
+    run_id TEXT PRIMARY KEY,
+    base_model TEXT,
+    base_model_sha TEXT,
+    lora_output_path TEXT,
+    lora_registry_id TEXT,
+    num_pairs INTEGER,
+    val_loss REAL,
+    eval_metrics_json TEXT,
+    trained_at REAL,
+    deployed_at REAL,
+    deprecated_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS api_key_metadata (
+    api_key_hash TEXT PRIMARY KEY,
+    training_opt_in INTEGER NOT NULL DEFAULT 1,
+    tier TEXT DEFAULT 'pro',
+    notes TEXT,
+    created_at REAL,
+    updated_at REAL
+);
 """
 
 
@@ -382,6 +442,22 @@ class HistoryStore:
         v2 adds four nullable columns to ``generations``: ``params_json``,
         ``gen_config_json``, ``seed``, ``enhanced_prompt``. Old rows remain
         valid (all NULL for the new fields) — no backfill.
+
+        v3 (v1.17.0-rc1) adds:
+          - 11 nullable columns on ``generations`` for validator scoring,
+            shot/composition lineage, applied-LoRA tracking, and the
+            (lazy-fill) prompt embedding.
+          - 5 new tables: ``composition_clips`` (inverted-index of clips
+            included in each composition export), ``validator_runs`` (cached
+            validator output keyed by video_sha256+version), ``preference_pairs``
+            (chosen-vs-rejected DPO training data), ``training_runs``
+            (LoRA training-job ledger), ``api_key_metadata`` (per-key
+            training_opt_in flag — defaults ON globally, opt-out only).
+          - 3 indexes on the new generations columns for shot-config-key,
+            parent-clip and composition lookups.
+        Pre-v3 rows get NULL for new columns; no backfill. The
+        ``api_key_metadata`` table is seeded once from ``.api_keys`` on
+        initial migration; subsequent migrations are idempotent no-ops.
         """
         current = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if current >= CURRENT_SCHEMA_VERSION:
@@ -395,6 +471,35 @@ class HistoryStore:
                     "ALTER TABLE generations ADD COLUMN enhanced_prompt TEXT",
                 ):
                     self._conn.execute(stmt)
+            if current < 3:
+                for stmt in (
+                    "ALTER TABLE generations ADD COLUMN validator_score REAL",
+                    "ALTER TABLE generations ADD COLUMN validator_payload_json TEXT",
+                    "ALTER TABLE generations ADD COLUMN validator_version TEXT",
+                    "ALTER TABLE generations ADD COLUMN validator_artifact_uri TEXT",
+                    "ALTER TABLE generations ADD COLUMN parent_clip_id TEXT",
+                    "ALTER TABLE generations ADD COLUMN shot_uuid TEXT",
+                    "ALTER TABLE generations ADD COLUMN shot_config_key TEXT",
+                    "ALTER TABLE generations ADD COLUMN composition_id TEXT",
+                    "ALTER TABLE generations ADD COLUMN lora_applied_id TEXT",
+                    "ALTER TABLE generations ADD COLUMN lora_applied_strength REAL",
+                    "ALTER TABLE generations ADD COLUMN prompt_embedding BLOB",
+                ):
+                    self._conn.execute(stmt)
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gen_shot_config_key "
+                    "ON generations(shot_config_key)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gen_parent_clip_id "
+                    "ON generations(parent_clip_id)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_gen_composition_id "
+                    "ON generations(composition_id)"
+                )
+                self._conn.executescript(_SCHEMA_V3_TABLES)
+                self._maybe_seed_api_key_metadata()
             self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
             self._conn.commit()
             logger.info(
@@ -405,6 +510,45 @@ class HistoryStore:
         except Exception:
             self._conn.rollback()
             raise
+
+    def _maybe_seed_api_key_metadata(self) -> None:
+        """Seed ``api_key_metadata`` from ``.api_keys`` on first v3 migration.
+
+        Single-tenant deploy default: every key in ``.api_keys`` gets
+        ``training_opt_in=1``. Subsequent calls are no-ops because
+        ``_migrate()`` only runs when ``user_version < CURRENT_SCHEMA_VERSION``.
+        Already-populated tables (e.g. operator pre-seeded a key) are
+        respected via ``INSERT OR IGNORE``.
+        """
+        existing = self._conn.execute(
+            "SELECT COUNT(*) FROM api_key_metadata"
+        ).fetchone()[0]
+        if existing:
+            return
+        keys_file = Path(__file__).parent / ".api_keys"
+        if not keys_file.exists():
+            return
+        try:
+            lines = keys_file.read_text().splitlines()
+        except OSError:
+            logger.warning("api_key_metadata seed: failed to read .api_keys", exc_info=True)
+            return
+        now = time.time()
+        rows = []
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            rows.append((_hash_key(line), 1, "pro", None, now, now))
+        if not rows:
+            return
+        self._conn.executemany(
+            """INSERT OR IGNORE INTO api_key_metadata
+               (api_key_hash, training_opt_in, tier, notes, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        logger.info("api_key_metadata seeded with %d row(s) from .api_keys", len(rows))
 
     def save(
         self,
@@ -428,6 +572,12 @@ class HistoryStore:
         raw_request: dict | None = None,
         gen_config_snapshot: dict | None = None,
         dispatch_params: dict | None = None,
+        parent_clip_id: str | None = None,
+        shot_uuid: str | None = None,
+        shot_config_key: str | None = None,
+        composition_id: str | None = None,
+        lora_applied_id: str | None = None,
+        lora_applied_strength: float | None = None,
     ) -> None:
         thumb_uri = None
         if result_bytes and result_uri:
@@ -462,8 +612,11 @@ class HistoryStore:
             """INSERT OR REPLACE INTO generations
                (id, api_key_hash, job_type, prompt, model, width, height, turbo,
                 status, result_uri, thumbnail_uri, created_at, completed_at, error,
-                params_json, gen_config_json, seed, enhanced_prompt)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                params_json, gen_config_json, seed, enhanced_prompt,
+                parent_clip_id, shot_uuid, shot_config_key, composition_id,
+                lora_applied_id, lora_applied_strength)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?)""",
             (
                 job_id,
                 _hash_key(api_key),
@@ -483,6 +636,12 @@ class HistoryStore:
                 gen_config_json,
                 seed,
                 enhanced_prompt,
+                parent_clip_id,
+                shot_uuid,
+                shot_config_key,
+                composition_id,
+                lora_applied_id,
+                lora_applied_strength,
             ),
         )
         self._conn.commit()
@@ -645,3 +804,67 @@ class HistoryStore:
         if count:
             logger.info("Cleaned up %d history entries older than %d days", count, days)
         return count
+
+    # ------------------------------------------------------------------
+    # v3 (v1.17.0-rc1) helpers — composition lineage + retake provenance
+    # ------------------------------------------------------------------
+
+    def record_composition_clips(self, comp_id: str, clips: list[dict]) -> int:
+        """Insert one ``composition_clips`` row per clip in a comp export.
+
+        Each entry in ``clips`` may carry ``historyId`` (LTX-generated clips
+        resolved through ``generations``) OR ``storage_uri`` (synthetic
+        flash inserts that never had an LTX job, per v1.16.3). Both forms
+        get a row; flash inserts store ``clip_history_id=NULL`` but still
+        record their position in the comp.
+
+        Best-effort: returns the number of rows actually inserted.
+        ``INSERT OR IGNORE`` so re-export of the same composition doesn't
+        explode on the (comp_id, clip_history_id, position) PK.
+        """
+        if not clips:
+            return 0
+        now = time.time()
+        rows = []
+        for idx, clip in enumerate(clips):
+            if not isinstance(clip, dict):
+                continue
+            hist_id = clip.get("historyId") or clip.get("history_id")
+            rows.append((comp_id, hist_id, idx, 1, now))
+        if not rows:
+            return 0
+        before = self._conn.execute(
+            "SELECT COUNT(*) FROM composition_clips WHERE comp_id = ?",
+            (comp_id,),
+        ).fetchone()[0]
+        self._conn.executemany(
+            """INSERT OR IGNORE INTO composition_clips
+               (comp_id, clip_history_id, position, was_final, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows,
+        )
+        self._conn.commit()
+        after = self._conn.execute(
+            "SELECT COUNT(*) FROM composition_clips WHERE comp_id = ?",
+            (comp_id,),
+        ).fetchone()[0]
+        return after - before
+
+    def find_id_by_result_uri(self, result_uri: str) -> str | None:
+        """Return the most recent history-row id whose ``result_uri`` matches.
+
+        Used by ``/v2/retake`` to populate ``parent_clip_id`` on the new
+        retake row. Bypasses api_key scoping intentionally — the caller
+        already trusts the path it resolved from the bearer's URI.
+        Returns ``None`` when no row matches (legacy clip, expired
+        retention, or storage_uri pointing at an upload that was never
+        a generation result).
+        """
+        if not result_uri:
+            return None
+        row = self._conn.execute(
+            """SELECT id FROM generations WHERE result_uri = ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (result_uri,),
+        ).fetchone()
+        return row["id"] if row else None
