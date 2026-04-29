@@ -256,6 +256,7 @@ async def _run_tier3_judge(
     prompt: str,
     tier1_summary: dict,
     tier2_summary: dict | None,
+    motion_intent: str | None = None,
 ) -> dict:
     """Sample keyframes, send to Gemma judge, parse + validate JSON.
 
@@ -349,8 +350,19 @@ async def _run_tier3_judge(
         )
     else:
         tier1_block = "Tier1 (optical flow): failed (no optical flow data)\n"
+    # v1.17.0-rc5: render motion_intent into the prompt only when provided.
+    # `None` (or empty string) skips the line entirely so the prompt stays
+    # byte-identical to rc4 for callers who don't supply intent.
+    intent_block = ""
+    if motion_intent:
+        intent_block = (
+            f'Motion intent: "{motion_intent}"\n'
+            f"(Reconcile your verdict against this intent — e.g. don't "
+            f'penalize a static clip when intent is "static portrait".)\n\n'
+        )
     summary_text = (
         f'Original prompt: "{prompt}"\n\n'
+        f"{intent_block}"
         f"{tier1_block}"
         f"Tier2 (pose stability): "
         f"{'skipped' if (tier2_summary is None or tier2_summary.get('tier2_skipped')) else json.dumps(tier2_summary)}\n\n"
@@ -578,6 +590,7 @@ async def run_all_tiers(
     history: HistoryStore,
     validator_version: str | None = None,
     tiers: list[str] | None = None,
+    motion_intent: str | None = None,
 ) -> dict:
     """Run the full validator pipeline + persist into validator_runs.
 
@@ -631,7 +644,10 @@ async def run_all_tiers(
     tier3: dict | None = None
     if "gemma" in tier_set:
         try:
-            tier3 = await _run_tier3_judge(chat, video_path, prompt, tier1 or {}, tier2)
+            tier3 = await _run_tier3_judge(
+                chat, video_path, prompt, tier1 or {}, tier2,
+                motion_intent=motion_intent,
+            )
         except Exception as exc:
             logger.warning("tier3 judge failed: %s", exc, exc_info=True)
             tier3 = None
