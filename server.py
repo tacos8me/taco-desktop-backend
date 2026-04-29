@@ -1894,7 +1894,9 @@ async def _stop_cuda1_tenants() -> None:
         ("sapiens-sidecar",       config.LOAD_SAPIENS),
         ("ltx-sidecar",           True),  # always stop — may be stale from prior turbo
     ]
-    for unit, _ in units:
+    for unit, cfg_flag in units:
+        if not cfg_flag:
+            continue
         try:
             await _systemctl_unit(unit, "stop")
             logger.info("Turbo: systemctl stop %s", unit)
@@ -3378,14 +3380,16 @@ _VALIDATOR_VIDEO_TYPES = {
 
 
 def _is_training_opted_in(api_key: str) -> bool:
-    """Look up ``api_key_metadata.training_opt_in`` for the bearer.
+    """Check whether the given API key has training_opt_in=1 in api_key_metadata.
 
-    Default to **opt-in** when the row is missing — single-tenant deploy
-    seeds every key in ``.api_keys`` with ``training_opt_in=1`` on first
-    v3 migration. External bearers added later get opted in by default;
-    flip a row's flag to 0 to disable validator dispatch for that key.
-    Empty / unknown keys are treated as opted-out so validator never runs
-    on auth-disabled local dev unless the key was explicitly seeded.
+    Default to opt-out when the row is missing. The rc1 v3 migration seeded
+    every `.api_keys` bearer with `training_opt_in=1`, so single-tenant deploy
+    captures validator data for all known operators. Unknown bearers (added
+    to `.api_keys` after the seed run, or never seeded) return False — they
+    must be explicitly INSERTed into `api_key_metadata` to opt in. This is
+    intentional defense-in-depth even though the user-locked default policy
+    is "ON globally" — protects against accidental data capture from keys
+    that haven't been reviewed.
     """
     if not api_key:
         return False

@@ -444,6 +444,31 @@ def test_turbo_skips_sapiens_when_load_sapiens_off(monkeypatch):
     assert "sapiens-sidecar" not in units
 
 
+def test_turbo_entry_skips_sapiens_when_load_sapiens_off(monkeypatch):
+    """LOAD_SAPIENS=0 → `_stop_cuda1_tenants` must not stop sapiens-sidecar.
+
+    v1.17.0-rc3 fix: prior to this, the loop discarded the cfg_flag tuple
+    component and unconditionally stopped every listed unit. Now mirrors
+    the gating pattern in `_restore_cuda1_tenants`.
+    """
+    monkeypatch.setattr(config, "LOAD_SAPIENS", False)
+    monkeypatch.setattr(config, "LOAD_ACE", False)
+    monkeypatch.setattr(config, "LOAD_JOYAI", False)
+    monkeypatch.setattr(config, "LOAD_ERNIE", False)
+
+    stopped: list[str] = []
+
+    async def fake_systemctl(unit, action):
+        stopped.append((unit, action))
+
+    monkeypatch.setattr(server_mod, "_systemctl_unit", fake_systemctl)
+    asyncio.run(server_mod._stop_cuda1_tenants())
+    units = [u for u, _ in stopped]
+    assert "sapiens-sidecar" not in units
+    # ltx-sidecar is gated True, so it should still always be stopped
+    assert "ltx-sidecar" in units
+
+
 # ---------------------------------------------------------------------------
 # JUDGE_PROMPT_V1 schema
 # ---------------------------------------------------------------------------
