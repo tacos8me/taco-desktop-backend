@@ -2,6 +2,53 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.16.4 — 2026-04-29
+
+### Chore: scale rate-limit caps for heavy-MV operators
+
+Bumped queue ceilings to accommodate 200-clip `cut_music_video` sessions with mcp v0.4.4+ parallel clip dispatch. A single bearer can now have ~100 jobs in flight against a 200-deep global queue with headroom for other tenants.
+
+| Cap | Old | New | Env override |
+|---|---|---|---|
+| `MAX_QUEUE_DEPTH` | 30 | **200** | `MAX_QUEUE_DEPTH` (newly env-tunable) |
+| `PER_KEY_QUEUE_CAP` | 15 | **100** | `PER_KEY_QUEUE_CAP` |
+| `PER_KEY_MUSIC_CAP` | 5 | **20** | `PER_KEY_MUSIC_CAP` |
+| `PER_KEY_BATCH_CAP` | 5 | **20** | `PER_KEY_BATCH_CAP` |
+| `MAX_BATCH_QUEUE_DEPTH` | 5 | **30** | `MAX_BATCH_QUEUE_DEPTH` (newly env-tunable) |
+
+Pure config bump; no code/schema/wire changes. `MAX_QUEUE_DEPTH` and `MAX_BATCH_QUEUE_DEPTH` (formerly hardcoded) are now env-overridable like the per-key caps. Half-global ratio for `PER_KEY_QUEUE_CAP` (100/200) preserves the single-tenant-protection rationale from v1.8.2 / v1.16.1.
+
+---
+
+## v1.16.3 — 2026-04-28
+
+### Fix: export_handler `storage_uri` fallback for flash inserts
+
+User report: composition export jobs failing with `KeyError: 'historyId'` at `export_handler.py:164`. Root cause: long-standing contract gap between MCP and backend, surfaced now because shot lists are starting to include flash inserts.
+
+The MCP orchestrator emits composition clips with EITHER `historyId` (LTX-generated, resolved via `history.db`) OR `storage_uri` (synthetic flash inserts minted by `_mint_flash_clip` — they don't ride history at all, no LTX job involved). The MCP-side comment at `orchestrator.py:2014-2015` always promised the backend "accepts either historyId or storage_uri." The backend's `_resolve_clip_path` has been history-id-only since the initial composition export commit (`3f114db`); the storage_uri branch never existed.
+
+**Fix.** `export_composition` clip loop now branches: try `historyId` first, fall through to `storage_uri` resolved via `UploadStore.resolve(...)`, raise a clear `ValueError` when both are absent.
+
+```python
+hist_id = clip.get("historyId")
+storage_uri = clip.get("storage_uri")
+if hist_id:
+    path = _resolve_clip_path(hist_id, uploads)
+elif storage_uri:
+    path = uploads.resolve(storage_uri)
+    if not path.exists():
+        raise FileNotFoundError(f"Clip {idx} storage_uri not found on disk: {storage_uri}")
+else:
+    raise ValueError(f"Clip {idx} missing both historyId and storage_uri")
+```
+
+Not a v1.16.2 regression — pre-existing latent bug. **No MCP change needed.** In-flight stuck export jobs can be retried via `POST /v2/compositions/{id}/export` to resolve cleanly.
+
+4 new regression tests cover storage_uri-only clips, mixed historyId+storage_uri compositions, neither-present rejection, and storage_uri-missing-on-disk handling. `tests/test_export_handler_v0_3.py` 21 → 25 passing.
+
+---
+
 ## v1.16.2 — 2026-04-28
 
 ### Feat: composition export quality knobs (libx264 CRF 18 default + per-export overrides)
