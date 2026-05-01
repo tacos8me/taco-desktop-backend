@@ -12,6 +12,7 @@ import torch
 import logging
 import random
 import secrets as _secrets
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
@@ -809,9 +810,11 @@ async def check_api_key(request: Request, call_next):
     # all require Bearer auth now (SEC P1-1 / P1-2, v1.8.1).
     if request.url.path in ("/health", "/v1/approved-images/events"):
         return await call_next(request)
-    # SSE job streams: EventSource can't set custom headers, so these endpoints
+    # SSE streams: EventSource can't set custom headers, so these endpoints
     # accept a `?token=` query param and do their own auth inside the handler.
     if request.url.path.startswith("/v2/jobs/") and request.url.path.endswith("/stream"):
+        return await call_next(request)
+    if request.url.path == "/v1/system/logs/stream":
         return await call_next(request)
 
     auth = request.headers.get("Authorization", "")
@@ -1692,38 +1695,9 @@ async def system_metrics(request: Request) -> JSONResponse:
         api_key = _extract_api_key(request)
         if not api_key:
             return _error(401, "Missing API key")
-    s = _validator_dispatch_counter["success"]
-    f = _validator_dispatch_counter["failure"]
-    rate = (100.0 * f / max(1, s + f)) if (s + f) > 0 else 0.0
-
-    # v1.18.0-rc2 — Phase B retrieval counters
-    em = _embeddings_metrics
-    avg_results = (
-        em["embeddings_search_results_sum"] / em["embeddings_search_results_count"]
-        if em["embeddings_search_results_count"] > 0
-        else 0.0
-    )
-    return JSONResponse(content={
-        "validator_dispatch": {
-            **_validator_dispatch_counter,
-            "failure_rate_pct": round(rate, 2),
-        },
-        "embeddings": {
-            "embeddings_search_total": em["embeddings_search_total"],
-            "embeddings_search_success": em["embeddings_search_success"],
-            "embeddings_search_failure": em["embeddings_search_failure"],
-            "embeddings_search_rate_limited": em["embeddings_search_rate_limited"],
-            "embeddings_search_results_avg": round(avg_results, 2),
-            "embeddings_search_latency_p50_ms": round(
-                _percentile(_embeddings_search_latencies_ms, 50.0), 2
-            ),
-            "embeddings_search_latency_p95_ms": round(
-                _percentile(_embeddings_search_latencies_ms, 95.0), 2
-            ),
-            "recommend_loras_total": em["recommend_loras_total"],
-            "bulk_revalidate_total": em["bulk_revalidate_total"],
-        },
-    })
+    snapshot = _system_metrics_snapshot()
+    _record_metrics_history(snapshot)
+    return JSONResponse(content=snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -1755,6 +1729,782 @@ def _parse_window_seconds(window: str | None, default: float) -> float:
         return default
 
 
+_METRICS_HISTORY_MAX_SECONDS = 7 * 86400.0
+_metrics_history: dict[int, dict[str, Any]] = {}
+
+
+def _system_metrics_snapshot() -> dict[str, Any]:
+    s = _validator_dispatch_counter["success"]
+    f = _validator_dispatch_counter["failure"]
+    rate = (100.0 * f / max(1, s + f)) if (s + f) > 0 else 0.0
+    em = _embeddings_metrics
+    avg_results = (
+        em["embeddings_search_results_sum"] / em["embeddings_search_results_count"]
+        if em["embeddings_search_results_count"] > 0
+        else 0.0
+    )
+    return {
+        "validator_dispatch": {
+            **_validator_dispatch_counter,
+            "failure_rate_pct": round(rate, 2),
+        },
+        "embeddings": {
+            "embeddings_search_total": em["embeddings_search_total"],
+            "embeddings_search_success": em["embeddings_search_success"],
+            "embeddings_search_failure": em["embeddings_search_failure"],
+            "embeddings_search_rate_limited": em["embeddings_search_rate_limited"],
+            "embeddings_search_results_avg": round(avg_results, 2),
+            "embeddings_search_latency_p50_ms": round(
+                _percentile(_embeddings_search_latencies_ms, 50.0), 2
+            ),
+            "embeddings_search_latency_p95_ms": round(
+                _percentile(_embeddings_search_latencies_ms, 95.0), 2
+            ),
+            "recommend_loras_total": em["recommend_loras_total"],
+            "bulk_revalidate_total": em["bulk_revalidate_total"],
+        },
+    }
+
+
+def _record_metrics_history(snapshot: dict[str, Any]) -> None:
+    minute = int(time.time() // 60) * 60
+    _metrics_history[minute] = snapshot
+    cutoff = int(time.time() - _METRICS_HISTORY_MAX_SECONDS)
+    for ts in list(_metrics_history):
+        if ts < cutoff:
+            _metrics_history.pop(ts, None)
+
+
+def _metric_from_snapshot(snapshot: dict[str, Any], metric: str) -> float | None:
+    current: Any = snapshot
+    for part in metric.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            current = None
+            break
+    if current is None and "." not in metric:
+        for group in snapshot.values():
+            if isinstance(group, dict) and metric in group:
+                current = group[metric]
+                break
+    if isinstance(current, (int, float)):
+        return float(current)
+    return None
+
+
+def _auth_required(request: Request) -> JSONResponse | None:
+    if config.API_KEYS and not _extract_api_key(request):
+        return _error(401, "Missing API key")
+    return None
+
+
+def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
+
+
+def _parse_json_obj(raw: str | None) -> Any:
+    if not raw:
+        return None
+    try:
+        return _json_mod.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _epoch_to_iso(ts: Any) -> str | None:
+    try:
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _history_table_exists(name: str) -> bool:
+    row = history._conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+@app.get("/v1/system/metrics/history")
+async def system_metrics_history(request: Request) -> JSONResponse:
+    deny = _auth_required(request)
+    if deny is not None:
+        return deny
+    metric = request.query_params.get("metric")
+    if not metric:
+        return _error(422, "metric query parameter required")
+    window = _parse_window_seconds(request.query_params.get("window"), 86400.0)
+    snapshot = _system_metrics_snapshot()
+    _record_metrics_history(snapshot)
+    if _metric_from_snapshot(snapshot, metric) is None:
+        return _error(422, "Unknown metric")
+    cutoff = time.time() - window
+    samples = []
+    for ts, snap in sorted(_metrics_history.items()):
+        if ts < cutoff:
+            continue
+        value = _metric_from_snapshot(snap, metric)
+        if value is not None:
+            samples.append({"ts": ts, "value": value})
+    return JSONResponse(content={
+        "metric": metric,
+        "window_seconds": window,
+        "samples": samples,
+    })
+
+
+_LOG_SOURCE_UNITS = {
+    "taco-backend": "taco-backend",
+    "ltx-sidecar": "ltx-sidecar",
+    "ace-step": "ace-step",
+    "joyai-sidecar": "joyai-sidecar",
+    "ernie-image-sidecar": "ernie-image-sidecar",
+    "madmom-sidecar": "madmom-sidecar",
+    "sapiens-sidecar": "sapiens-sidecar",
+    "taco-dashboard": "taco-dashboard",
+}
+_SEVERITY_RANK = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+
+def _journal_priority_to_severity(priority: Any) -> str:
+    try:
+        p = int(priority)
+    except (TypeError, ValueError):
+        return "INFO"
+    if p <= 3:
+        return "ERROR"
+    if p == 4:
+        return "WARN"
+    if p in (5, 6):
+        return "INFO"
+    return "DEBUG"
+
+
+def _parse_journal_line(line: str, source: str) -> dict[str, str]:
+    try:
+        raw = _json_mod.loads(line)
+    except (TypeError, ValueError):
+        raw = {"MESSAGE": line.strip()}
+    severity = _journal_priority_to_severity(raw.get("PRIORITY"))
+    ts_raw = raw.get("__REALTIME_TIMESTAMP")
+    ts: str | None = None
+    try:
+        if ts_raw is not None:
+            ts = datetime.fromtimestamp(
+                int(ts_raw) / 1_000_000.0, tz=timezone.utc
+            ).isoformat()
+    except (TypeError, ValueError, OSError):
+        ts = None
+    unit = str(raw.get("_SYSTEMD_UNIT") or source)
+    return {
+        "ts": ts or datetime.now(timezone.utc).isoformat(),
+        "source": unit.removesuffix(".service"),
+        "severity": severity,
+        "message": str(raw.get("MESSAGE") or ""),
+    }
+
+
+@app.get("/v1/system/logs/stream")
+async def system_logs_stream(
+    request: Request,
+    source: str = "taco-backend",
+    since: str = "5m",
+    min_severity: str = "INFO",
+    token: str | None = None,
+) -> Response:
+    if source not in _LOG_SOURCE_UNITS:
+        return _error(422, "Invalid log source")
+    min_severity = min_severity.upper()
+    if min_severity not in _SEVERITY_RANK:
+        return _error(422, "Invalid min_severity")
+    api_key = _resolve_sse_token(token) or token or _extract_api_key(request)
+    deny = _require_admin_api_key(api_key)
+    if deny is not None:
+        return deny
+
+    async def event_stream():
+        import queue
+        import threading
+
+        proc = subprocess.Popen(
+            [
+                "journalctl",
+                "--user",
+                "-u",
+                _LOG_SOURCE_UNITS[source],
+                f"--since={since}",
+                "--output=json",
+                "--follow",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        q: queue.Queue[str | None] = queue.Queue(maxsize=1000)
+        dropped = 0
+        stop = threading.Event()
+
+        def reader() -> None:
+            nonlocal dropped
+            try:
+                stdout = proc.stdout
+                if stdout is None:
+                    return
+                for line in stdout:
+                    if stop.is_set():
+                        break
+                    try:
+                        q.put_nowait(line)
+                    except queue.Full:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        dropped += 1
+                        try:
+                            q.put_nowait(line)
+                        except queue.Full:
+                            pass
+            finally:
+                while True:
+                    try:
+                        q.put_nowait(None)
+                        break
+                    except queue.Full:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    return
+                try:
+                    line = await asyncio.to_thread(q.get, True, 1.0)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if line is None:
+                    return
+                if dropped:
+                    event = {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "source": source,
+                        "severity": "WARN",
+                        "message": f"[{dropped} lines dropped]",
+                    }
+                    dropped = 0
+                    yield f"data: {_json_mod.dumps(event)}\n\n"
+                event = _parse_journal_line(line, source)
+                if _SEVERITY_RANK[event["severity"]] < _SEVERITY_RANK[min_severity]:
+                    continue
+                yield f"data: {_json_mod.dumps(event)}\n\n"
+        except asyncio.CancelledError:
+            return
+        finally:
+            stop.set()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    await asyncio.to_thread(proc.wait, 2)
+                except Exception:
+                    if proc.poll() is None:
+                        proc.kill()
+            thread.join(timeout=1.0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/v1/system/schema-state")
+async def system_schema_state(request: Request) -> JSONResponse:
+    deny = _auth_required(request)
+    if deny is not None:
+        return deny
+    from history_store import CURRENT_SCHEMA_VERSION
+
+    table_names = [
+        "generations",
+        "preference_pairs",
+        "training_runs",
+        "clip_embeddings",
+        "validator_runs",
+        "composition_clips",
+        "compositions",
+        "api_key_metadata",
+    ]
+    tables: dict[str, dict[str, int]] = {}
+    for name in table_names:
+        if not _history_table_exists(name):
+            tables[name] = {"row_count": 0}
+            continue
+        try:
+            n = history._conn.execute(f"SELECT COUNT(*) AS n FROM {name}").fetchone()["n"]
+        except sqlite3.Error:
+            n = 0
+        tables[name] = {"row_count": int(n)}
+
+    db_path = Path(getattr(history, "_db_path", config.HISTORY_DB))
+    wal_path = Path(str(db_path) + "-wal")
+    indexes = [
+        str(r["name"])
+        for r in history._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IS NOT NULL ORDER BY name"
+        ).fetchall()
+    ]
+    return JSONResponse(content={
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "tables": tables,
+        "db_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+        "indexes": indexes,
+    })
+
+
+def _job_row(job_id: str) -> sqlite3.Row | None:
+    return history._conn.execute(
+        """SELECT id, api_key_hash, job_type, prompt, model, width, height, turbo,
+                  status, result_uri, thumbnail_uri, created_at, completed_at, error,
+                  params_json, gen_config_json, seed, enhanced_prompt,
+                  validator_score, validator_payload_json, validator_version,
+                  validator_artifact_uri, parent_clip_id, shot_uuid, shot_config_key,
+                  composition_id, lora_applied_id, lora_applied_strength,
+                  motion_intent, ab_arm
+           FROM generations WHERE id = ?""",
+        (job_id,),
+    ).fetchone()
+
+
+def _validator_run_for_job(row: sqlite3.Row) -> dict[str, Any] | None:
+    vrow = None
+    if row["result_uri"] and _history_table_exists("validator_runs"):
+        vrow = history._conn.execute(
+            """SELECT run_id, video_uri, video_sha256, payload_json, latency_s,
+                      validator_version, ran_at
+               FROM validator_runs
+               WHERE video_uri = ? OR video_uri = ?
+               ORDER BY ran_at DESC LIMIT 1""",
+            (row["result_uri"], row["id"]),
+        ).fetchone()
+    out = _row_to_dict(vrow)
+    payload = _parse_json_obj(out.get("payload_json")) if out else None
+    if out is not None:
+        out["payload"] = payload
+        return out
+    generated_payload = _parse_json_obj(row["validator_payload_json"])
+    if generated_payload is None:
+        return None
+    return {
+        "run_id": None,
+        "video_uri": row["result_uri"],
+        "payload_json": row["validator_payload_json"],
+        "payload": generated_payload,
+        "validator_version": row["validator_version"],
+        "ran_at": None,
+    }
+
+
+def _lineage_for_job(row: sqlite3.Row) -> dict[str, Any]:
+    job_id = row["id"]
+    lineage = {
+        "parent_clip_id": row["parent_clip_id"],
+        "shot_uuid": row["shot_uuid"],
+        "shot_config_key": row["shot_config_key"],
+        "ab_arm": row["ab_arm"],
+        "composition_id": row["composition_id"],
+        "lora_applied_id": row["lora_applied_id"],
+        "lora_applied_strength": row["lora_applied_strength"],
+        "motion_intent": row["motion_intent"],
+        "ancestors": [],
+        "descendants": [],
+        "siblings": [],
+    }
+
+    seen = {job_id}
+    parent_id = row["parent_clip_id"]
+    for _ in range(50):
+        if not parent_id or parent_id in seen:
+            break
+        seen.add(parent_id)
+        prow = history._conn.execute(
+            "SELECT id, parent_clip_id, validator_score FROM generations WHERE id = ?",
+            (parent_id,),
+        ).fetchone()
+        if not prow:
+            break
+        lineage["ancestors"].append({
+            "id": prow["id"],
+            "validator_score": prow["validator_score"],
+        })
+        parent_id = prow["parent_clip_id"]
+
+    queue_ids = [job_id]
+    seen_desc = {job_id}
+    while queue_ids and len(seen_desc) <= 50:
+        current = queue_ids.pop(0)
+        rows = history._conn.execute(
+            """SELECT id, validator_score FROM generations
+               WHERE parent_clip_id = ? ORDER BY created_at ASC""",
+            (current,),
+        ).fetchall()
+        for child in rows:
+            cid = child["id"]
+            if cid in seen_desc:
+                continue
+            seen_desc.add(cid)
+            lineage["descendants"].append({
+                "id": cid,
+                "validator_score": child["validator_score"],
+            })
+            queue_ids.append(cid)
+            if len(seen_desc) > 50:
+                break
+
+    if row["shot_uuid"]:
+        siblings = history._conn.execute(
+            """SELECT id, validator_score, ab_arm FROM generations
+               WHERE shot_uuid = ? AND id != ?
+               ORDER BY created_at DESC LIMIT 50""",
+            (row["shot_uuid"], job_id),
+        ).fetchall()
+        lineage["siblings"] = [
+            {
+                "id": s["id"],
+                "validator_score": s["validator_score"],
+                "ab_arm": s["ab_arm"],
+            }
+            for s in siblings
+        ]
+    return lineage
+
+
+def _compositions_for_job(job_id: str) -> list[dict[str, Any]]:
+    if not _history_table_exists("composition_clips"):
+        return []
+    if _history_table_exists("compositions"):
+        rows = history._conn.execute(
+            """SELECT cc.comp_id, cc.position, cc.was_final, c.data
+               FROM composition_clips cc
+               LEFT JOIN compositions c ON c.id = cc.comp_id
+               WHERE cc.clip_history_id = ?
+               ORDER BY cc.created_at DESC, cc.position ASC""",
+            (job_id,),
+        ).fetchall()
+    else:
+        rows = history._conn.execute(
+            """SELECT comp_id, position, was_final, NULL AS data
+               FROM composition_clips
+               WHERE clip_history_id = ?
+               ORDER BY created_at DESC, position ASC""",
+            (job_id,),
+        ).fetchall()
+    return [
+        {
+            "composition_id": r["comp_id"],
+            "position_in_comp": r["position"],
+            "kept": bool(r["was_final"]),
+            "thumbnail_url": f"/v2/history/{job_id}/thumbnail",
+        }
+        for r in rows
+    ]
+
+
+@app.get("/v1/system/jobs/{job_id}")
+async def system_job_detail(job_id: str, request: Request) -> JSONResponse:
+    if config.API_KEYS and not _extract_api_key(request):
+        return _error(401, "Missing API key")
+    row = _job_row(job_id)
+    if row is None:
+        return _error(404, "Job not found")
+    api_key = _extract_api_key(request) or ""
+    from history_store import _hash_key
+    is_admin = _is_admin_api_key(api_key)
+    if config.API_KEYS and not is_admin and row["api_key_hash"] != _hash_key(api_key):
+        return _error(403, "Job not owned by bearer")
+
+    params = _parse_json_obj(row["params_json"]) or {}
+    gen_config = _parse_json_obj(row["gen_config_json"])
+    phases = []
+    if row["created_at"] and row["completed_at"]:
+        phases.append({
+            "name": "total",
+            "ts": _epoch_to_iso(row["created_at"]),
+            "duration_ms": int((float(row["completed_at"]) - float(row["created_at"])) * 1000),
+        })
+    live = job_store.get(job_id)
+    phase = live.phase if live is not None else None
+    validator_run = _validator_run_for_job(row)
+    validator_payload = validator_run.get("payload") if validator_run else None
+    response = {
+        "id": row["id"],
+        "type": row["job_type"],
+        "status": row["status"],
+        "phase": phase,
+        "params": params,
+        "gen_config": gen_config,
+        "result_uri": row["result_uri"],
+        "thumbnail_url": f"/v2/history/{row['id']}/thumbnail" if row["thumbnail_uri"] else None,
+        "phases": phases,
+        "validator_run": validator_run,
+        "validator_score": row["validator_score"],
+        "validator_payload": validator_payload,
+        "lineage": _lineage_for_job(row),
+        "in_compositions": _compositions_for_job(job_id),
+    }
+    return JSONResponse(content=response)
+
+
+@app.get("/v1/system/bearers")
+async def system_bearers(request: Request) -> JSONResponse:
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    meta_rows = history._conn.execute(
+        """SELECT api_key_hash, training_opt_in, tier, notes, created_at, updated_at
+           FROM api_key_metadata"""
+    ).fetchall()
+    meta_by_hash = {r["api_key_hash"]: r for r in meta_rows}
+    gen_rows = history._conn.execute(
+        """SELECT api_key_hash, COUNT(*) AS total_clips,
+                  MIN(created_at) AS first_activity_at,
+                  MAX(created_at) AS last_activity_at,
+                  AVG(validator_score) AS mean_validator_score
+           FROM generations
+           GROUP BY api_key_hash"""
+    ).fetchall()
+    gen_by_hash = {r["api_key_hash"]: r for r in gen_rows}
+    arm_rows = history._conn.execute(
+        """SELECT api_key_hash, COALESCE(ab_arm, 'null') AS arm, COUNT(*) AS n
+           FROM generations
+           GROUP BY api_key_hash, COALESCE(ab_arm, 'null')"""
+    ).fetchall()
+    arms: dict[str, dict[str, int]] = {}
+    for r in arm_rows:
+        arms.setdefault(r["api_key_hash"], {})[r["arm"]] = int(r["n"])
+
+    out = []
+    for key_hash in sorted(set(meta_by_hash) | set(gen_by_hash)):
+        meta = meta_by_hash.get(key_hash)
+        gen = gen_by_hash.get(key_hash)
+        first_seen = meta["created_at"] if meta else (gen["first_activity_at"] if gen else None)
+        last_activity = gen["last_activity_at"] if gen else (meta["updated_at"] if meta else None)
+        out.append({
+            "api_key_hash": key_hash,
+            "label": meta["notes"] if meta else None,
+            "tier": meta["tier"] if meta else None,
+            "training_opt_in": bool(meta["training_opt_in"]) if meta else False,
+            "first_seen_at": _epoch_to_iso(first_seen),
+            "last_activity_at": _epoch_to_iso(last_activity),
+            "total_clips": int(gen["total_clips"]) if gen else 0,
+            "mean_validator_score": (
+                round(float(gen["mean_validator_score"]), 4)
+                if gen and gen["mean_validator_score"] is not None else None
+            ),
+            "ab_arm_distribution": arms.get(key_hash, {}),
+        })
+    return JSONResponse(content={"bearers": out})
+
+
+@app.post("/v1/system/bearers/{api_key_hash}/training-opt-in")
+async def system_bearer_training_opt_in(
+    api_key_hash: str, request: Request
+) -> JSONResponse:
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "JSON body required")
+    if "opted_in" not in body or not isinstance(body["opted_in"], bool):
+        return _error(422, "Body must be {opted_in: bool}")
+    now = time.time()
+    history._conn.execute(
+        """INSERT INTO api_key_metadata
+           (api_key_hash, training_opt_in, tier, notes, created_at, updated_at)
+           VALUES (?, ?, 'pro', NULL, ?, ?)
+           ON CONFLICT(api_key_hash) DO UPDATE SET
+             training_opt_in = excluded.training_opt_in,
+             updated_at = excluded.updated_at""",
+        (api_key_hash, 1 if body["opted_in"] else 0, now, now),
+    )
+    history._conn.commit()
+    return JSONResponse(content={"api_key_hash": api_key_hash, "opted_in": bool(body["opted_in"])})
+
+
+_SIDECAR_DEFS = [
+    ("ltx-sidecar", "LTX_SIDECAR_URL", "DUAL_GPU_LTX"),
+    ("ace-step", "ACE_SIDECAR_URL", "LOAD_ACE"),
+    ("joyai-sidecar", "JOYAI_SIDECAR_URL", "LOAD_JOYAI"),
+    ("ernie-image-sidecar", "ERNIE_SIDECAR_URL", "LOAD_ERNIE"),
+    ("madmom-sidecar", "MADMOM_SIDECAR_URL", "LOAD_MADMOM"),
+    ("sapiens-sidecar", "SAPIENS_SIDECAR_URL", "LOAD_SAPIENS"),
+    ("taco-dashboard", None, None),
+]
+
+
+def _systemctl_main_pid(unit: str) -> int | None:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+        value = result.stdout.strip()
+        pid = int(value) if value else 0
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def _gpu_memory_by_pid() -> dict[int, int]:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return {}
+    out: dict[int, int] = {}
+    for line in result.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            out[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+async def _sidecar_health(url: str | None) -> tuple[bool, str | None, str | None, str | None]:
+    if not url:
+        return False, None, "no_url", None
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"{url.rstrip('/')}/health")
+        if resp.status_code != 200:
+            return False, None, f"HTTP {resp.status_code}: {resp.text[:200]}", None
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        status = str(data.get("status") or data.get("state") or "ready")
+        model = data.get("model_loaded") or data.get("model") or data.get("model_name")
+        return True, status, None, str(model) if model is not None else None
+    except Exception as exc:
+        return False, None, str(exc), None
+
+
+@app.get("/v1/system/sidecars")
+async def system_sidecars(request: Request) -> JSONResponse:
+    deny = _auth_required(request)
+    if deny is not None:
+        return deny
+    gpu_mem = _gpu_memory_by_pid()
+    out = []
+    for name, url_attr, load_attr in _SIDECAR_DEFS:
+        url = getattr(config, url_attr) if url_attr else "http://127.0.0.1:8099"
+        configured = bool(getattr(config, load_attr)) if load_attr else True
+        pid = _systemctl_main_pid(name)
+        active, status, error, model = await _sidecar_health(url if configured else None)
+        vram_mb = gpu_mem.get(pid or -1)
+        out.append({
+            "name": name,
+            "url": url,
+            "configured": configured,
+            "active": active,
+            "pid": pid,
+            "last_health_at": datetime.now(timezone.utc).isoformat(),
+            "last_health_status": status,
+            "last_health_error": error,
+            "model_loaded": model,
+            "vram_resident_gb": round(vram_mb / 1024.0, 3) if vram_mb is not None else None,
+        })
+    return JSONResponse(content={"sidecars": out})
+
+
+def _dir_size_count(path: Path) -> tuple[int, int]:
+    total = 0
+    count = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            total += st.st_size
+                            count += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total, count
+
+
+@app.get("/v1/system/storage")
+async def system_storage(request: Request) -> JSONResponse:
+    deny = _auth_required(request)
+    if deny is not None:
+        return deny
+    db_path = Path(getattr(history, "_db_path", config.HISTORY_DB))
+    wal_path = Path(str(db_path) + "-wal")
+    uploads_bytes, uploads_count = _dir_size_count(config.UPLOAD_DIR)
+    thumbs_bytes, thumbs_count = _dir_size_count(config.THUMBNAIL_DIR)
+    artifacts_bytes, artifacts_count = _dir_size_count(config.VALIDATOR_ARTIFACTS_DIR)
+    clip_rows = 0
+    if _history_table_exists("clip_embeddings"):
+        try:
+            clip_rows = int(
+                history._conn.execute("SELECT COUNT(*) AS n FROM clip_embeddings").fetchone()["n"]
+            )
+        except sqlite3.Error:
+            clip_rows = 0
+    return JSONResponse(content={
+        "history_db_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        "wal_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+        "uploads_bytes": uploads_bytes,
+        "uploads_count": uploads_count,
+        "thumbnails_bytes": thumbs_bytes,
+        "thumbnails_count": thumbs_count,
+        "validator_artifacts_bytes": artifacts_bytes,
+        "validator_artifacts_count": artifacts_count,
+        "clip_embeddings_projected_bytes": clip_rows * 4096 * 4,
+    })
+
+
 @app.get("/v1/system/validator-stats")
 async def system_validator_stats(request: Request) -> JSONResponse:
     """Histogram + percentiles of validator scores in a recent window.
@@ -1762,15 +2512,26 @@ async def system_validator_stats(request: Request) -> JSONResponse:
     Query: ``?window=24h`` (default). Buckets are 10 equal-width slots
     [0.0, 0.1) ... [0.9, 1.0]. ``by_version`` breaks down mean+count
     per ``validator_version`` so version drifts surface immediately.
+    ``timeline`` is a compact score-over-time series for the dashboard.
     """
     if config.API_KEYS:
         api_key = _extract_api_key(request)
         if not api_key:
             return _error(401, "Missing API key")
     window = _parse_window_seconds(request.query_params.get("window"), 86400.0)
+    try:
+        timeline_buckets = int(request.query_params.get("timeline_buckets", "48"))
+    except (TypeError, ValueError):
+        timeline_buckets = 48
+    timeline_buckets = min(144, max(12, timeline_buckets))
+    try:
+        recent_limit = int(request.query_params.get("recent_limit", "24"))
+    except (TypeError, ValueError):
+        recent_limit = 24
+    recent_limit = min(50, max(1, recent_limit))
     cutoff = time.time() - window
     rows = history._conn.execute(
-        """SELECT validator_score, validator_version FROM generations
+        """SELECT created_at, validator_score, validator_version FROM generations
            WHERE created_at > ? AND validator_score IS NOT NULL""",
         (cutoff,),
     ).fetchall()
@@ -1789,6 +2550,129 @@ async def system_validator_stats(request: Request) -> JSONResponse:
         v: {"mean": round(s["_sum"] / s["count"], 4), "count": int(s["count"])}
         for v, s in by_version.items()
     }
+    recent_rows = history._conn.execute(
+        """SELECT id, created_at, completed_at, job_type, status, model, prompt,
+                  gen_config_json, params_json,
+                  validator_score, validator_payload_json, validator_version,
+                  composition_id, lora_applied_id, ab_arm, motion_intent, error
+           FROM generations
+           WHERE created_at > ? AND validator_score IS NOT NULL
+           ORDER BY created_at DESC LIMIT ?""",
+        (cutoff, recent_limit),
+    ).fetchall()
+    recent: list[dict[str, Any]] = []
+    recent_scores: list[float] = []
+    for idx, r in enumerate(recent_rows):
+        score = float(r["validator_score"])
+        recent_scores.append(score)
+        previous_score = (
+            float(recent_rows[idx + 1]["validator_score"])
+            if idx + 1 < len(recent_rows)
+            else None
+        )
+        payload = _parse_json_obj(r["validator_payload_json"])
+        if not isinstance(payload, dict):
+            payload = {}
+        gen_config = _parse_json_obj(r["gen_config_json"])
+        if not isinstance(gen_config, dict):
+            gen_config = {}
+        params = _parse_json_obj(r["params_json"])
+        if not isinstance(params, dict):
+            params = {}
+        tier1 = payload.get("tier1") if isinstance(payload.get("tier1"), dict) else {}
+        tier2 = payload.get("tier2") if isinstance(payload.get("tier2"), dict) else {}
+        tier3 = payload.get("tier3") if isinstance(payload.get("tier3"), dict) else {}
+        stage1_steps = (
+            gen_config.get("fast_stage1_steps")
+            if str(r["model"] or "").endswith("-fast")
+            else gen_config.get("pro_stage1_steps")
+        )
+        adjustment_parts = [
+            gen_config.get("sampler"),
+            f"s1 {stage1_steps}" if stage1_steps is not None else None,
+            f"cfg {gen_config.get('cfg_scale')}" if gen_config.get("cfg_scale") is not None else None,
+            f"shift {gen_config.get('scheduler_max_shift')}" if gen_config.get("scheduler_max_shift") is not None else None,
+        ]
+        adjustment_summary = " · ".join(str(x) for x in adjustment_parts if x)
+        recent.append({
+            "id": r["id"],
+            "created_at": float(r["created_at"] or 0.0),
+            "created_at_iso": _epoch_to_iso(r["created_at"]),
+            "completed_at": float(r["completed_at"]) if r["completed_at"] is not None else None,
+            "job_type": r["job_type"],
+            "status": r["status"],
+            "model": r["model"],
+            "prompt": (r["prompt"] or "")[:180],
+            "validator_score": round(score, 4),
+            "delta_vs_previous": (
+                round(score - previous_score, 4)
+                if previous_score is not None
+                else None
+            ),
+            "validator_version": r["validator_version"] or "unknown",
+            "recommendation": payload.get("recommendation"),
+            "tier1_verdict": tier1.get("verdict"),
+            "tier2_motion": tier2.get("motion_score") or tier2.get("score"),
+            "tier3_verdict": tier3.get("verdict"),
+            "tier3_score": tier3.get("score") or tier3.get("judge_score"),
+            "adjustment_summary": adjustment_summary or None,
+            "generation_config": {
+                "sampler": gen_config.get("sampler"),
+                "stage1_steps": stage1_steps,
+                "cfg_scale": gen_config.get("cfg_scale"),
+                "stg_scale": gen_config.get("stg_scale"),
+                "scheduler_max_shift": gen_config.get("scheduler_max_shift"),
+                "scheduler_base_shift": gen_config.get("scheduler_base_shift"),
+                "image_strength": params.get("image_strength"),
+                "duration": params.get("duration"),
+                "resolution": params.get("resolution"),
+            },
+            "composition_id": r["composition_id"],
+            "lora_applied_id": r["lora_applied_id"],
+            "ab_arm": r["ab_arm"],
+            "motion_intent": r["motion_intent"],
+            "error": (r["error"] or "")[:240] if r["error"] else None,
+        })
+
+    def _mean(vals: list[float]) -> float | None:
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    last5 = recent_scores[:5]
+    prev5 = recent_scores[5:10]
+    last5_mean = _mean(last5)
+    prev5_mean = _mean(prev5)
+    trend = {
+        "latest_score": round(recent_scores[0], 4) if recent_scores else None,
+        "latest_delta": (
+            round(recent_scores[0] - recent_scores[1], 4)
+            if len(recent_scores) > 1
+            else None
+        ),
+        "last5_mean": last5_mean,
+        "previous5_mean": prev5_mean,
+        "last5_delta": (
+            round(last5_mean - prev5_mean, 4)
+            if last5_mean is not None and prev5_mean is not None
+            else None
+        ),
+        "last5_count": len(last5),
+        "previous5_count": len(prev5),
+    }
+    bucket_seconds = max(1.0, window / float(timeline_buckets))
+    timeline_acc = [{"sum": 0.0, "count": 0} for _ in range(timeline_buckets)]
+    for r in rows:
+        idx = int((float(r["created_at"]) - cutoff) / bucket_seconds)
+        idx = min(timeline_buckets - 1, max(0, idx))
+        timeline_acc[idx]["sum"] += float(r["validator_score"])
+        timeline_acc[idx]["count"] += 1
+    timeline = []
+    for i, slot in enumerate(timeline_acc):
+        n = int(slot["count"])
+        timeline.append({
+            "ts": round(cutoff + i * bucket_seconds, 3),
+            "count": n,
+            "mean": round(slot["sum"] / n, 4) if n else None,
+        })
     from _ab_stats import percentile
     return JSONResponse(content={
         "histogram": histogram,
@@ -1797,6 +2681,10 @@ async def system_validator_stats(request: Request) -> JSONResponse:
         "p95": round(percentile(scores, 95.0), 4),
         "count": len(scores),
         "by_version": by_version_out,
+        "recent": recent,
+        "trend": trend,
+        "timeline": timeline,
+        "timeline_bucket_seconds": bucket_seconds,
         "window_seconds": window,
     })
 
@@ -2550,6 +3438,7 @@ async def _dispatch_job_turbo(job: Job) -> bytes:
     if job.type not in _VIDEO_JOB_TYPES:
         raise ValueError(f"Turbo worker cannot handle {job.type} — only video jobs supported")
     p = _strip_history_params(job.params)
+    job.gen_config_snapshot = dict(split_model_manager._gen_config)
     try:
         return await ltx_sidecar.generate(
             job_type=job.type,
@@ -5221,6 +6110,12 @@ _RATE_LIMITED_PATH_PREFIXES = (
     "/v1/system/training-runs",
     "/v1/system/preference-pairs-count",
     "/v1/system/validator-failures",
+    "/v1/system/metrics/history",
+    "/v1/system/schema-state",
+    "/v1/system/jobs/",
+    "/v1/system/bearers",
+    "/v1/system/sidecars",
+    "/v1/system/storage",
 )
 
 
@@ -5866,6 +6761,27 @@ def _require_admin(request: Request) -> JSONResponse | None:
             return None
         return _error(401, "Invalid or missing API key")
     if _constant_time_match(token, config.ADMIN_KEYS):
+        return None
+    return _error(403, "admin_required")
+
+
+def _is_admin_api_key(api_key: str) -> bool:
+    if not config.API_KEYS:
+        return True
+    if not api_key:
+        return False
+    if not config.ADMIN_KEYS:
+        return _constant_time_match(api_key, config.API_KEYS)
+    return _constant_time_match(api_key, config.ADMIN_KEYS)
+
+
+def _require_admin_api_key(api_key: str | None) -> JSONResponse | None:
+    if not config.API_KEYS:
+        return None
+    token = api_key or ""
+    if not token:
+        return _error(401, "Missing API key")
+    if _is_admin_api_key(token):
         return None
     return _error(403, "admin_required")
 

@@ -25,6 +25,8 @@
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
+html { overflow-x: hidden; }
+* { min-width: 0; }
 
 body {
   font-family: var(--font);
@@ -32,6 +34,7 @@ body {
   color: var(--text);
   line-height: 1.5;
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
 .container {
@@ -853,28 +856,2215 @@ input[type="range"]::-moz-range-track {
   100% { box-shadow: 0 0 0 0 oklch(0.65 0.15 150 / 0); }
 }
 .pair-badge.pulse { animation: pair-pulse 1.4s ease-out 4; border-color: var(--success); }
+
+/* v1.19.0-rc2 operator-depth panels */
+.sidecar-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.sidecar-card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px; min-height: 140px;
+}
+.sidecar-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sidecar-name { font-family: var(--mono); font-size: 0.82rem; color: var(--text); }
+.sidecar-port { margin-left: auto; font-family: var(--mono); font-size: 0.7rem; color: var(--text-dim); }
+.sidecar-row { display: flex; justify-content: space-between; gap: 10px; font-size: 0.72rem; padding: 2px 0; }
+.sidecar-row span:first-child { color: var(--text-dim); }
+.sidecar-row span:last-child { color: var(--text-muted); font-family: var(--mono); text-align: right; overflow-wrap: anywhere; }
+.sidecar-log { margin-top: 8px; font-size: 0.72rem; padding: 4px 8px; }
+
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.metric-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.metric-table th, .metric-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+.metric-table th { color: var(--text-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.metric-table td { font-family: var(--mono); }
+.metric-counter { background: transparent; border: none; color: var(--text); font: inherit; cursor: pointer; padding: 0; }
+.metric-counter:hover, .job-link:hover { color: var(--accent); }
+.metric-rate {
+  font-family: var(--mono); font-size: 2rem; line-height: 1; margin: 4px 0 12px;
+}
+.metric-rate.danger { color: var(--danger); }
+.metric-rate.ok { color: var(--success); }
+.metric-spark svg { display: block; width: 100%; height: 46px; margin-top: 8px; }
+
+.job-link {
+  background: transparent; border: none; color: var(--text); font-family: var(--mono);
+  font-size: inherit; cursor: pointer; padding: 0; text-decoration: underline; text-decoration-color: var(--border);
+}
+.job-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.job-tab {
+  padding: 5px 10px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-input); color: var(--text-muted); cursor: pointer; font-size: 0.75rem;
+}
+.job-tab.active { color: var(--text); border-color: var(--accent); }
+.job-json {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 12px; font-family: var(--mono); font-size: 0.74rem; overflow-x: auto; white-space: pre-wrap;
+}
+.status-pill {
+  display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.66rem;
+  text-transform: uppercase; letter-spacing: 0.04em; background: var(--bg-input); color: var(--text-muted);
+}
+.status-pill.completed { background: oklch(0.30 0.10 150); color: oklch(0.85 0.13 150); }
+.status-pill.failed { background: oklch(0.30 0.10 25); color: oklch(0.85 0.13 25); }
+.status-pill.processing, .status-pill.queued { background: oklch(0.30 0.10 250); color: oklch(0.85 0.13 250); }
+.phase-chart svg { width: 100%; min-height: 84px; background: var(--bg-input); border-radius: 4px; }
+
+.logs-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 10px; }
+.logs-toolbar .form-group { min-width: 130px; flex: 0 1 auto; }
+.logs-toolbar select[multiple] { min-height: 88px; }
+.log-lines {
+  height: 320px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px; font-family: var(--mono); font-size: 0.74rem;
+}
+.log-line { display: grid; grid-template-columns: 174px 58px 120px 1fr; gap: 8px; padding: 2px 0; border-bottom: 1px solid oklch(0.22 0 0); }
+.log-line .ts, .log-line .src { color: var(--text-dim); }
+.log-line.ERROR .sev { color: var(--danger); }
+.log-line.WARN .sev { color: var(--warning); }
+.log-line.INFO .sev { color: var(--text-muted); }
+.log-line.DEBUG { color: var(--text-dim); }
+.log-status { color: var(--warning); font-size: 0.76rem; margin-bottom: 8px; min-height: 1em; }
+
+.schema-table, .bearer-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.schema-table th, .schema-table td, .bearer-table th, .bearer-table td {
+  padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: left;
+}
+.schema-table th, .bearer-table th {
+  color: var(--text-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.schema-table td, .bearer-table td { font-family: var(--mono); }
+.storage-bar { margin: 12px 0; }
+.storage-bar svg { width: 100%; height: 58px; display: block; }
+.bearer-toggle { transform: translateY(1px); }
+.mini-pie { width: 42px; height: 42px; }
+
+@media (max-width: 640px) {
+  .log-line { grid-template-columns: 1fr; gap: 1px; padding: 6px 0; }
+  .metrics-grid { grid-template-columns: 1fr; }
+}
+
+/* v1.19.0-rc2 dashboard visual refactor */
+:root {
+  --bg: oklch(0.145 0.012 260);
+  --bg-card: oklch(0.205 0.01 260);
+  --bg-input: oklch(0.255 0.012 260);
+  --bg-hover: oklch(0.305 0.014 260);
+  --surface-raised: oklch(0.235 0.012 260);
+  --border: oklch(0.31 0.014 260);
+  --border-strong: oklch(0.42 0.03 260);
+  --text: oklch(0.94 0.01 260);
+  --text-muted: oklch(0.70 0.02 260);
+  --text-dim: oklch(0.52 0.018 260);
+  --radius: 6px;
+}
+
+body {
+  background:
+    linear-gradient(180deg, oklch(0.18 0.018 260) 0, var(--bg) 280px),
+    var(--bg);
+  font-size: 14px;
+}
+
+.container {
+  max-width: 1480px;
+  padding: 0 24px 32px;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(360px, 620px) auto;
+  align-items: center;
+  gap: 16px;
+  margin: 0 -24px 22px;
+  padding: 16px 24px;
+  background: color-mix(in oklch, var(--bg) 86%, transparent);
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand-block {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+header h1 {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  font-size: 1.05rem;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+header h1 span { color: var(--text-muted); }
+
+.pair-badge {
+  margin-left: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--surface-raised);
+}
+
+.auth-bar {
+  margin: 0;
+  padding: 7px 9px;
+  background: var(--surface-raised);
+  border-radius: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.auth-bar label {
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.auth-bar input,
+.form-group input,
+.form-group select,
+.form-group textarea,
+.adv-control select,
+.adv-control input[type="number"] {
+  border-color: var(--border);
+  background: oklch(0.18 0.01 260);
+  border-radius: 5px;
+  color-scheme: dark;
+}
+
+select option {
+  background: oklch(0.18 0.01 260);
+  color: var(--text);
+}
+
+select option:checked {
+  background: var(--accent);
+  color: var(--text);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.conn-status {
+  justify-self: end;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-raised);
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+section,
+.panel-section {
+  margin: 0;
+  min-width: 0;
+}
+
+.panel-section {
+  background: color-mix(in oklch, var(--bg-card) 92%, black);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 15px;
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.035) inset, 0 18px 48px oklch(0 0 0 / 0.16);
+}
+
+.panel-section h2,
+section h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  margin: 0 0 12px;
+  color: var(--text);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.085em;
+  text-transform: uppercase;
+}
+
+.panel-section h2::before {
+  content: "";
+  width: 5px;
+  height: 16px;
+  border-radius: 3px;
+  background: var(--accent);
+  opacity: 0.75;
+}
+
+.span-3 { grid-column: span 3; }
+.span-4 { grid-column: span 4; }
+.span-5 { grid-column: span 5; }
+.span-6 { grid-column: span 6; }
+.span-7 { grid-column: span 7; }
+.span-8 { grid-column: span 8; }
+.span-12 { grid-column: 1 / -1; }
+
+.card,
+.gpu-card,
+.stat-card,
+.active-job,
+.worker-card,
+.panel-card,
+.sidecar-card,
+.tab-content,
+.response-box {
+  background: var(--surface-raised);
+  border-color: var(--border);
+  border-radius: 6px;
+}
+
+.cards { gap: 10px; }
+
+.gpu-card {
+  min-height: 142px;
+  padding: 14px;
+}
+
+.gpu-header {
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.gpu-name {
+  font-size: 0.86rem;
+  line-height: 1.25;
+}
+
+.gpu-tenant {
+  white-space: nowrap;
+  border-radius: 999px;
+  max-width: 100%;
+}
+
+.vram-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: oklch(0.16 0.01 260);
+}
+
+.vram-fill { border-radius: 999px; }
+
+.queue-stats {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stat-card {
+  min-height: 92px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 12px;
+}
+
+.stat-label,
+.btn-row-label,
+.form-group label,
+.adv-control label,
+.metric-table th,
+.schema-table th,
+.bearer-table th,
+.exp-table th,
+.train-table th {
+  color: var(--text-muted);
+  letter-spacing: 0.055em;
+}
+
+.stat-value {
+  margin-top: 2px;
+  font-size: 2rem;
+}
+
+.workers-grid,
+.sidecar-grid {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.worker-card,
+.sidecar-card {
+  min-height: 128px;
+  padding: 11px;
+}
+
+.worker-card.idle { opacity: 0.68; }
+
+.panel-card {
+  padding: 13px;
+}
+
+.panel-empty {
+  color: var(--text-dim);
+  background: oklch(0.17 0.009 260);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+
+.qual-row { gap: 12px; }
+.qual-stats { min-width: 150px; }
+
+.metrics-grid {
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 10px;
+}
+
+.metric-rate {
+  font-size: 2.35rem;
+  letter-spacing: -0.04em;
+}
+
+.metric-table th,
+.metric-table td,
+.schema-table th,
+.schema-table td,
+.bearer-table th,
+.bearer-table td,
+.exp-table th,
+.exp-table td,
+.train-table th,
+.train-table td {
+  padding: 8px 9px;
+}
+
+.logs-toolbar {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.25fr) 130px 120px auto auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.logs-toolbar .form-group {
+  min-width: 0;
+}
+
+.logs-toolbar select[multiple] {
+  min-height: 72px;
+}
+
+.log-lines {
+  height: 260px;
+  background: oklch(0.115 0.012 260);
+  border-color: oklch(0.28 0.02 260);
+}
+
+.log-line {
+  grid-template-columns: 168px 54px 128px minmax(0, 1fr);
+}
+
+.btn {
+  border-radius: 5px;
+  background: oklch(0.235 0.014 260);
+  padding: 7px 13px;
+}
+
+.btn-success {
+  color: oklch(0.84 0.13 150);
+  border-color: oklch(0.43 0.09 150);
+}
+
+.btn-danger {
+  color: oklch(0.82 0.12 25);
+  border-color: oklch(0.42 0.09 25);
+}
+
+.controls-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.control-block {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: oklch(0.185 0.012 260);
+}
+
+.control-block .btn-grid:last-child { margin-bottom: 0; }
+
+.collapsible-header {
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: oklch(0.185 0.012 260);
+}
+
+.collapsible-header h2 {
+  min-height: 0;
+  margin: 0;
+}
+
+.collapsible-header h2::before { display: none; }
+
+.collapsible-body.open { max-height: 1800px; }
+
+.adv-row {
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.tabs {
+  margin-bottom: -1px;
+}
+
+.tab {
+  border-radius: 6px 6px 0 0;
+  background: oklch(0.19 0.012 260);
+}
+
+.tab.active {
+  background: var(--surface-raised);
+}
+
+.tab-content {
+  padding: 14px;
+}
+
+.modal-box {
+  max-width: min(980px, calc(100vw - 32px));
+  border-radius: 8px;
+}
+
+.modal-body {
+  max-height: calc(85vh - 54px);
+}
+
+@media (max-width: 1120px) {
+  .span-3,
+  .span-4,
+  .span-5,
+  .span-6,
+  .span-7,
+  .span-8 {
+    grid-column: span 6;
+  }
+  .logs-toolbar {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 780px) {
+  .container { padding: 0 12px 24px; }
+  .topbar {
+    grid-template-columns: 1fr;
+    margin: 0 -12px 16px;
+    padding: 12px;
+    width: 100vw;
+  }
+  .conn-status { justify-self: start; }
+  .auth-bar input { min-width: 0; }
+  .gpu-tenant { margin-left: 0; }
+  .dashboard-grid {
+    display: block;
+    width: calc(100vw - 24px);
+  }
+  .span-3,
+  .span-4,
+  .span-5,
+  .span-6,
+  .span-7,
+  .span-8,
+  .span-12 {
+    grid-column: 1;
+  }
+  .panel-section {
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .cards,
+  .metrics-grid,
+  .queue-stats,
+  .logs-toolbar {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* v1.19.0-rc2 second-pass UI polish */
+:root {
+  --bg: oklch(0.125 0.008 255);
+  --bg-card: oklch(0.18 0.009 255);
+  --bg-input: oklch(0.215 0.012 255);
+  --bg-hover: oklch(0.255 0.016 255);
+  --surface-raised: oklch(0.195 0.01 255);
+  --surface-soft: oklch(0.158 0.008 255);
+  --border: oklch(0.285 0.012 255);
+  --border-strong: oklch(0.42 0.026 255);
+  --accent: oklch(0.68 0.13 205);
+  --accent-hover: oklch(0.75 0.13 205);
+  --success: oklch(0.68 0.14 155);
+  --danger: oklch(0.66 0.16 25);
+  --warning: oklch(0.78 0.15 82);
+}
+
+body {
+  background:
+    radial-gradient(1200px 520px at 58% -180px, oklch(0.205 0.032 235 / 0.85), transparent 62%),
+    linear-gradient(180deg, oklch(0.142 0.009 255), var(--bg) 420px),
+    var(--bg);
+}
+
+.container {
+  max-width: none;
+  width: 100%;
+  padding: 0 22px 34px;
+}
+
+.topbar {
+  min-height: 70px;
+  margin: 0 -22px 0;
+  padding: 14px 22px;
+  grid-template-columns: 244px minmax(320px, 620px) auto;
+  background: oklch(0.128 0.008 255 / 0.9);
+  border-bottom-color: oklch(0.34 0.012 255);
+}
+
+.brand-block h1 {
+  font-size: 1rem;
+  font-weight: 750;
+}
+
+.brand-block h1::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 4px oklch(0.68 0.14 155 / 0.12);
+}
+
+.pair-badge,
+.conn-status,
+.auth-bar {
+  background: oklch(0.18 0.01 255);
+  border-color: oklch(0.34 0.014 255);
+}
+
+.auth-bar {
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.035) inset;
+}
+
+.auth-bar input {
+  background: oklch(0.128 0.008 255);
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 184px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  padding-top: 18px;
+}
+
+.side-nav {
+  position: sticky;
+  top: 88px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: oklch(0.145 0.008 255 / 0.82);
+  backdrop-filter: blur(12px);
+}
+
+.side-nav a {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  padding: 7px 9px;
+  color: var(--text-muted);
+  border-radius: 6px;
+  text-decoration: none;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.side-nav a::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.55;
+}
+
+.side-nav a:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.dashboard-grid {
+  gap: 14px;
+}
+
+.panel-section {
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, oklch(0.19 0.011 255), oklch(0.165 0.009 255));
+  border-color: oklch(0.32 0.014 255);
+  border-radius: 7px;
+  padding: 14px;
+  box-shadow:
+    0 1px 0 oklch(1 0 0 / 0.04) inset,
+    0 12px 30px oklch(0 0 0 / 0.18);
+}
+
+.panel-section::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  border-top: 1px solid oklch(1 0 0 / 0.035);
+}
+
+.panel-section h2,
+section h2 {
+  color: oklch(0.88 0.012 255);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  min-height: 20px;
+  margin-bottom: 13px;
+}
+
+.panel-section h2::before {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px oklch(0.68 0.13 205 / 0.12);
+}
+
+#sectionGpu h2::before,
+#sectionQueue h2::before { background: var(--accent); }
+#sectionQuality h2::before,
+#sectionMetrics h2::before { background: var(--success); }
+#sectionExperiments h2::before,
+#sectionTraining h2::before { background: var(--warning); }
+#sectionLogs h2::before,
+#sectionControls h2::before { background: oklch(0.72 0.12 285); }
+
+.card,
+.gpu-card,
+.stat-card,
+.active-job,
+.worker-card,
+.panel-card,
+.sidecar-card,
+.tab-content,
+.response-box,
+.control-block {
+  background:
+    linear-gradient(180deg, oklch(0.218 0.012 255), oklch(0.19 0.01 255));
+  border: 1px solid oklch(0.335 0.014 255);
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.035) inset;
+}
+
+.cards {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.gpu-card {
+  min-height: 132px;
+}
+
+.gpu-name,
+.worker-card .wc-id,
+.sidecar-name {
+  font-weight: 760;
+}
+
+.gpu-tenant,
+.exp-status,
+.train-status,
+.status-pill,
+.worker-card .provider-pill {
+  border: 1px solid oklch(1 0 0 / 0.07);
+}
+
+.vram-bar,
+.progress-bar,
+.worker-card .wc-progress {
+  background: oklch(0.105 0.006 255);
+}
+
+.stat-card {
+  align-items: flex-start;
+  text-align: left;
+  min-height: 84px;
+}
+
+.stat-value {
+  font-size: 1.75rem;
+  line-height: 1.05;
+}
+
+.stat-label {
+  font-size: 0.68rem;
+}
+
+.panel-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 54px;
+  background:
+    repeating-linear-gradient(135deg, oklch(0.13 0.007 255), oklch(0.13 0.007 255) 10px, oklch(0.145 0.008 255) 10px, oklch(0.145 0.008 255) 20px);
+  border: 1px solid oklch(0.28 0.01 255);
+  border-radius: 6px;
+}
+
+.panel-error {
+  color: var(--warning);
+  background: oklch(0.20 0.045 70 / 0.28);
+  border: 1px solid oklch(0.50 0.10 70 / 0.45);
+  border-radius: 6px;
+}
+
+.metric-rate {
+  color: var(--success);
+  font-size: 2.1rem;
+}
+
+.metric-table tr:hover,
+.schema-table tr:hover,
+.bearer-table tr:hover,
+.exp-table tbody tr:hover,
+.train-table tbody tr:hover {
+  background: oklch(0.235 0.014 255);
+}
+
+.logs-toolbar {
+  grid-template-columns: minmax(180px, 1fr) 128px 116px auto auto auto;
+}
+
+.log-lines {
+  height: 292px;
+  border-color: oklch(0.25 0.012 255);
+  box-shadow: 0 0 0 1px oklch(0 0 0 / 0.28) inset;
+}
+
+.btn {
+  border-color: oklch(0.36 0.014 255);
+  background: oklch(0.225 0.012 255);
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.035) inset;
+}
+
+.btn:hover:not(:disabled) {
+  background: oklch(0.285 0.018 255);
+  border-color: oklch(0.50 0.035 255);
+}
+
+.btn.active {
+  color: oklch(0.12 0.01 255);
+  background: var(--accent);
+}
+
+.btn-success:hover:not(:disabled) {
+  background: oklch(0.24 0.055 155);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: oklch(0.24 0.055 25);
+}
+
+.control-block {
+  padding: 11px;
+  background: oklch(0.16 0.008 255);
+}
+
+.collapsible-header {
+  background: oklch(0.175 0.01 255);
+}
+
+.tab {
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.tab.active {
+  color: var(--text);
+  border-color: oklch(0.38 0.018 255);
+}
+
+.job-json {
+  background: oklch(0.12 0.007 255);
+}
+
+@media (max-width: 1180px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+  .side-nav {
+    position: static;
+    flex-direction: row;
+    overflow-x: auto;
+  }
+  .side-nav a {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 780px) {
+  .app-shell {
+    display: block;
+    padding-top: 12px;
+  }
+  .side-nav {
+    margin-bottom: 12px;
+  }
+  .cards {
+    grid-template-columns: 1fr;
+  }
+  .panel-section {
+    padding: 12px;
+  }
+}
+
+/* v1.19.0-rc2 final dashboard polish */
+:root {
+  --bg: oklch(0.118 0.006 250);
+  --bg-card: oklch(0.172 0.007 250);
+  --bg-input: oklch(0.205 0.009 250);
+  --bg-hover: oklch(0.245 0.013 250);
+  --surface-raised: oklch(0.186 0.008 250);
+  --surface-soft: oklch(0.148 0.006 250);
+  --border: oklch(0.295 0.01 250);
+  --border-strong: oklch(0.43 0.02 250);
+  --accent: oklch(0.70 0.13 202);
+  --accent-hover: oklch(0.76 0.13 202);
+  --success: oklch(0.69 0.14 154);
+  --danger: oklch(0.67 0.16 25);
+  --warning: oklch(0.79 0.15 82);
+}
+
+body {
+  background:
+    linear-gradient(180deg, oklch(0.148 0.009 250) 0, oklch(0.126 0.007 250) 240px, var(--bg) 640px),
+    var(--bg);
+  color: oklch(0.925 0.006 250);
+}
+
+.container {
+  padding: 0 24px 36px;
+}
+
+.topbar {
+  min-height: 72px;
+  margin: 0 -24px;
+  padding: 14px 24px;
+  grid-template-columns: 226px minmax(360px, 660px) auto;
+  background: oklch(0.112 0.006 250 / 0.92);
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.04) inset, 0 12px 26px oklch(0 0 0 / 0.22);
+}
+
+.brand-block h1 {
+  font-size: 1.05rem;
+}
+
+.brand-block h1::before {
+  width: 8px;
+  height: 8px;
+}
+
+.auth-bar,
+.conn-status,
+.pair-badge {
+  background: oklch(0.16 0.007 250);
+}
+
+.auth-bar {
+  height: 44px;
+}
+
+.auth-bar input {
+  height: 30px;
+  background: oklch(0.102 0.005 250);
+}
+
+.conn-status {
+  min-height: 34px;
+}
+
+.app-shell {
+  grid-template-columns: 166px minmax(0, 1fr);
+  gap: 22px;
+  padding-top: 20px;
+}
+
+.side-nav {
+  top: 92px;
+  gap: 1px;
+  padding: 4px 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  backdrop-filter: none;
+}
+
+.side-nav a {
+  flex: 0 0 auto;
+  min-height: 31px;
+  padding: 6px 10px;
+  border-left: 2px solid transparent;
+  border-radius: 0 5px 5px 0;
+  color: oklch(0.68 0.014 250);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.side-nav a::before {
+  display: none;
+}
+
+.side-nav a:hover {
+  color: var(--text);
+  background: oklch(0.19 0.01 250);
+  border-left-color: var(--accent);
+}
+
+.dashboard-grid {
+  gap: 16px;
+}
+
+.panel-section {
+  overflow: hidden;
+  background: oklch(0.162 0.007 250);
+  border-color: oklch(0.295 0.012 250);
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.035) inset, 0 16px 34px oklch(0 0 0 / 0.16);
+}
+
+.panel-section::after {
+  display: none;
+}
+
+.panel-section h2,
+section h2 {
+  margin-bottom: 12px;
+  color: oklch(0.875 0.01 250);
+  letter-spacing: 0.105em;
+}
+
+.card,
+.gpu-card,
+.stat-card,
+.active-job,
+.worker-card,
+.panel-card,
+.sidecar-card,
+.tab-content,
+.response-box,
+.control-block {
+  background: oklch(0.19 0.008 250);
+  border-color: oklch(0.325 0.012 250);
+  box-shadow: none;
+}
+
+.panel-card,
+.control-block {
+  padding: 12px;
+}
+
+.cards {
+  gap: 12px;
+}
+
+.gpu-card {
+  min-height: 128px;
+  border-left: 2px solid oklch(0.55 0.09 202);
+}
+
+.gpu-header {
+  margin-bottom: 16px;
+}
+
+.gpu-name {
+  font-size: 0.9rem;
+}
+
+.gpu-tenant {
+  padding: 3px 9px;
+}
+
+.vram-label,
+.gpu-temp,
+.stat-label,
+.form-group label,
+.adv-control label,
+.btn-row-label {
+  color: oklch(0.68 0.014 250);
+}
+
+.queue-stats {
+  gap: 9px;
+}
+
+.stat-card {
+  min-height: 80px;
+  padding: 13px;
+}
+
+.stat-value {
+  font-size: 1.65rem;
+}
+
+.panel-empty {
+  min-height: 50px;
+  background: oklch(0.125 0.006 250);
+  border-style: solid;
+  color: oklch(0.58 0.013 250);
+}
+
+.panel-error {
+  color: oklch(0.76 0.10 82);
+  background: oklch(0.155 0.02 82);
+  border-color: oklch(0.38 0.07 82);
+}
+
+.metrics-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.metric-rate {
+  font-size: 2rem;
+}
+
+.metric-rate.idle {
+  color: var(--text-dim);
+}
+
+.metric-caption {
+  margin: -7px 0 10px;
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+#sectionQuality .panel-card {
+  min-height: 382px;
+}
+
+#sectionQuality #qualBody {
+  min-height: 338px;
+}
+
+#sectionQuality #qualEmpty {
+  min-height: 296px;
+}
+
+.quality-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+  margin: -2px 0 10px;
+}
+
+.seg-btn {
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 1px solid oklch(0.32 0.012 250);
+  background: oklch(0.14 0.006 250);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.seg-btn:first-child {
+  border-radius: 5px 0 0 5px;
+}
+
+.seg-btn:last-child {
+  border-radius: 0 5px 5px 0;
+}
+
+.seg-btn.active {
+  background: oklch(0.23 0.035 202);
+  border-color: oklch(0.52 0.09 202);
+  color: var(--text);
+}
+
+.qual-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 158px;
+  gap: 14px;
+  align-items: stretch;
+}
+
+.qual-hist-wrap {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid oklch(0.295 0.012 250);
+  border-radius: 6px;
+  background: oklch(0.118 0.006 250);
+}
+
+.qual-hist {
+  min-height: 380px;
+  height: 380px;
+}
+
+.qual-hist svg {
+  width: 100%;
+  height: 380px;
+}
+
+.qual-hist canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.qual-hist .range-band {
+  opacity: 0.12;
+}
+
+.qual-hist .range-band.danger {
+  fill: var(--danger);
+}
+
+.qual-hist .range-band.warning {
+  fill: var(--warning);
+}
+
+.qual-hist .range-band.success {
+  fill: var(--success);
+}
+
+.qual-hist .gridline {
+  stroke: oklch(0.27 0.01 250);
+  stroke-width: 1;
+  stroke-dasharray: 3 5;
+}
+
+.qual-hist .marker {
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+}
+
+.qual-hist .marker.mean {
+  stroke: var(--accent);
+}
+
+.qual-hist .marker.p50 {
+  stroke: oklch(0.82 0.10 285);
+}
+
+.qual-hist .axis-label,
+.qual-hist .threshold-label {
+  fill: oklch(0.62 0.013 250);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.qual-hist .threshold-label {
+  font-size: 8px;
+  letter-spacing: 0.04em;
+}
+
+.qual-hist .bucket {
+  filter: saturate(1.06);
+}
+
+.qual-hist .quality-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.qual-hist .quality-point {
+  fill: oklch(0.18 0.008 250);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.qual-hist .quality-point.high {
+  stroke: var(--success);
+}
+
+.qual-hist .quality-point.low {
+  stroke: var(--danger);
+}
+
+.qual-stats {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  align-content: start;
+}
+
+.qual-stat-row {
+  min-height: 52px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid oklch(0.30 0.012 250);
+  border-left: 2px solid var(--accent);
+  border-radius: 6px;
+  background: oklch(0.145 0.006 250);
+}
+
+.qual-stat-row .val {
+  font-size: 1rem;
+}
+
+.qual-versions {
+  max-height: 76px;
+  overflow-y: auto;
+  padding-top: 1px;
+}
+
+.qual-trend {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.qual-trend-card {
+  min-height: 54px;
+  padding: 8px 10px;
+  border: 1px solid oklch(0.30 0.012 250);
+  border-radius: 6px;
+  background: oklch(0.132 0.006 250);
+}
+
+.qual-trend-label {
+  color: var(--text-dim);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.qual-trend-value {
+  margin-top: 2px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.qual-trend-sub {
+  margin-top: 1px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.66rem;
+}
+
+.qual-delta-pos { color: var(--success); }
+.qual-delta-neg { color: var(--danger); }
+.qual-delta-flat { color: var(--text-muted); }
+
+.qual-recent {
+  margin-top: 10px;
+  border: 1px solid oklch(0.285 0.01 250);
+  border-radius: 6px;
+  overflow: hidden;
+  background: oklch(0.118 0.006 250);
+}
+
+.qual-recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  padding: 7px 10px;
+  border-bottom: 1px solid oklch(0.255 0.009 250);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.qual-recent-head span:last-child {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.qual-recent-scroll {
+  max-height: min(44vh, 440px);
+  overflow: auto;
+}
+
+.qual-recent-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 0.72rem;
+}
+
+.qual-recent-table th,
+.qual-recent-table td {
+  padding: 7px 9px;
+  border-bottom: 1px solid oklch(0.235 0.008 250);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.qual-recent-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: oklch(0.142 0.006 250);
+  color: var(--text-dim);
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.qual-recent-table td {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.qual-recent-table td.prompt-cell,
+.qual-recent-table td.adjust-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qual-recent-table td.prompt-cell {
+  color: var(--text-dim);
+  font-family: var(--font);
+}
+
+.qual-score-chip {
+  display: inline-flex;
+  min-width: 44px;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: oklch(0.16 0.008 250);
+  font-weight: 800;
+}
+
+.qual-score-chip.low { color: var(--danger); }
+.qual-score-chip.watch { color: var(--warning); }
+.qual-score-chip.good { color: var(--success); }
+
+.qual-run-main {
+  border-left: 2px solid transparent;
+}
+
+.qual-run-main.low { border-left-color: var(--danger); }
+.qual-run-main.watch { border-left-color: var(--warning); }
+.qual-run-main.good { border-left-color: var(--success); }
+
+.qual-run-main:hover,
+.qual-run-main:hover + .qual-run-detail {
+  background: oklch(0.15 0.007 250);
+}
+
+.qual-run-detail td {
+  padding-top: 0;
+  color: var(--text-dim);
+  background: oklch(0.104 0.005 250);
+}
+
+.qual-run-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.58fr) minmax(360px, 1fr);
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+  padding: 2px 0 5px;
+}
+
+.qual-run-detail-grid span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qual-run-detail-grid b,
+.qual-time-age {
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.qual-run-pill {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid oklch(0.31 0.012 250);
+  border-radius: 999px;
+  background: oklch(0.142 0.006 250);
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+}
+
+.qual-time-age {
+  display: block;
+  margin-top: 2px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.logs-toolbar {
+  grid-template-columns: minmax(180px, 1fr) 128px 112px auto minmax(112px, auto) auto;
+  align-items: end;
+}
+
+.logs-toolbar select[multiple] {
+  min-height: 40px;
+  height: 40px;
+  overflow-y: auto;
+}
+
+.log-status {
+  margin: 2px 0 9px;
+}
+
+.log-lines {
+  height: 322px;
+  background: oklch(0.095 0.005 250);
+  border-color: oklch(0.255 0.009 250);
+}
+
+.log-line {
+  grid-template-columns: 166px 52px 124px minmax(0, 1fr);
+}
+
+.btn {
+  min-height: 34px;
+  padding: 7px 13px;
+  border-radius: 5px;
+  background: oklch(0.218 0.009 250);
+}
+
+.btn-grid {
+  gap: 8px;
+}
+
+.control-block {
+  background: oklch(0.147 0.006 250);
+}
+
+.control-block .btn-row-label {
+  margin-bottom: 8px;
+}
+
+.collapsible-header {
+  min-height: 44px;
+  background: oklch(0.17 0.007 250);
+}
+
+.tab {
+  min-height: 36px;
+  padding: 8px 18px;
+  background: oklch(0.145 0.006 250);
+}
+
+.tab.active {
+  background: oklch(0.19 0.008 250);
+}
+
+.tab-content {
+  padding: 16px;
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea,
+.adv-control select,
+.adv-control input[type="number"] {
+  min-height: 36px;
+  background: oklch(0.118 0.006 250);
+}
+
+.form-group textarea {
+  min-height: 78px;
+}
+
+@media (max-width: 1180px) {
+  .side-nav {
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .side-nav a {
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 5px 5px 0 0;
+  }
+  .side-nav a:hover {
+    border-bottom-color: var(--accent);
+  }
+}
+
+@media (max-width: 780px) {
+  .container {
+    padding: 0 12px 24px;
+  }
+  .topbar {
+    margin: 0 -12px;
+    grid-template-columns: 1fr;
+  }
+  .auth-bar {
+    height: auto;
+  }
+  .logs-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+  .qual-row {
+    grid-template-columns: 1fr;
+  }
+  .quality-toolbar {
+    justify-content: stretch;
+  }
+  .seg-btn {
+    flex: 1;
+  }
+  .qual-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .logs-toolbar .form-group:first-child {
+    grid-column: 1 / -1;
+  }
+  .log-line {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* v1.19.0-rc2 layout correction: stable operator console flow */
+.dashboard-grid {
+  grid-auto-flow: row dense;
+  align-items: start;
+}
+
+#sectionControls { order: 1; grid-column: 1 / -1; grid-row: 1; }
+#sectionGpu { order: 2; grid-column: 1 / 5; grid-row: 2; }
+#sectionQueue { order: 3; grid-column: 5 / 9; grid-row: 2; }
+#sectionWorkers { order: 4; grid-column: 9 / 13; grid-row: 2 / 4; }
+#sectionSidecars { order: 5; grid-column: 1 / 9; grid-row: 3; }
+#sectionQuality { order: 6; grid-column: 1 / -1; grid-row: 4; }
+#sectionMetrics { order: 7; grid-column: 1 / 5; grid-row: 5; }
+#sectionExperiments { order: 8; grid-column: 5 / 9; grid-row: 5; }
+#sectionTraining { order: 9; grid-column: 9 / 13; grid-row: 5; }
+#sectionLogs { order: 10; grid-column: 1 / -1; grid-row: 6; }
+#sectionQuickGenerate { order: 11; grid-column: 1 / -1; grid-row: 7; }
+#sectionAdvanced { order: 12; grid-column: 1 / -1; grid-row: 8; }
+#sectionFlux { order: 13; grid-column: 1 / -1; grid-row: 9; }
+
+.app-shell {
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 16px;
+}
+
+.side-nav a {
+  min-height: 29px;
+  padding: 5px 8px;
+  font-size: 0.72rem;
+}
+
+#sectionGpu .cards {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#sectionGpu .gpu-card {
+  min-height: 118px;
+  padding: 12px;
+}
+
+#sectionGpu .gpu-name {
+  font-size: 0.82rem;
+  line-height: 1.22;
+}
+
+#sectionWorkers .workers-grid {
+  grid-template-columns: 1fr;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+#sectionWorkers .worker-card {
+  min-height: 116px;
+}
+
+#sectionLogs .log-lines {
+  height: 286px;
+}
+
+#sectionLogs .logs-toolbar {
+  grid-template-columns: minmax(220px, 1fr) 132px 120px auto minmax(118px, auto) auto;
+}
+
+#sectionControls {
+  padding: 12px;
+}
+
+#sectionControls h2 {
+  margin-bottom: 9px;
+}
+
+#sectionControls .controls-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.72fr) minmax(255px, 1.15fr) minmax(230px, 0.95fr) minmax(180px, 0.78fr);
+  gap: 9px;
+  align-items: stretch;
+}
+
+#sectionControls .control-block {
+  min-height: 0;
+  padding: 9px;
+}
+
+#sectionControls .control-block:nth-child(1) { order: 1; }
+#sectionControls .control-block:nth-child(2) { order: 2; }
+#sectionControls .control-block:nth-child(3) { order: 3; }
+#sectionControls .control-block:nth-child(7) { order: 4; }
+#sectionControls .control-block:nth-child(4) { order: 5; grid-column: span 2; }
+#sectionControls .control-block:nth-child(5) { order: 6; }
+#sectionControls .control-block:nth-child(6) { order: 7; }
+
+#sectionControls .btn-row-label {
+  margin-top: 0 !important;
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 0.66rem;
+  line-height: 1.25;
+}
+
+#sectionControls .btn-grid {
+  grid-template-columns: repeat(auto-fit, minmax(76px, 1fr));
+  gap: 6px;
+}
+
+#sectionControls #poolBtnGrid {
+  grid-template-columns: repeat(11, minmax(26px, 1fr)) !important;
+}
+
+#sectionControls #poolBtnGridRunpod {
+  grid-template-columns: repeat(5, minmax(38px, 1fr)) !important;
+}
+
+#sectionControls .btn {
+  min-height: 29px;
+  padding: 5px 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.7rem;
+}
+
+#sectionControls .collapsible-header {
+  min-height: 31px;
+  padding: 5px 7px;
+}
+
+#sectionControls .collapsible-header h2 {
+  font-size: 0.7rem !important;
+}
+
+#sectionControls .panel-card {
+  padding: 8px;
+}
+
+#sectionControls .collapsible-body.open {
+  max-height: 720px;
+  overflow: auto;
+}
+
+#sectionAdvanced,
+#sectionFlux {
+  padding: 0;
+  overflow: visible;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+#sectionAdvanced::after,
+#sectionFlux::after {
+  display: none;
+}
+
+#sectionAdvanced .collapsible-header,
+#sectionFlux .collapsible-header {
+  min-height: 42px;
+  padding: 9px 12px;
+  background: oklch(0.158 0.007 250);
+  border: 1px solid oklch(0.295 0.012 250);
+  border-radius: 7px;
+}
+
+#sectionAdvanced .collapsible-header h2,
+#sectionFlux .collapsible-header h2 {
+  font-size: 0.74rem;
+}
+
+#sectionAdvanced .collapsible-body,
+#sectionFlux .collapsible-body {
+  margin-top: 8px;
+  background: oklch(0.142 0.006 250);
+  border: 1px solid oklch(0.285 0.01 250);
+  border-radius: 7px;
+}
+
+#sectionAdvanced .collapsible-body:not(.open),
+#sectionFlux .collapsible-body:not(.open) {
+  margin-top: 0;
+  border: 0;
+}
+
+#sectionAdvanced .collapsible-body.open,
+#sectionFlux .collapsible-body.open {
+  max-height: none;
+}
+
+#sectionAdvanced .collapsible-body > div,
+#sectionFlux .collapsible-body > div {
+  padding: 14px;
+}
+
+#sectionAdvanced .adv-row,
+#sectionFlux .adv-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+#sectionAdvanced .adv-control,
+#sectionFlux .adv-control {
+  min-width: 0;
+}
+
+#sectionSidecars {
+  padding-bottom: 12px;
+}
+
+#sectionSidecars .sidecar-grid {
+  display: block;
+}
+
+.sidecar-list {
+  max-height: 322px;
+  overflow: auto;
+  border: 1px solid oklch(0.31 0.012 250);
+  border-radius: 6px;
+  background: oklch(0.125 0.006 250);
+}
+
+.sidecar-line {
+  display: grid;
+  grid-template-columns: minmax(132px, 1.25fr) 74px 54px 58px 66px minmax(132px, 1.6fr) 46px;
+  gap: 8px;
+  align-items: center;
+  min-height: 42px;
+  padding: 7px 9px;
+  border-top: 1px solid oklch(0.255 0.009 250);
+  font-size: 0.76rem;
+}
+
+.sidecar-line:first-child {
+  border-top: 0;
+}
+
+.sidecar-line-head {
+  min-height: 34px;
+  background: oklch(0.155 0.008 250);
+  color: var(--text-dim);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.sidecar-line.active {
+  background: oklch(0.16 0.015 155 / 0.42);
+}
+
+.sidecar-line.error {
+  background: oklch(0.15 0.012 25 / 0.35);
+}
+
+.sidecar-namecell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sidecar-name,
+.sidecar-status,
+.sidecar-port,
+.sidecar-pid,
+.sidecar-vram,
+.sidecar-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidecar-status,
+.sidecar-port,
+.sidecar-pid,
+.sidecar-vram,
+.sidecar-detail {
+  color: var(--text-muted);
+  font-family: var(--mono);
+}
+
+.sidecar-line.error .sidecar-status {
+  color: oklch(0.78 0.13 25);
+}
+
+.sidecar-line.active .sidecar-status {
+  color: var(--success);
+}
+
+.sidecar-log {
+  min-height: 26px;
+  margin: 0;
+  padding: 4px 7px;
+  justify-self: end;
+  font-size: 0.66rem;
+}
+
+#sectionMetrics .metrics-grid {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+#sectionMetrics .panel-card {
+  min-width: 0;
+  padding: 10px;
+  border-radius: 6px;
+}
+
+#sectionMetrics .metric-table {
+  display: block;
+  max-height: 112px;
+  overflow: auto;
+  table-layout: fixed;
+  font-size: 0.72rem;
+  border: 1px solid oklch(0.28 0.01 250);
+  border-radius: 5px;
+}
+
+#sectionMetrics .metric-table tbody {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+#sectionMetrics .metric-table th {
+  width: 62%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#sectionMetrics .metric-table th,
+#sectionMetrics .metric-table td {
+  padding: 4px 6px;
+}
+
+#sectionMetrics .metric-table td {
+  text-align: right;
+}
+
+#sectionMetrics .metric-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 7px;
+}
+
+#sectionMetrics .metric-card-head h3 {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.085em;
+  text-transform: uppercase;
+}
+
+#sectionMetrics .metric-card-head .metric-caption {
+  margin: 0;
+}
+
+#sectionMetrics .metric-rate {
+  margin: 0 0 8px;
+  font-size: 1.62rem;
+}
+
+.metric-chip {
+  flex: 0 0 auto;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 7px;
+  border: 1px solid oklch(0.32 0.012 250);
+  border-radius: 999px;
+  background: oklch(0.13 0.006 250);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+}
+
+.embedding-card {
+  background: oklch(0.158 0.007 250);
+}
+
+.embedding-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 118px;
+  gap: 8px;
+  align-items: stretch;
+  margin-bottom: 7px;
+}
+
+.embedding-card .metric-spark {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid oklch(0.28 0.01 250);
+  border-radius: 5px;
+  background: oklch(0.12 0.006 250);
+}
+
+.embedding-card .metric-spark svg {
+  height: 38px !important;
+  margin: 0 !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+}
+
+.embedding-kpis {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 3px;
+}
+
+.embedding-kpi {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 18px;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 0.68rem;
+}
+
+.embedding-kpi span {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.embedding-kpi strong {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+}
+
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-title-row h2 {
+  margin-bottom: 0;
+  flex: 0 0 auto;
+}
+
+#sectionQueue .queue-stats {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+#sectionQueue .stat-card {
+  min-height: 70px;
+  padding: 10px 12px;
+}
+
+#sectionQueue .active-job.header-job {
+  flex: 0 0 198px;
+  min-width: 184px;
+  max-width: 210px;
+  margin: 0;
+  padding: 6px 8px;
+  background: oklch(0.125 0.006 250);
+  border: 1px solid oklch(0.30 0.012 250);
+  border-radius: 6px;
+  display: none;
+}
+
+#sectionQueue .active-job.header-job.visible {
+  display: block;
+}
+
+#sectionQueue .active-job-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+  font-size: 0.68rem;
+}
+
+#sectionQueue .active-job-header .job-type {
+  max-width: 122px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 700;
+}
+
+#sectionQueue .active-job-header .job-phase {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-style: normal;
+}
+
+#sectionQueue .progress-bar {
+  height: 14px;
+}
+
+#sectionQueue .progress-label {
+  font-size: 0.68rem;
+}
+
+@media (max-width: 1180px) {
+  #sectionGpu,
+  #sectionQueue,
+  #sectionWorkers,
+  #sectionSidecars,
+  #sectionQuality,
+  #sectionMetrics,
+  #sectionExperiments,
+  #sectionTraining,
+  #sectionLogs,
+  #sectionControls,
+  #sectionAdvanced,
+  #sectionFlux,
+  #sectionQuickGenerate {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+}
+
+@media (max-width: 780px) {
+  .section-title-row {
+    flex-direction: column;
+  }
+  #sectionQueue .active-job.header-job {
+    max-width: none;
+    width: 100%;
+  }
+  .embedding-summary {
+    grid-template-columns: 1fr;
+  }
+  .sidecar-list {
+    border: 0;
+    background: transparent;
+  }
+  .sidecar-line,
+  .sidecar-line-head {
+    grid-template-columns: 1fr auto;
+  }
+  .sidecar-line-head {
+    display: none;
+  }
+  .sidecar-port,
+  .sidecar-pid,
+  .sidecar-vram,
+  .sidecar-detail {
+    grid-column: 1 / -1;
+  }
+  .sidecar-log {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 </head>
 <body>
 <div class="container">
 
 <!-- Header -->
-<header>
-  <h1>taco-backend <span>v1.2 — GPU Dashboard</span><span id="pairBadge" class="pair-badge" title="Preference pairs collected" style="display:none" onclick="openPairModal()"><span class="pair-count">0</span><span class="pair-suffix">pairs</span></span></h1>
+<header class="topbar">
+  <div class="brand-block">
+    <h1>taco-backend <span>v1.2</span><span id="pairBadge" class="pair-badge" title="Preference pairs collected" style="display:none" onclick="openPairModal()"><span class="pair-count">0</span><span class="pair-suffix">pairs</span></span></h1>
+  </div>
+  <div class="auth-bar">
+    <label for="apiKey">API Key</label>
+    <input type="password" id="apiKey" placeholder="Bearer token for authenticated endpoints" autocomplete="off">
+  </div>
   <div class="conn-status">
     <div class="conn-dot" id="connDot"></div>
     <span id="connLabel">Connecting...</span>
   </div>
 </header>
 
-<!-- Auth bar -->
-<div class="auth-bar">
-  <label for="apiKey">API Key</label>
-  <input type="password" id="apiKey" placeholder="Bearer token for authenticated endpoints" autocomplete="off">
-</div>
+<div class="app-shell">
+<nav class="side-nav" aria-label="Dashboard sections">
+  <a href="#sectionGpu">Status</a>
+  <a href="#sectionControls">Controls</a>
+  <a href="#sectionSidecars">Sidecars</a>
+  <a href="#sectionQueue">Queue</a>
+  <a href="#sectionWorkers">Workers</a>
+  <a href="#sectionQuality">Quality</a>
+  <a href="#sectionMetrics">Metrics</a>
+  <a href="#sectionExperiments">Experiments</a>
+  <a href="#sectionTraining">Training</a>
+  <a href="#sectionLogs">Logs</a>
+  <a href="#sectionQuickGenerate">Generate</a>
+  <a href="#sectionAdvanced">Advanced</a>
+  <a href="#sectionFlux">Flux</a>
+</nav>
+
+<main class="dashboard-grid">
 
 <!-- Section 1: GPU Status -->
-<section>
+<section class="panel-section span-6" id="sectionGpu">
   <h2>GPU Status</h2>
   <div class="cards">
     <div class="gpu-card" id="gpu0">
@@ -909,20 +3099,26 @@ input[type="range"]::-moz-range-track {
 </section>
 
 <!-- Section 2: Model State -->
-<section>
-  <h2>Model State</h2>
-  <div class="badge-row" id="badges">
-    <div class="badge"><div class="badge-dot gray" id="badgeLtx"></div>LTX</div>
-    <div class="badge"><div class="badge-dot gray" id="badgeFlux"></div>Flux</div>
-    <div class="badge"><div class="badge-dot gray" id="badgeJoyai"></div>JoyAI</div>
-    <div class="badge"><div class="badge-dot gray" id="badgeAce"></div>ACE</div>
-    <div class="badge"><div class="badge-dot gray" id="badgeChat"></div>Chat</div>
-  </div>
+<section class="panel-section span-6" id="sectionSidecars">
+  <h2>Sidecars <span id="sidecarMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+  <div class="sidecar-grid" id="sidecarGrid"><div class="panel-empty">Awaiting sidecar telemetry.</div></div>
 </section>
 
 <!-- Section 3: Job Queue -->
-<section>
-  <h2>Job Queue</h2>
+<section class="panel-section span-4" id="sectionQueue">
+  <div class="section-title-row">
+    <h2>Job Queue</h2>
+    <div class="active-job header-job" id="activeJob">
+      <div class="active-job-header">
+        <span class="job-type" id="activeJobType">--</span>
+        <span class="job-phase" id="activeJobPhase">--</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="activeJobFill" style="width:0%"></div>
+        <div class="progress-label" id="activeJobLabel">0%</div>
+      </div>
+    </div>
+  </div>
   <div class="queue-stats" id="queueStats">
     <div class="stat-card">
       <div class="stat-label">Queued</div>
@@ -941,31 +3137,26 @@ input[type="range"]::-moz-range-track {
       <div class="stat-value failed" id="statFailed">0</div>
     </div>
   </div>
-  <div class="active-job" id="activeJob">
-    <div class="active-job-header">
-      <span class="job-type" id="activeJobType">--</span>
-      <span class="job-phase" id="activeJobPhase">--</span>
-    </div>
-    <div class="progress-bar">
-      <div class="progress-fill" id="activeJobFill" style="width:0%"></div>
-      <div class="progress-label" id="activeJobLabel">0%</div>
-    </div>
-  </div>
 </section>
 
 <!-- Section 3.5: Live Workers (v1.13.0) -->
-<section>
+<section class="panel-section span-8" id="sectionWorkers">
   <h2>Live Workers <span id="workerCount" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
-  <div id="workersGrid" class="workers-grid"></div>
+  <div id="workersGrid" class="workers-grid"><div class="panel-empty">Awaiting worker telemetry.</div></div>
 </section>
 
 <!-- Section 3.6: Quality (v1.18.0-rc3, B-dash panel #1 + #5 banner) -->
-<section>
+<section class="panel-section span-8" id="sectionQuality">
   <h2>Quality <span id="qualMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
   <div id="failBanner" class="fail-banner" style="display:none"></div>
   <div class="panel-card" id="qualPanel">
     <div class="panel-empty" id="qualEmpty">No validator scores in window.</div>
     <div id="qualBody" style="display:none">
+      <div class="quality-toolbar" role="group" aria-label="Quality graph mode">
+        <button class="seg-btn active" id="qualModeHistogram" onclick="setQualityGraphMode('histogram')">Distribution</button>
+        <button class="seg-btn" id="qualModeTimeline" onclick="setQualityGraphMode('timeline')">Timeline</button>
+      </div>
+      <div class="qual-trend" id="qualTrend"></div>
       <div class="qual-row">
         <div class="qual-hist-wrap">
           <div class="qual-hist" id="qualHist"></div>
@@ -973,12 +3164,43 @@ input[type="range"]::-moz-range-track {
         <div class="qual-stats" id="qualStats"></div>
       </div>
       <div class="qual-versions" id="qualVersions"></div>
+      <div class="qual-recent" id="qualRecent"></div>
+    </div>
+  </div>
+</section>
+
+<!-- Section 3.65: Metrics (v1.19.0-rc2) -->
+<section class="panel-section span-4" id="sectionMetrics">
+  <h2>Metrics <span id="metricsMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+  <div class="metrics-grid">
+    <div class="panel-card metric-card">
+      <div class="metric-card-head">
+        <h3>Validator dispatch</h3>
+        <div id="validatorFailureCaption" class="metric-caption">no dispatches</div>
+      </div>
+      <div id="validatorFailureRate" class="metric-rate idle">--</div>
+      <table class="metric-table"><tbody id="validatorMetricsBody"></tbody></table>
+    </div>
+    <div class="panel-card metric-card embedding-card">
+      <div class="metric-card-head">
+        <h3>Embeddings</h3>
+        <div class="metric-chip" id="embeddingLatencyCaption">p50 -- / p95 --</div>
+      </div>
+      <div class="embedding-summary">
+        <div class="metric-spark" id="embeddingLatencySpark"></div>
+        <div class="embedding-kpis" aria-label="Embedding summary">
+          <div class="embedding-kpi"><span>Searches</span><strong id="embeddingSearchKpi">--</strong></div>
+          <div class="embedding-kpi"><span>Success</span><strong id="embeddingSuccessKpi">--</strong></div>
+          <div class="embedding-kpi"><span>P95</span><strong id="embeddingP95Kpi">--</strong></div>
+        </div>
+      </div>
+      <table class="metric-table"><tbody id="embeddingMetricsBody"></tbody></table>
     </div>
   </div>
 </section>
 
 <!-- Section 3.7: Experiments (v1.18.0-rc3, B-dash panel #2) -->
-<section>
+<section class="panel-section span-7" id="sectionExperiments">
   <h2>Experiments <span id="expMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
   <div class="panel-card" id="expPanel">
     <div class="panel-empty" id="expEmpty">No experiments yet (admin-gated).</div>
@@ -1001,7 +3223,7 @@ input[type="range"]::-moz-range-track {
 </section>
 
 <!-- Section 3.8: Training (v1.18.0-rc3, B-dash panel #3) -->
-<section>
+<section class="panel-section span-5" id="sectionTraining">
   <h2>Training <span id="trainMeta" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
   <div class="panel-card" id="trainPanel">
     <div class="panel-empty" id="trainEmpty">No training runs yet (admin-gated).</div>
@@ -1017,6 +3239,53 @@ input[type="range"]::-moz-range-track {
   </div>
 </section>
 
+<!-- Section 3.9: Logs (v1.19.0-rc2) -->
+<section class="panel-section span-8" id="sectionLogs">
+  <h2>Logs</h2>
+  <div class="panel-card">
+    <div class="logs-toolbar">
+      <div class="form-group">
+        <label>Source</label>
+        <select id="logSources" multiple onchange="restartLogStreams()">
+          <option value="taco-backend" selected>taco-backend</option>
+          <option value="ltx-sidecar">ltx-sidecar</option>
+          <option value="ace-step">ace-step</option>
+          <option value="joyai-sidecar">joyai-sidecar</option>
+          <option value="ernie-image-sidecar">ernie-image-sidecar</option>
+          <option value="madmom-sidecar">madmom-sidecar</option>
+          <option value="sapiens-sidecar">sapiens-sidecar</option>
+          <option value="taco-dashboard">taco-dashboard</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Severity</label>
+        <select id="logSeverity" onchange="restartLogStreams()">
+          <option value="WARN" selected>WARN+</option>
+          <option value="ERROR">ERROR</option>
+          <option value="INFO">INFO+</option>
+          <option value="DEBUG">DEBUG+</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Since</label>
+        <select id="logSince" onchange="restartLogStreams()">
+          <option value="5m" selected>5m</option>
+          <option value="15m">15m</option>
+          <option value="1h">1h</option>
+          <option value="24h">24h</option>
+        </select>
+      </div>
+      <button class="btn" id="logPauseBtn" onclick="toggleLogsPaused()">Pause</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--text-muted)">
+        <input type="checkbox" id="logAutoscroll" checked> Auto-scroll
+      </label>
+      <button class="btn" onclick="clearLogs()">Clear</button>
+    </div>
+    <div class="log-status" id="logStatus"></div>
+    <div class="log-lines" id="logLines"></div>
+  </div>
+</section>
+
 <!-- Generic modal (v1.18.0-rc3) -->
 <div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this)closeModal()">
   <div class="modal-box">
@@ -1029,13 +3298,17 @@ input[type="range"]::-moz-range-track {
 </div>
 
 <!-- Section 4: Controls -->
-<section>
+<section class="panel-section span-4" id="sectionControls">
   <h2>Controls</h2>
+  <div class="controls-grid">
+  <div class="control-block">
   <div class="btn-row-label">System</div>
   <div class="btn-grid">
     <button class="btn btn-danger" onclick="callEndpoint('POST','/v1/system/pause')">Pause System</button>
     <button class="btn btn-success" onclick="callEndpoint('POST','/v1/system/resume')">Resume System</button>
   </div>
+  </div>
+  <div class="control-block">
   <div class="btn-row-label">Models</div>
   <div class="btn-grid">
     <button class="btn" onclick="callEndpoint('POST','/v1/ltx/unload')">Unload LTX</button>
@@ -1043,24 +3316,62 @@ input[type="range"]::-moz-range-track {
     <button class="btn" onclick="callEndpoint('POST','/v1/flux/unload')">Unload Flux</button>
     <button class="btn" onclick="callEndpoint('POST','/v1/flux/reload')">Reload Flux</button>
   </div>
+  </div>
+  <div class="control-block">
   <div class="btn-row-label">Turbo Mode <span id="turboStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(off)</span></div>
   <div class="btn-grid">
     <button class="btn btn-success" id="btnTurboOn" onclick="toggleTurbo(true)" title="Claim cuda:1 for dual-GPU inference (disables ACE + JoyAI)">Turbo Mode ON</button>
     <button class="btn btn-danger" id="btnTurboOff" onclick="toggleTurbo(false)" title="Release cuda:1 back to ACE/JoyAI">Turbo Mode OFF</button>
   </div>
+  </div>
+  <div class="control-block">
   <div class="btn-row-label">Modal Pool <span id="poolStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
   <div class="btn-grid" id="poolBtnGrid" style="grid-template-columns:repeat(11,1fr)"></div>
   <div class="btn-row-label">RunPod Pool <span id="poolStatusRunpod" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(not configured)</span></div>
   <div class="btn-grid" id="poolBtnGridRunpod" style="grid-template-columns:repeat(5,1fr)"></div>
+  </div>
+  <div class="control-block">
+  <div class="btn-row-label" style="margin-top:14px">Schema</div>
+  <div class="collapsible-header" onclick="toggleSchemaPanel()">
+    <span class="collapse-arrow" id="schemaArrow">&#9654;</span>
+    <h2 style="font-size:0.82rem">Schema & Storage</h2>
+  </div>
+  <div class="collapsible-body" id="schemaBody">
+    <div class="panel-card" style="margin-top:10px">
+      <div class="btn-grid">
+        <button class="btn" onclick="fetchSchemaState(true)">Refresh Schema</button>
+        <button class="btn" onclick="fetchStorageState()">Refresh Storage</button>
+      </div>
+      <div id="schemaPanel"><div class="panel-empty">Collapsed.</div></div>
+      <div id="storagePanel" style="margin-top:14px"></div>
+    </div>
+  </div>
+  </div>
+  <div class="control-block">
+  <div class="btn-row-label" style="margin-top:14px" id="bearersLabel">Bearers</div>
+  <div class="collapsible-header" id="bearersHeader" onclick="toggleBearersPanel()">
+    <span class="collapse-arrow" id="bearersArrow">&#9654;</span>
+    <h2 style="font-size:0.82rem">Bearer Activity</h2>
+  </div>
+  <div class="collapsible-body" id="bearersBody">
+    <div class="panel-card" style="margin-top:10px">
+      <div class="btn-grid"><button class="btn" onclick="fetchBearers()">Refresh Bearers</button></div>
+      <div id="bearersPanel"><div class="panel-empty">Collapsed.</div></div>
+    </div>
+  </div>
+  </div>
+  <div class="control-block">
   <div class="btn-row-label">Sampler <span id="samplerStatus" style="font-size:0.75rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(euler)</span></div>
   <div class="btn-grid">
     <button class="btn" id="btnEuler" onclick="setSampler('euler')" title="Standard Euler (upstream default)">Euler</button>
     <button class="btn btn-success" id="btnCfgPP" onclick="setSampler('cfg_pp')" title="CFG++ with alpha rescaling (ComfyUI-style, better motion quality)">CFG++</button>
   </div>
+  </div>
+  </div>
 </section>
 
 <!-- Section 4b: Advanced Controls -->
-<section>
+<section class="panel-section span-4" id="sectionAdvanced">
   <div class="collapsible-header" onclick="toggleAdvanced()">
     <span class="collapse-arrow" id="advArrow">&#9654;</span>
     <h2>Advanced</h2>
@@ -1177,7 +3488,7 @@ input[type="range"]::-moz-range-track {
 </section>
 
 <!-- Section 4c: Flux Controls -->
-<section>
+<section class="panel-section span-4" id="sectionFlux">
   <div class="collapsible-header" onclick="toggleSection('flux')">
     <span class="collapse-arrow" id="fluxArrow">&#9654;</span>
     <h2>Flux</h2>
@@ -1254,7 +3565,7 @@ input[type="range"]::-moz-range-track {
 </section>
 
 <!-- Section 5: Quick Generate -->
-<section>
+<section class="panel-section span-12" id="sectionQuickGenerate">
   <h2>Quick Generate</h2>
   <div class="tabs">
     <div class="tab active" onclick="switchTab('music')">Music</div>
@@ -1334,6 +3645,8 @@ input[type="range"]::-moz-range-track {
   </div>
 </section>
 
+</main>
+</div>
 </div><!-- /container -->
 
 <div class="toast-container" id="toasts"></div>
@@ -1347,6 +3660,11 @@ const apiKeyInput = document.getElementById("apiKey");
 apiKeyInput.value = localStorage.getItem("taco_api_key") || "";
 apiKeyInput.addEventListener("input", () => {
   localStorage.setItem("taco_api_key", apiKeyInput.value);
+  document.getElementById("bearersHeader").style.display = "";
+  document.getElementById("bearersLabel").style.display = "";
+  document.getElementById("bearersBody").style.display = "";
+  _bearersFetched = false;
+  restartLogStreams();
 });
 
 function getAuthHeaders() {
@@ -1454,7 +3772,55 @@ function updateModelBadges(data) {
 
 function setBadge(id, color) {
   const el = document.getElementById(id);
+  if (!el) return;
   el.className = "badge-dot " + color;
+}
+
+async function pollSidecars() {
+  try {
+    const r = await fetch("/v1/system/sidecars", { headers: getAuthHeaders() });
+    if (!r.ok) return;
+    const data = await r.json();
+    renderSidecars(data.sidecars || []);
+  } catch (e) { /* sidecars panel is best-effort */ }
+}
+
+function _urlPort(url) {
+  try { return new URL(url).port || "—"; } catch { return "—"; }
+}
+
+function renderSidecars(sidecars) {
+  const grid = document.getElementById("sidecarGrid");
+  const meta = document.getElementById("sidecarMeta");
+  const active = sidecars.filter(s => s.active).length;
+  meta.textContent = sidecars.length ? `(${active}/${sidecars.length} active)` : "";
+  grid.innerHTML = sidecars.length ? sidecars.map(s => {
+    const dot = s.active ? "green" : (s.configured ? "red" : "gray");
+    const status = s.last_health_status || (s.configured ? "error" : "disabled");
+    const detail = s.last_health_error
+      ? String(s.last_health_error)
+      : (s.model_loaded || (s.configured ? "configured" : "not configured"));
+    return `<div class="sidecar-line ${s.active ? "active" : (s.configured ? "error" : "disabled")}">
+      <div class="sidecar-namecell">
+        <span class="badge-dot ${dot}"></span>
+        <span class="sidecar-name">${_escapeHtml(s.name)}</span>
+      </div>
+      <span class="sidecar-status">${_escapeHtml(status)}</span>
+      <span class="sidecar-port">:${_escapeHtml(_urlPort(s.url))}</span>
+      <span class="sidecar-pid">${s.pid || "—"}</span>
+      <span class="sidecar-vram">${s.vram_resident_gb == null ? "—" : s.vram_resident_gb.toFixed(2) + " GB"}</span>
+      <span class="sidecar-detail" title="${_escapeHtml(detail)}">${_escapeHtml(detail)}</span>
+      <button class="btn sidecar-log" onclick="openLogsFor('${_escapeHtml(s.name)}')">Logs</button>
+    </div>`;
+  }).join("") : `<div class="panel-empty">No sidecar state available.</div>`;
+  if (sidecars.length) {
+    grid.innerHTML = `<div class="sidecar-list">
+      <div class="sidecar-line sidecar-line-head">
+        <span>Service</span><span>Status</span><span>Port</span><span>PID</span><span>VRAM</span><span>Detail</span><span></span>
+      </div>
+      ${grid.innerHTML}
+    </div>`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,7 +4512,7 @@ function renderWorkerCard(w) {
     const model = _escapeHtml(j.model || "");
     const jtype = _escapeHtml(String(j.type || ""));
     body = `
-      <div class="wc-job-id" title="click to copy: ${jid}" onclick="navigator.clipboard.writeText('${jid}').then(()=>toast('job id copied','ok'))">${jid.slice(0, 10)}…</div>
+      <button class="job-link wc-job-id" data-job-id="${jid}" title="${jid}">${jid.slice(0, 10)}…</button>
       <div class="wc-meta">${jtype}<span class="wc-dim"> · ${model}${dims ? " · " + dims : ""}${frames}</span></div>
       <div class="wc-meta"><span class="wc-dim">${phase} · ${_fmtElapsed(j.elapsed_sec)} · ${pct}%</span></div>
       <div class="wc-progress"><div class="wc-progress-fill" style="width:${pct}%"></div></div>
@@ -2200,6 +4566,218 @@ function closeModal() {
   document.getElementById("modalOverlay").classList.remove("open");
 }
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+document.addEventListener("click", e => {
+  const btn = e.target.closest(".job-link");
+  if (!btn) return;
+  e.preventDefault();
+  const jobId = btn.getAttribute("data-job-id");
+  if (jobId) openJobModal(jobId);
+});
+
+function _fmtBytes(n) {
+  n = Number(n || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function _fmtTs(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? String(s) : d.toISOString().replace("T", " ").replace("Z", "");
+}
+
+function _prettyJson(v) {
+  return `<pre class="job-json">${_escapeHtml(JSON.stringify(v ?? {}, null, 2))}</pre>`;
+}
+
+function _miniLine(values, metricName, opts = {}) {
+  if (!values || values.length < 2) return `<div class="panel-empty" style="padding:6px">No history yet.</div>`;
+  const W = 420, H = 64, pad = 8;
+  const cssHeight = Number(opts.height || 90);
+  const bg = opts.flat ? "transparent" : "var(--bg-input)";
+  const nums = values.map(v => Number(v.value || 0));
+  const lo = Math.min(...nums), hi = Math.max(...nums);
+  const range = (hi - lo) || 1;
+  const pts = values.map((v, i) => {
+    const x = pad + (i / (values.length - 1)) * (W - pad * 2);
+    const y = H - pad - ((Number(v.value || 0) - lo) / range) * (H - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${cssHeight}px;background:${bg};border-radius:4px">
+    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <text x="${pad}" y="${H - 4}" fill="var(--text-dim)" font-size="10" font-family="monospace">${_escapeHtml(metricName)}</text>
+  </svg>`;
+}
+
+async function openMetricHistory(metric) {
+  try {
+    const r = await fetch(`/v1/system/metrics/history?window=24h&metric=${encodeURIComponent(metric)}`, { headers: getAuthHeaders() });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    openModal(`Metric · ${metric}`, _miniLine(data.samples || [], metric) + _prettyJson(data.samples || []));
+  } catch (e) {
+    toast("Metric history failed: " + e.message, "err");
+  }
+}
+
+function _metricButton(metric, value) {
+  return `<button class="metric-counter" onclick="openMetricHistory('${metric}')">${_escapeHtml(value)}</button>`;
+}
+
+async function pollSystemMetrics() {
+  if (!_tabVisible()) return;
+  try {
+    const r = await fetch("/v1/system/metrics", { headers: getAuthHeaders() });
+    if (!r.ok) return;
+    const data = await r.json();
+    renderSystemMetrics(data);
+  } catch (e) { /* quiet */ }
+}
+
+function renderSystemMetrics(data) {
+  const vd = data.validator_dispatch || {};
+  const em = data.embeddings || {};
+  const rate = Number(vd.failure_rate_pct || 0);
+  const dispatchSuccess = Number(vd.success || 0);
+  const dispatchFailure = Number(vd.failure || 0);
+  const activeDispatches = dispatchSuccess + dispatchFailure;
+  const skippedDispatches = Number(vd.skipped_not_video || 0)
+    + Number(vd.skipped_opt_out || 0)
+    + Number(vd.skipped_validator_disabled || 0);
+  const rateEl = document.getElementById("validatorFailureRate");
+  const captionEl = document.getElementById("validatorFailureCaption");
+  if (activeDispatches) {
+    rateEl.textContent = rate.toFixed(2) + "%";
+    rateEl.className = "metric-rate " + (rate > 5 ? "danger" : "ok");
+    captionEl.textContent = "failure rate";
+  } else {
+    rateEl.textContent = "--";
+    rateEl.className = "metric-rate idle";
+    captionEl.textContent = skippedDispatches ? "no eligible dispatches" : "no dispatches";
+  }
+  const vRows = [
+    ["active_dispatches", null, activeDispatches],
+    ["skipped_total", null, skippedDispatches],
+    ["success", "validator_dispatch.success"],
+    ["failure", "validator_dispatch.failure"],
+    ["skipped_not_video", "validator_dispatch.skipped_not_video"],
+    ["skipped_opt_out", "validator_dispatch.skipped_opt_out"],
+    ["skipped_validator_disabled", "validator_dispatch.skipped_validator_disabled"],
+  ];
+  document.getElementById("validatorMetricsBody").innerHTML = vRows.map(([k, m, value]) =>
+    `<tr><th>${_escapeHtml(k)}</th><td>${m ? _metricButton(m, _fmtNum(vd[k] || 0)) : _escapeHtml(_fmtNum(value || 0))}</td></tr>`
+  ).join("");
+  const eRows = [
+    ["search_total", "embeddings.embeddings_search_total", em.embeddings_search_total],
+    ["success", "embeddings.embeddings_search_success", em.embeddings_search_success],
+    ["failure", "embeddings.embeddings_search_failure", em.embeddings_search_failure],
+    ["rate_limited", "embeddings.embeddings_search_rate_limited", em.embeddings_search_rate_limited],
+    ["results_avg", "embeddings.embeddings_search_results_avg", em.embeddings_search_results_avg],
+    ["p50_ms", "embeddings.embeddings_search_latency_p50_ms", em.embeddings_search_latency_p50_ms],
+    ["p95_ms", "embeddings.embeddings_search_latency_p95_ms", em.embeddings_search_latency_p95_ms],
+    ["recommend_loras", "embeddings.recommend_loras_total", em.recommend_loras_total],
+    ["bulk_revalidate", "embeddings.bulk_revalidate_total", em.bulk_revalidate_total],
+  ];
+  const embeddingSearchTotal = Number(em.embeddings_search_total || 0);
+  const embeddingSuccess = Number(em.embeddings_search_success || 0);
+  const embeddingP50 = Number(em.embeddings_search_latency_p50_ms || 0);
+  const embeddingP95 = Number(em.embeddings_search_latency_p95_ms || 0);
+  document.getElementById("embeddingSearchKpi").textContent = _fmtNum(embeddingSearchTotal);
+  document.getElementById("embeddingSuccessKpi").textContent = _fmtNum(embeddingSuccess);
+  document.getElementById("embeddingP95Kpi").textContent = _fmtFixed(embeddingP95, 1) + "ms";
+  document.getElementById("embeddingLatencyCaption").textContent = `p50 ${_fmtFixed(embeddingP50, 1)}ms / p95 ${_fmtFixed(embeddingP95, 1)}ms`;
+  document.getElementById("embeddingMetricsBody").innerHTML = eRows.map(([label, metric, value]) =>
+    `<tr><th>${_escapeHtml(label)}</th><td>${_metricButton(metric, _fmtFixed(value || 0, label.includes("ms") || label.includes("avg") ? 2 : 0))}</td></tr>`
+  ).join("");
+  document.getElementById("embeddingLatencySpark").innerHTML = _miniLine([
+    {value: em.embeddings_search_latency_p50_ms || 0},
+    {value: em.embeddings_search_latency_p95_ms || 0},
+  ], "p50 / p95 latency", {height: 44, flat: true});
+  document.getElementById("metricsMeta").textContent = "(10s refresh)";
+}
+
+let _jobModalData = null;
+
+async function openJobModal(jobId) {
+  openModal(`Job · ${jobId.slice(0, 16)}`, `<div class="panel-empty">Loading job detail...</div>`);
+  try {
+    const r = await fetch(`/v1/system/jobs/${encodeURIComponent(jobId)}`, { headers: getAuthHeaders() });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    _jobModalData = data;
+    document.getElementById("modalTitle").innerHTML = `${_escapeHtml(data.id)} <span class="status-pill ${_escapeHtml(data.status || "")}">${_escapeHtml(data.status || "—")}</span>`;
+    renderJobTab("params");
+  } catch (e) {
+    document.getElementById("modalBody").innerHTML = `<div class="panel-error">${_escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderJobTab(tab) {
+  const d = _jobModalData;
+  if (!d) return;
+  const tabs = ["params", "phases", "validator", "lineage", "compositions"];
+  let body = "";
+  if (tab === "params") {
+    body = _prettyJson({type: d.type, result_uri: d.result_uri, params: d.params, gen_config: d.gen_config});
+  } else if (tab === "phases") {
+    body = renderPhaseChart(d.phases || []);
+  } else if (tab === "validator") {
+    body = _prettyJson({score: d.validator_score, payload: d.validator_payload, run: d.validator_run});
+  } else if (tab === "lineage") {
+    body = renderLineage(d.lineage || {});
+  } else {
+    body = renderJobCompositions(d.in_compositions || []);
+  }
+  document.getElementById("modalBody").innerHTML = `
+    <div class="job-tabs">${tabs.map(t => `<button class="job-tab ${t === tab ? "active" : ""}" onclick="renderJobTab('${t}')">${t}</button>`).join("")}</div>
+    ${body}
+  `;
+}
+
+function renderPhaseChart(phases) {
+  if (!phases.length) return `<div class="panel-empty">No structured phase timings recorded.</div>`;
+  const total = phases.reduce((a, p) => a + Math.max(0, p.duration_ms || 0), 0) || 1;
+  let x = 0;
+  const rects = phases.map((p, i) => {
+    const w = Math.max(3, ((p.duration_ms || 0) / total) * 100);
+    const out = `<rect x="${x}" y="18" width="${w}" height="28" fill="var(--accent)" opacity="${0.55 + i * 0.08}"><title>${_escapeHtml(p.name)} · ${_fmtNum(p.duration_ms || 0)} ms</title></rect>
+      <text x="${x + 1}" y="62" fill="var(--text-muted)" font-size="3" font-family="monospace">${_escapeHtml(p.name)}</text>`;
+    x += w;
+    return out;
+  }).join("");
+  return `<div class="phase-chart"><svg viewBox="0 0 100 70" preserveAspectRatio="none">${rects}</svg></div>`;
+}
+
+function _lineageTable(items) {
+  return items.length ? `<table class="schema-table"><tbody>${items.map(it =>
+    `<tr><td>${_escapeHtml(it.id)}</td><td>${_fmtFixed(it.validator_score, 3)}</td></tr>`
+  ).join("")}</tbody></table>` : `<div class="panel-empty" style="padding:6px">None</div>`;
+}
+
+function renderLineage(l) {
+  return `
+    <dl>
+      <dt>parent</dt><dd>${_escapeHtml(l.parent_clip_id || "—")}</dd>
+      <dt>shot_uuid</dt><dd>${_escapeHtml(l.shot_uuid || "—")}</dd>
+      <dt>shot_config_key</dt><dd>${_escapeHtml(l.shot_config_key || "—")}</dd>
+      <dt>ab_arm</dt><dd>${_escapeHtml(l.ab_arm || "—")}</dd>
+      <dt>composition_id</dt><dd>${_escapeHtml(l.composition_id || "—")}</dd>
+      <dt>lora</dt><dd>${_escapeHtml(l.lora_applied_id || "—")} ${l.lora_applied_strength == null ? "" : "@ " + l.lora_applied_strength}</dd>
+      <dt>motion_intent</dt><dd>${_escapeHtml(l.motion_intent || "—")}</dd>
+    </dl>
+    <h4 style="margin:14px 0 6px;color:var(--text-muted)">Ancestors</h4>${_lineageTable(l.ancestors || [])}
+    <h4 style="margin:14px 0 6px;color:var(--text-muted)">Descendants</h4>${_lineageTable(l.descendants || [])}
+    <h4 style="margin:14px 0 6px;color:var(--text-muted)">Siblings</h4>${_lineageTable(l.siblings || [])}`;
+}
+
+function renderJobCompositions(items) {
+  if (!items.length) return `<div class="panel-empty">This job is not indexed in any composition.</div>`;
+  return `<table class="schema-table"><thead><tr><th>Composition</th><th>Position</th><th>Kept</th></tr></thead><tbody>${items.map(c =>
+    `<tr><td>${_escapeHtml(c.composition_id)}</td><td>${_fmtNum(c.position_in_comp)}</td><td>${c.kept ? "yes" : "no"}</td></tr>`
+  ).join("")}</tbody></table>`;
+}
 
 // ----- Panel #1: Quality (validator-stats histogram) -----
 
@@ -2212,42 +4790,557 @@ function _bucketColor(idx) {
   return "var(--success)";
 }
 
-function renderQualityHistogram(hist) {
+let _qualityGraphMode = "histogram";
+let _lastQualityStats = null;
+const QUALITY_RECENT_LIMIT = 24;
+let _qualityChart = null;
+
+function setQualityGraphMode(mode) {
+  _qualityGraphMode = mode === "timeline" ? "timeline" : "histogram";
+  if (_lastQualityStats) renderQualityGraph(_lastQualityStats);
+}
+
+function syncQualityModeButtons() {
+  document.getElementById("qualModeHistogram")?.classList.toggle("active", _qualityGraphMode === "histogram");
+  document.getElementById("qualModeTimeline")?.classList.toggle("active", _qualityGraphMode === "timeline");
+}
+
+function renderQualityHistogram(hist, stats = {}) {
   const total = hist.reduce((a, b) => a + b, 0);
   const max = Math.max(1, ...hist);
-  const W = 520, H = 140, padL = 28, padR = 8, padT = 12, padB = 22;
+  const yMax = Math.max(1, Math.ceil(max * 1.18));
+  const W = 680, H = 286, padL = 42, padR = 18, padT = 36, padB = 36;
   const innerW = W - padL - padR;
   const innerH = H - padT - padB;
   const bw = innerW / 10;
+  const xForScore = score => padL + Math.max(0, Math.min(1, score)) * innerW;
+  const markerValue = value => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : null;
+  };
   let bars = "";
+  let guides = "";
+  let markers = "";
+  [
+    ["danger", 0.00, 0.45, "low"],
+    ["warning", 0.45, 0.65, "watch"],
+    ["success", 0.65, 1.00, "good"]
+  ].forEach(([cls, lo, hi, label]) => {
+    const x = xForScore(lo);
+    const w = xForScore(hi) - x;
+    guides += `<rect class="range-band ${cls}" x="${x}" y="${padT}" width="${w}" height="${innerH}"></rect>`;
+    guides += `<text class="threshold-label" x="${x + 6}" y="${padT + 12}">${label}</text>`;
+  });
+  for (const pct of [0, 0.25, 0.5, 0.75, 1]) {
+    const y = padT + innerH - pct * innerH;
+    const label = Math.round(yMax * pct);
+    guides += `<line class="gridline" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"></line>`;
+    guides += `<text class="axis-label" x="${padL - 8}" y="${y + 3}" text-anchor="end">${label}</text>`;
+  }
   for (let i = 0; i < 10; i++) {
     const v = hist[i];
-    const h = max ? (v / max) * innerH : 0;
-    const x = padL + i * bw + 2;
+    const h = yMax ? (v / yMax) * innerH : 0;
+    const x = padL + i * bw + 4;
     const y = padT + innerH - h;
-    const w = bw - 4;
+    const w = bw - 8;
     const lo = (i / 10).toFixed(1);
     const hi = ((i + 1) / 10).toFixed(1);
     bars += `<rect class="bucket" data-bucket="${i}" data-lo="${lo}" data-hi="${hi}" data-count="${v}" `
-          + `x="${x}" y="${y}" width="${w}" height="${h}" rx="2" fill="${_bucketColor(i)}">`
+          + `x="${x}" y="${y}" width="${w}" height="${h}" rx="3" fill="${_bucketColor(i)}">`
           + `<title>[${lo}, ${hi}) — ${v} clips (${total ? ((v / total) * 100).toFixed(1) : 0}%)</title></rect>`;
     if (v > 0) {
-      bars += `<text class="bucket-count" x="${x + w / 2}" y="${y - 3}" text-anchor="middle">${v}</text>`;
+      bars += `<text class="bucket-count" x="${x + w / 2}" y="${Math.max(12, y - 5)}" text-anchor="middle">${v}</text>`;
     }
-    if (i % 2 === 0) {
-      bars += `<text class="bucket-label" x="${x}" y="${H - 6}" text-anchor="start">${lo}</text>`;
-    }
+    bars += `<text class="bucket-label" x="${x + w / 2}" y="${H - 9}" text-anchor="middle">${lo}</text>`;
   }
-  bars += `<text class="bucket-label" x="${W - padR}" y="${H - 6}" text-anchor="end">1.0</text>`;
+  const mean = markerValue(stats.mean);
+  const p50 = markerValue(stats.p50);
+  if (p50 !== null) {
+    const x = xForScore(p50);
+    markers += `<line class="marker p50" x1="${x}" y1="${padT}" x2="${x}" y2="${padT + innerH}"></line>`;
+    markers += `<text class="axis-label" x="${x + 5}" y="${padT + innerH - 8}">p50</text>`;
+  }
+  if (mean !== null) {
+    const x = xForScore(mean);
+    markers += `<line class="marker mean" x1="${x}" y1="${padT}" x2="${x}" y2="${padT + innerH}"></line>`;
+    markers += `<text class="axis-label" x="${x + 5}" y="${padT + 24}">mean</text>`;
+  }
+  bars += `<text class="bucket-label" x="${W - padR}" y="${H - 9}" text-anchor="end">1.0</text>`;
   bars += `<line class="axis" x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}"/>`;
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${bars}</svg>`;
+  bars += `<text class="axis-label" x="${padL}" y="${padT - 10}">clips</text>`;
+  bars += `<text class="axis-label" x="${padL + innerW / 2}" y="${H - 1}" text-anchor="middle">score</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${guides}${bars}${markers}</svg>`;
+}
+
+function _fmtTimelineLabel(ts) {
+  const d = new Date(Number(ts || 0) * 1000);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+}
+
+function renderQualityTimeline(timeline, stats = {}) {
+  let rows = (timeline || []).map((slot, idx) => ({
+    idx,
+    ts: Number(slot.ts || 0),
+    mean: slot.mean == null ? null : Number(slot.mean),
+    count: Number(slot.count || 0),
+  }));
+  let scored = rows.filter(p => Number.isFinite(p.mean));
+  const fallbackMean = Number(stats.mean);
+  const fallbackCount = Number(stats.count || 0);
+  if (!scored.length && fallbackCount > 0 && Number.isFinite(fallbackMean)) {
+    const lastTs = rows.length ? rows[rows.length - 1].ts : Math.floor(Date.now() / 1000);
+    const firstTs = rows.length ? rows[0].ts : lastTs - Number(stats.window_seconds || 86400);
+    rows = [
+      {idx: 0, ts: firstTs, mean: null, count: 0},
+      {idx: 1, ts: lastTs, mean: Math.max(0, Math.min(1, fallbackMean)), count: fallbackCount},
+    ];
+    scored = rows.filter(p => Number.isFinite(p.mean));
+  }
+  if (!scored.length) {
+    return `<div class="panel-empty" style="height:292px">No scored quality samples in this window.</div>`;
+  }
+  const W = 680, H = 286, padL = 42, padR = 18, padT = 36, padB = 36;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const denom = Math.max(1, rows.length - 1);
+  const xForIndex = idx => padL + (idx / denom) * innerW;
+  const yForScore = score => padT + innerH - Math.max(0, Math.min(1, score)) * innerH;
+  let guides = "";
+  [
+    ["danger", 0.00, 0.45, "low"],
+    ["warning", 0.45, 0.65, "watch"],
+    ["success", 0.65, 1.00, "good"]
+  ].forEach(([cls, lo, hi, label]) => {
+    const y = yForScore(hi);
+    const h = yForScore(lo) - y;
+    guides += `<rect class="range-band ${cls}" x="${padL}" y="${y}" width="${innerW}" height="${h}"></rect>`;
+    guides += `<text class="threshold-label" x="${padL + 6}" y="${y + 12}">${label}</text>`;
+  });
+  for (const score of [0, 0.25, 0.5, 0.75, 1]) {
+    const y = yForScore(score);
+    guides += `<line class="gridline" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"></line>`;
+    guides += `<text class="axis-label" x="${padL - 8}" y="${y + 3}" text-anchor="end">${score.toFixed(2)}</text>`;
+  }
+  const points = scored.map(p => `${xForIndex(p.idx).toFixed(1)},${yForScore(p.mean).toFixed(1)}`).join(" ");
+  const line = scored.length > 1
+    ? `<polyline class="quality-line" points="${points}"></polyline>`
+    : "";
+  const circles = scored.map(p => {
+    const cls = p.mean < 0.45 ? "low" : (p.mean >= 0.65 ? "high" : "");
+    const radius = Math.min(7, 3 + Math.sqrt(Math.max(1, p.count)));
+    return `<circle class="quality-point ${cls}" cx="${xForIndex(p.idx).toFixed(1)}" cy="${yForScore(p.mean).toFixed(1)}" r="${radius.toFixed(1)}">
+      <title>${_fmtTimelineLabel(p.ts)} · mean ${p.mean.toFixed(3)} · ${p.count} clips</title>
+    </circle>`;
+  }).join("");
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    ${guides}
+    ${line}
+    ${circles}
+    <line class="axis" x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}"></line>
+    <text class="axis-label" x="${padL}" y="${padT - 10}">mean score</text>
+    <text class="bucket-label" x="${padL}" y="${H - 9}" text-anchor="start">${_fmtTimelineLabel(first.ts)}</text>
+    <text class="bucket-label" x="${W - padR}" y="${H - 9}" text-anchor="end">${_fmtTimelineLabel(last.ts)}</text>
+    <text class="axis-label" x="${padL + innerW / 2}" y="${H - 1}" text-anchor="middle">${scored.length > 1 ? "time" : "single scored bucket"}</text>
+  </svg>`;
+}
+
+function wireQualityGraphInteractions() {
+  document.querySelectorAll("#qualHist .bucket").forEach(rect => {
+    rect.addEventListener("click", () => {
+      const lo = rect.getAttribute("data-lo");
+      const hi = rect.getAttribute("data-hi");
+      const cnt = rect.getAttribute("data-count");
+      const html = `<dl>
+        <dt>Range</dt><dd>[${lo}, ${hi})</dd>
+        <dt>Count</dt><dd>${cnt} clips</dd>
+        <dt>Window</dt><dd>last 24 h</dd>
+      </dl>
+      <p style="margin-top:14px;color:var(--text-muted);font-size:0.78rem">
+        History filtering by validator_score is not yet exposed via /v2/history.
+        Drill-down details land in v1.19.0-rc1.
+      </p>`;
+      openModal(`Bucket [${lo}, ${hi})`, html);
+    });
+  });
+}
+
+function _openQualityBucketModal(lo, hi, count) {
+  const html = `<dl>
+    <dt>Range</dt><dd>[${_escapeHtml(lo)}, ${_escapeHtml(hi)})</dd>
+    <dt>Count</dt><dd>${_escapeHtml(count)} clips</dd>
+    <dt>Window</dt><dd>last 24 h</dd>
+  </dl>
+  <p style="margin-top:14px;color:var(--text-muted);font-size:0.78rem">
+    Use the recent validator runs below to inspect the clips that are moving the score.
+  </p>`;
+  openModal(`Bucket [${lo}, ${hi})`, html);
+}
+
+const QUALITY_CHART_COLORS = {
+  danger: "#ef6461",
+  warning: "#eeb738",
+  success: "#43ba78",
+  accent: "#18c5cf",
+  p50: "#b48cff",
+  text: "#e6edf3",
+  muted: "#8a97a6",
+  dim: "#627083",
+  grid: "rgba(138,151,166,0.18)",
+  panel: "#070a0d",
+};
+
+function _qualityChartBucketColor(idx) {
+  const lo = idx * 0.1;
+  if (lo < 0.45) return QUALITY_CHART_COLORS.danger;
+  if (lo < 0.65) return QUALITY_CHART_COLORS.warning;
+  return QUALITY_CHART_COLORS.success;
+}
+
+function _qualityChartBase() {
+  return {
+    backgroundColor: "transparent",
+    textStyle: {
+      color: QUALITY_CHART_COLORS.muted,
+      fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono") || "monospace",
+      fontSize: 11,
+    },
+    grid: { left: 46, right: 22, top: 34, bottom: 42, containLabel: false },
+    animationDuration: 350,
+    tooltip: {
+      confine: true,
+      backgroundColor: "rgba(7,10,13,0.96)",
+      borderColor: "rgba(138,151,166,0.35)",
+      textStyle: { color: QUALITY_CHART_COLORS.text, fontSize: 12 },
+      extraCssText: "box-shadow:0 12px 30px rgba(0,0,0,.28);border-radius:6px;",
+    },
+  };
+}
+
+function _qualityChartRangeAreas(axis) {
+  return {
+    silent: true,
+    itemStyle: { opacity: 0.11 },
+    label: { color: QUALITY_CHART_COLORS.dim, fontSize: 10, fontWeight: 700 },
+    data: axis === "x"
+      ? [
+          [{ name: "low", xAxis: 0.00, itemStyle: { color: QUALITY_CHART_COLORS.danger } }, { xAxis: 0.45 }],
+          [{ name: "watch", xAxis: 0.45, itemStyle: { color: QUALITY_CHART_COLORS.warning } }, { xAxis: 0.65 }],
+          [{ name: "good", xAxis: 0.65, itemStyle: { color: QUALITY_CHART_COLORS.success } }, { xAxis: 1.00 }],
+        ]
+      : [
+          [{ name: "low", yAxis: 0.00, itemStyle: { color: QUALITY_CHART_COLORS.danger } }, { yAxis: 0.45 }],
+          [{ name: "watch", yAxis: 0.45, itemStyle: { color: QUALITY_CHART_COLORS.warning } }, { yAxis: 0.65 }],
+          [{ name: "good", yAxis: 0.65, itemStyle: { color: QUALITY_CHART_COLORS.success } }, { yAxis: 1.00 }],
+        ],
+  };
+}
+
+function _qualityChartMarkLines(stats) {
+  const lines = [];
+  const mean = Number(stats.mean);
+  const p50 = Number(stats.p50);
+  if (Number.isFinite(mean)) lines.push({ name: "mean", xAxis: Math.max(0, Math.min(1, mean)), lineStyle: { color: QUALITY_CHART_COLORS.accent } });
+  if (Number.isFinite(p50)) lines.push({ name: "p50", xAxis: Math.max(0, Math.min(1, p50)), lineStyle: { color: QUALITY_CHART_COLORS.p50 } });
+  return {
+    symbol: "none",
+    silent: true,
+    label: {
+      color: QUALITY_CHART_COLORS.text,
+      formatter: p => p.name,
+      position: "insideEndTop",
+      fontSize: 10,
+    },
+    lineStyle: { type: "dashed", width: 1.5 },
+    data: lines,
+  };
+}
+
+function renderQualityEchartHistogram(data) {
+  const hist = data.histogram || [0,0,0,0,0,0,0,0,0,0];
+  const total = hist.reduce((a, b) => a + b, 0);
+  const option = {
+    ..._qualityChartBase(),
+    xAxis: {
+      type: "value",
+      min: 0,
+      max: 1,
+      interval: 0.1,
+      name: "score",
+      nameLocation: "middle",
+      nameGap: 30,
+      axisLabel: { color: QUALITY_CHART_COLORS.dim, formatter: v => Number(v).toFixed(1) },
+      axisLine: { lineStyle: { color: QUALITY_CHART_COLORS.grid } },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: "value",
+      name: "clips",
+      nameTextStyle: { color: QUALITY_CHART_COLORS.dim, align: "left" },
+      axisLabel: { color: QUALITY_CHART_COLORS.dim },
+      splitLine: { lineStyle: { color: QUALITY_CHART_COLORS.grid, type: "dashed" } },
+    },
+    tooltip: {
+      ..._qualityChartBase().tooltip,
+      trigger: "item",
+      formatter: p => {
+        const d = p.data || {};
+        const pct = total ? ((Number(d.count || 0) / total) * 100).toFixed(1) : "0.0";
+        return `<strong>${d.lo} - ${d.hi}</strong><br>${_fmtNum(d.count || 0)} clips · ${pct}%`;
+      },
+    },
+    series: [{
+      name: "clips",
+      type: "bar",
+      data: hist.map((count, idx) => ({
+        value: [idx / 10 + 0.05, count],
+        count,
+        bucket: idx,
+        lo: (idx / 10).toFixed(1),
+        hi: ((idx + 1) / 10).toFixed(1),
+        itemStyle: { color: _qualityChartBucketColor(idx), borderRadius: [4, 4, 0, 0] },
+      })),
+      barWidth: 34,
+      markArea: _qualityChartRangeAreas("x"),
+      markLine: _qualityChartMarkLines(data),
+      emphasis: { focus: "series" },
+    }],
+  };
+  _qualityChart.setOption(option, true);
+  _qualityChart.off("click");
+  _qualityChart.on("click", params => {
+    if (params.componentType !== "series" || params.seriesType !== "bar") return;
+    const d = params.data || {};
+    _openQualityBucketModal(d.lo, d.hi, d.count);
+  });
+}
+
+function renderQualityEchartTimeline(data) {
+  let rows = (data.timeline || []).map(slot => ({
+    ts: Number(slot.ts || 0) * 1000,
+    mean: slot.mean == null ? null : Number(slot.mean),
+    count: Number(slot.count || 0),
+  }));
+  if (!rows.some(p => Number.isFinite(p.mean)) && Number(data.count || 0) > 0 && Number.isFinite(Number(data.mean))) {
+    const now = Date.now();
+    rows = [
+      { ts: now - Number(data.window_seconds || 86400) * 1000, mean: null, count: 0 },
+      { ts: now, mean: Math.max(0, Math.min(1, Number(data.mean))), count: Number(data.count || 0) },
+    ];
+  }
+  const option = {
+    ..._qualityChartBase(),
+    xAxis: {
+      type: "time",
+      axisLabel: { color: QUALITY_CHART_COLORS.dim },
+      axisLine: { lineStyle: { color: QUALITY_CHART_COLORS.grid } },
+      splitLine: { lineStyle: { color: QUALITY_CHART_COLORS.grid, type: "dashed" } },
+    },
+    yAxis: {
+      type: "value",
+      min: 0,
+      max: 1,
+      interval: 0.25,
+      name: "mean score",
+      nameTextStyle: { color: QUALITY_CHART_COLORS.dim, align: "left" },
+      axisLabel: { color: QUALITY_CHART_COLORS.dim, formatter: v => Number(v).toFixed(2) },
+      splitLine: { lineStyle: { color: QUALITY_CHART_COLORS.grid, type: "dashed" } },
+    },
+    tooltip: {
+      ..._qualityChartBase().tooltip,
+      trigger: "item",
+      formatter: p => {
+        const d = p.data || {};
+        const value = d.value || [];
+        const ts = new Date(value[0]);
+        return `<strong>${ts.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}</strong><br>mean ${_fmtFixed(value[1])}<br>${_fmtNum(d.count || 0)} scored clips`;
+      },
+    },
+    series: [{
+      name: "mean score",
+      type: "line",
+      data: rows.map(p => ({
+        value: [p.ts, Number.isFinite(p.mean) ? p.mean : null],
+        count: p.count,
+        symbolSize: Math.min(12, 5 + Math.sqrt(Math.max(1, p.count))),
+        itemStyle: { color: Number(p.mean) < 0.45 ? QUALITY_CHART_COLORS.danger : (Number(p.mean) >= 0.65 ? QUALITY_CHART_COLORS.success : QUALITY_CHART_COLORS.warning) },
+      })),
+      smooth: 0.22,
+      connectNulls: false,
+      showSymbol: true,
+      symbol: "circle",
+      lineStyle: { width: 3, color: QUALITY_CHART_COLORS.accent },
+      areaStyle: { color: "rgba(24,197,207,0.08)" },
+      markArea: _qualityChartRangeAreas("y"),
+      emphasis: { focus: "series" },
+    }],
+  };
+  _qualityChart.setOption(option, true);
+  _qualityChart.off("click");
+}
+
+function renderQualityGraph(data) {
+  syncQualityModeButtons();
+  const graph = document.getElementById("qualHist");
+  if (window.echarts) {
+    if (!_qualityChart) {
+      graph.innerHTML = "";
+      _qualityChart = echarts.init(graph, null, { renderer: "canvas" });
+    }
+    if (_qualityGraphMode === "timeline") {
+      renderQualityEchartTimeline(data);
+    } else {
+      renderQualityEchartHistogram(data);
+    }
+    return;
+  }
+  if (_qualityChart) {
+    _qualityChart.dispose();
+    _qualityChart = null;
+  }
+  if (_qualityGraphMode === "timeline") {
+    graph.innerHTML = renderQualityTimeline(data.timeline || [], data);
+    return;
+  }
+  graph.innerHTML = renderQualityHistogram(
+    data.histogram || [0,0,0,0,0,0,0,0,0,0],
+    { mean: data.mean, p50: data.p50 }
+  );
+  wireQualityGraphInteractions();
+}
+
+window.addEventListener("resize", () => {
+  if (_qualityChart) _qualityChart.resize();
+});
+
+
+function _qualityScoreClass(score) {
+  const n = Number(score);
+  if (!Number.isFinite(n)) return "watch";
+  if (n < 0.45) return "low";
+  if (n < 0.65) return "watch";
+  return "good";
+}
+
+function _fmtQualityDelta(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return { text: "—", cls: "qual-delta-flat" };
+  }
+  const cls = n > 0 ? "qual-delta-pos" : (n < 0 ? "qual-delta-neg" : "qual-delta-flat");
+  const sign = n > 0 ? "+" : "";
+  return { text: sign + n.toFixed(3), cls };
+}
+
+function _fmtQualityTime(ts) {
+  const d = new Date(Number(ts || 0) * 1000);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleTimeString("en-GB", {hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false});
+}
+
+function _fmtQualityAge(ts) {
+  const t = Number(ts || 0);
+  if (!Number.isFinite(t) || t <= 0) return "";
+  const age = Math.max(0, Math.floor(Date.now() / 1000 - t));
+  if (age < 60) return `${age}s ago`;
+  if (age < 3600) return `${Math.floor(age / 60)}m ago`;
+  if (age < 86400) return `${Math.floor(age / 3600)}h ago`;
+  return `${Math.floor(age / 86400)}d ago`;
+}
+
+function renderQualityTrend(data) {
+  const trend = data.trend || {};
+  const latestDelta = _fmtQualityDelta(trend.latest_delta);
+  const last5Delta = _fmtQualityDelta(trend.last5_delta);
+  const recent = data.recent || [];
+  const latest = recent[0] || {};
+  const cards = [
+    ["latest", _fmtFixed(trend.latest_score), latest.id ? `job ${String(latest.id).slice(0, 10)}` : "no recent run", ""],
+    ["Δ previous", latestDelta.text, "latest scored run", latestDelta.cls],
+    ["last 5 μ", _fmtFixed(trend.last5_mean), `${_fmtNum(trend.last5_count || 0)} scored runs`, ""],
+    ["last 5 Δ", last5Delta.text, `vs prior ${_fmtNum(trend.previous5_count || 0)}`, last5Delta.cls],
+  ];
+  document.getElementById("qualTrend").innerHTML = cards.map(([label, value, sub, cls]) => `
+    <div class="qual-trend-card">
+      <div class="qual-trend-label">${_escapeHtml(label)}</div>
+      <div class="qual-trend-value ${_escapeHtml(cls)}">${_escapeHtml(value)}</div>
+      <div class="qual-trend-sub">${_escapeHtml(sub)}</div>
+    </div>
+  `).join("");
+}
+
+function renderQualityRecent(recent) {
+  const rows = (recent || []).slice(0, QUALITY_RECENT_LIMIT);
+  const el = document.getElementById("qualRecent");
+  if (!rows.length) {
+    el.innerHTML = `
+      <div class="qual-recent-head"><span>Recent validator runs</span><span>no scored runs</span></div>
+      <div class="panel-empty" style="border:0;border-radius:0;min-height:56px">No recent validator runs in this window.</div>
+    `;
+    return;
+  }
+  const body = rows.map(run => {
+    const score = Number(run.validator_score);
+    const scoreClass = _qualityScoreClass(score);
+    const delta = _fmtQualityDelta(run.delta_vs_previous);
+    const rec = run.recommendation || run.tier3_verdict || "—";
+    const adjustment = run.adjustment_summary || [
+      run.lora_applied_id ? `lora:${run.lora_applied_id}` : null,
+      run.ab_arm ? `arm:${run.ab_arm}` : null,
+      run.model || null,
+    ].filter(Boolean).join(" · ") || "—";
+    const detailBits = [
+      run.validator_version ? `<span class="qual-run-pill">${_escapeHtml(run.validator_version)}</span>` : "",
+      run.lora_applied_id ? `<span class="qual-run-pill">lora ${_escapeHtml(run.lora_applied_id)}</span>` : "",
+      run.ab_arm ? `<span class="qual-run-pill">arm ${_escapeHtml(run.ab_arm)}</span>` : "",
+    ].filter(Boolean).join(" ");
+    return `<tr class="qual-run-main ${scoreClass}">
+      <td title="${_escapeHtml(run.created_at_iso || "")}">
+        ${_escapeHtml(_fmtQualityTime(run.created_at))}
+        <span class="qual-time-age">${_escapeHtml(_fmtQualityAge(run.created_at))}</span>
+      </td>
+      <td><button class="job-link" data-job-id="${_escapeHtml(run.id || "")}">${_escapeHtml(String(run.id || "").slice(0, 10))}</button></td>
+      <td><span class="qual-score-chip ${scoreClass}">${_fmtFixed(score)}</span></td>
+      <td class="${delta.cls}">${_escapeHtml(delta.text)}</td>
+      <td>${_escapeHtml(rec)}</td>
+    </tr>
+    <tr class="qual-run-detail">
+      <td colspan="5">
+        <div class="qual-run-detail-grid">
+          <span title="${_escapeHtml(adjustment)}"><b>Adjustment</b> ${_escapeHtml(adjustment)}</span>
+          <span title="${_escapeHtml(run.prompt || "")}"><b>Prompt</b> ${_escapeHtml(run.prompt || "—")}</span>
+          ${detailBits ? `<span style="grid-column:1 / -1">${detailBits}</span>` : ""}
+        </div>
+      </td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `
+    <div class="qual-recent-head">
+      <span>Recent validator runs</span>
+      <span>newest first · ${_fmtNum(rows.length)} shown</span>
+    </div>
+    <div class="qual-recent-scroll">
+      <table class="qual-recent-table">
+        <thead><tr>
+          <th style="width:128px">Time</th>
+          <th style="width:132px">Job</th>
+          <th style="width:86px">Score</th>
+          <th style="width:86px">Δ</th>
+          <th>Rec</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 async function pollValidatorStats() {
   if (!_tabVisible()) return;
   let data;
   try {
-    const r = await fetch("/v1/system/validator-stats?window=24h", { headers: getAuthHeaders() });
+    const r = await fetch(`/v1/system/validator-stats?window=24h&timeline_buckets=96&recent_limit=${QUALITY_RECENT_LIMIT}`, { headers: getAuthHeaders() });
     if (!r.ok) {
       document.getElementById("qualEmpty").textContent = `Error: HTTP ${r.status}`;
       return;
@@ -2267,25 +5360,10 @@ async function pollValidatorStats() {
     return;
   }
   empty.style.display = "none"; body.style.display = "";
-  document.getElementById("qualHist").innerHTML = renderQualityHistogram(data.histogram || [0,0,0,0,0,0,0,0,0,0]);
-  // Wire bucket click → modal
-  document.querySelectorAll("#qualHist .bucket").forEach(rect => {
-    rect.addEventListener("click", () => {
-      const lo = rect.getAttribute("data-lo");
-      const hi = rect.getAttribute("data-hi");
-      const cnt = rect.getAttribute("data-count");
-      const html = `<dl>
-        <dt>Range</dt><dd>[${lo}, ${hi})</dd>
-        <dt>Count</dt><dd>${cnt} clips</dd>
-        <dt>Window</dt><dd>last 24 h</dd>
-      </dl>
-      <p style="margin-top:14px;color:var(--text-muted);font-size:0.78rem">
-        History filtering by validator_score is not yet exposed via /v2/history.
-        Drill-down details land in v1.19.0-rc1.
-      </p>`;
-      openModal(`Bucket [${lo}, ${hi})`, html);
-    });
-  });
+  _lastQualityStats = data;
+  renderQualityGraph(data);
+  renderQualityTrend(data);
+  renderQualityRecent(data.recent || []);
   document.getElementById("qualStats").innerHTML = `
     <div class="qual-stat-row"><span class="lbl">mean</span><span class="val">${_fmtFixed(data.mean)}</span></div>
     <div class="qual-stat-row"><span class="lbl">p50</span><span class="val">${_fmtFixed(data.p50)}</span></div>
@@ -2329,7 +5407,8 @@ async function pollValidatorFailures() {
     const ts = it.ts ? new Date(it.ts * 1000).toISOString().replace("T", " ").replace("Z", "") : "—";
     const tier = it.tier || it.stage || "—";
     const err = (it.error || it.message || "").toString().slice(0, 200);
-    return `<li>${_escapeHtml(ts)} · ${_escapeHtml(tier)} → ${_escapeHtml(err)}</li>`;
+    const jid = it.job_id ? `<button class="job-link" data-job-id="${_escapeHtml(it.job_id)}">${_escapeHtml(String(it.job_id).slice(0, 12))}</button> · ` : "";
+    return `<li>${_escapeHtml(ts)} · ${jid}${_escapeHtml(tier)} → ${_escapeHtml(err)}</li>`;
   }).join("");
   banner.innerHTML = `
     <div class="fail-banner-head" id="failBannerHead">
@@ -2655,6 +5734,214 @@ function openPairModal() {
   openModal("Preference pairs", html);
 }
 
+// ----- v1.19.0-rc2: Logs -----
+
+let _logStreams = {};
+let _logPaused = false;
+let _logReconnectMs = {};
+
+function selectedLogSources() {
+  return Array.from(document.getElementById("logSources").selectedOptions).map(o => o.value);
+}
+
+function logTokenParam() {
+  const key = apiKeyInput.value.trim();
+  return key ? `&token=${encodeURIComponent(key)}` : "";
+}
+
+function appendLogLine(ev) {
+  const box = document.getElementById("logLines");
+  const line = document.createElement("div");
+  line.className = "log-line " + (ev.severity || "INFO");
+  line.innerHTML = `<span class="ts">${_escapeHtml(_fmtTs(ev.ts))}</span><span class="sev">${_escapeHtml(ev.severity || "")}</span><span class="src">${_escapeHtml(ev.source || "")}</span><span>${_escapeHtml(ev.message || "")}</span>`;
+  box.appendChild(line);
+  while (box.children.length > 500) box.removeChild(box.firstChild);
+  if (document.getElementById("logAutoscroll").checked) box.scrollTop = box.scrollHeight;
+}
+
+function closeLogStreams() {
+  Object.values(_logStreams).forEach(es => es.close());
+  _logStreams = {};
+}
+
+function startLogStream(source) {
+  if (_logPaused || _logStreams[source]) return;
+  const severity = document.getElementById("logSeverity").value;
+  const since = document.getElementById("logSince").value;
+  const url = `/v1/system/logs/stream?source=${encodeURIComponent(source)}&since=${encodeURIComponent(since)}&min_severity=${encodeURIComponent(severity)}${logTokenParam()}`;
+  const es = new EventSource(url);
+  _logStreams[source] = es;
+  document.getElementById("logStatus").textContent = "";
+  es.onmessage = evt => {
+    try { appendLogLine(JSON.parse(evt.data)); } catch { appendLogLine({ts: new Date().toISOString(), source, severity: "INFO", message: evt.data}); }
+  };
+  es.onerror = () => {
+    es.close();
+    delete _logStreams[source];
+    const delay = _logReconnectMs[source] || 1000;
+    _logReconnectMs[source] = Math.min(delay * 2, 30000);
+    document.getElementById("logStatus").textContent = `(connection lost for ${source}, retrying in ${Math.round(delay / 1000)}s...)`;
+    if (!_logPaused) setTimeout(() => startLogStream(source), delay);
+  };
+  es.onopen = () => { _logReconnectMs[source] = 1000; };
+}
+
+function restartLogStreams() {
+  closeLogStreams();
+  if (!_logPaused) selectedLogSources().forEach(startLogStream);
+}
+
+function toggleLogsPaused() {
+  _logPaused = !_logPaused;
+  document.getElementById("logPauseBtn").textContent = _logPaused ? "Resume" : "Pause";
+  if (_logPaused) {
+    closeLogStreams();
+    document.getElementById("logStatus").textContent = "(paused)";
+  } else {
+    restartLogStreams();
+  }
+}
+
+function clearLogs() {
+  document.getElementById("logLines").innerHTML = "";
+}
+
+function openLogsFor(source) {
+  const select = document.getElementById("logSources");
+  Array.from(select.options).forEach(o => { o.selected = o.value === source; });
+  _logPaused = false;
+  document.getElementById("logPauseBtn").textContent = "Pause";
+  restartLogStreams();
+  document.getElementById("logLines").scrollIntoView({behavior: "smooth", block: "center"});
+}
+
+// ----- v1.19.0-rc2: Schema / storage / bearers -----
+
+let _schemaFetched = false;
+let _bearersFetched = false;
+
+function toggleSchemaPanel() {
+  toggleSection("schema");
+  if (!_schemaFetched) {
+    _schemaFetched = true;
+    fetchSchemaState(true);
+    fetchStorageState();
+  }
+}
+
+async function fetchSchemaState(force) {
+  try {
+    const r = await fetch("/v1/system/schema-state", { headers: getAuthHeaders() });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    const rows = Object.entries(data.tables || {}).map(([name, meta]) =>
+      `<tr><td>${_escapeHtml(name)}</td><td>${_fmtNum(meta.row_count || 0)}</td></tr>`
+    ).join("");
+    document.getElementById("schemaPanel").innerHTML = `
+      <dl style="margin-bottom:12px">
+        <dt>schema_version</dt><dd>${_escapeHtml(data.schema_version)}</dd>
+        <dt>history.db</dt><dd>${_fmtBytes(data.db_size_bytes)}</dd>
+        <dt>wal</dt><dd>${_fmtBytes(data.wal_size_bytes)}</dd>
+      </dl>
+      <table class="schema-table"><thead><tr><th>Table</th><th>Rows</th></tr></thead><tbody>${rows}</tbody></table>
+      <div style="margin-top:10px;color:var(--text-dim);font-size:0.72rem;font-family:var(--mono)">indexes: ${(data.indexes || []).map(_escapeHtml).join(", ")}</div>`;
+  } catch (e) {
+    document.getElementById("schemaPanel").innerHTML = `<div class="panel-error">${_escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderStorageBar(data) {
+  const parts = [
+    ["history.db", data.history_db_bytes, "var(--accent)"],
+    ["uploads", data.uploads_bytes, "var(--success)"],
+    ["thumbs", data.thumbnails_bytes, "var(--warning)"],
+    ["embeddings", data.clip_embeddings_projected_bytes, "oklch(0.65 0.15 300)"],
+    ["artifacts", data.validator_artifacts_bytes, "var(--danger)"],
+  ];
+  const total = parts.reduce((a, p) => a + Number(p[1] || 0), 0) || 1;
+  let x = 0;
+  const rects = parts.map(([label, bytes, color]) => {
+    const w = Math.max(0.5, (Number(bytes || 0) / total) * 100);
+    const r = `<rect x="${x}" y="10" width="${w}" height="18" fill="${color}"><title>${_escapeHtml(label)} ${_fmtBytes(bytes)}</title></rect>`;
+    x += w;
+    return r;
+  }).join("");
+  return `<div class="storage-bar"><svg viewBox="0 0 100 44" preserveAspectRatio="none">${rects}</svg></div>
+    <table class="schema-table"><tbody>${parts.map(([label, bytes]) => `<tr><td>${_escapeHtml(label)}</td><td>${_fmtBytes(bytes)}</td></tr>`).join("")}</tbody></table>`;
+}
+
+async function fetchStorageState() {
+  try {
+    const r = await fetch("/v1/system/storage", { headers: getAuthHeaders() });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    document.getElementById("storagePanel").innerHTML = `<h3 style="font-size:0.82rem;margin:10px 0;color:var(--text-muted)">Storage</h3>${renderStorageBar(data)}`;
+  } catch (e) {
+    document.getElementById("storagePanel").innerHTML = `<div class="panel-error">${_escapeHtml(e.message)}</div>`;
+  }
+}
+
+function toggleBearersPanel() {
+  toggleSection("bearers");
+  if (!_bearersFetched) {
+    _bearersFetched = true;
+    fetchBearers();
+  }
+}
+
+function _armPie(dist) {
+  const total = Object.values(dist || {}).reduce((a, b) => a + Number(b || 0), 0);
+  if (!total) return "—";
+  const cand = Number(dist.candidate || 0) / total;
+  const base = Number(dist.baseline || 0) / total;
+  const candDeg = Math.round(cand * 360);
+  const baseDeg = Math.round((cand + base) * 360);
+  return `<div class="mini-pie" title="${_escapeHtml(JSON.stringify(dist))}" style="border-radius:50%;background:conic-gradient(var(--success) 0 ${candDeg}deg, var(--accent) ${candDeg}deg ${baseDeg}deg, var(--bg-input) ${baseDeg}deg 360deg)"></div>`;
+}
+
+async function fetchBearers() {
+  try {
+    const r = await fetch("/v1/system/bearers", { headers: getAuthHeaders() });
+    if (r.status === 401 || r.status === 403) {
+      document.getElementById("bearersHeader").style.display = "none";
+      document.getElementById("bearersLabel").style.display = "none";
+      document.getElementById("bearersBody").style.display = "none";
+      return;
+    }
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    const rows = (data.bearers || []).map(b => `
+      <tr>
+        <td title="${_escapeHtml(b.api_key_hash)}">${_escapeHtml(String(b.api_key_hash).slice(0, 8))}</td>
+        <td>${_escapeHtml(b.label || "—")}</td>
+        <td><input class="bearer-toggle" type="checkbox" ${b.training_opt_in ? "checked" : ""} onchange="setBearerOptIn('${_escapeHtml(b.api_key_hash)}', this.checked)"></td>
+        <td>${_fmtNum(b.total_clips || 0)}</td>
+        <td>${_fmtFixed(b.mean_validator_score, 3)}</td>
+        <td>${_armPie(b.ab_arm_distribution || {})}</td>
+      </tr>`).join("");
+    document.getElementById("bearersPanel").innerHTML = rows
+      ? `<table class="bearer-table"><thead><tr><th>Hash</th><th>Label</th><th>Opt-in</th><th>Clips</th><th>Mean</th><th>A/B</th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<div class="panel-empty">No bearer metadata yet.</div>`;
+  } catch (e) {
+    document.getElementById("bearersPanel").innerHTML = `<div class="panel-error">${_escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function setBearerOptIn(hash, optedIn) {
+  const headers = {"Content-Type": "application/json", ...getAuthHeaders()};
+  try {
+    const r = await fetch(`/v1/system/bearers/${encodeURIComponent(hash)}/training-opt-in`, {
+      method: "POST", headers, body: JSON.stringify({opted_in: optedIn}),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    toast("Bearer opt-in updated", "ok");
+  } catch (e) {
+    toast("Bearer opt-in failed: " + e.message, "err");
+    fetchBearers();
+  }
+}
+
 // Start polling
 pollHealth();
 setInterval(pollHealth, 2000);
@@ -2664,6 +5951,8 @@ pollGpu();
 setInterval(pollGpu, 5000);
 pollPool();
 setInterval(pollPool, 5000);
+pollSidecars();
+setInterval(pollSidecars, 5000);
 
 // v1.13.0 live workers (2s cadence — fast enough for phase transitions)
 pollWorkers();
@@ -2672,18 +5961,24 @@ setInterval(pollWorkers, 2000);
 // v1.18.0-rc3 B-dash panels — staggered cadences per spec.
 pollValidatorStats();      setInterval(pollValidatorStats,    30000);
 pollValidatorFailures();   setInterval(pollValidatorFailures, 30000);
+pollSystemMetrics();       setInterval(pollSystemMetrics,     10000);
 pollExperiments();         setInterval(pollExperiments,       10000);
 pollTrainingRuns();         setInterval(pollTrainingRuns,      30000);
 pollPairCount();            setInterval(pollPairCount,         30000);
+restartLogStreams();
+setInterval(() => { if (_schemaFetched) fetchStorageState(); }, 30000);
 
 // Re-poll immediately when tab becomes visible (avoid stale UI on tab switch).
 document.addEventListener("visibilitychange", () => {
   if (_tabVisible()) {
     pollValidatorStats();
     pollValidatorFailures();
+    pollSystemMetrics();
     pollExperiments();
     pollTrainingRuns();
     pollPairCount();
+    pollSidecars();
+    if (_schemaFetched) fetchStorageState();
   }
 });
 </script>

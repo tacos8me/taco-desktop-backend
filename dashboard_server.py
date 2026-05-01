@@ -77,6 +77,8 @@ _HOP_BY_HOP = frozenset({
     "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "upgrade",
 })
+_REQUEST_STRIP_HEADERS = _HOP_BY_HOP | {"accept-encoding"}
+_RESPONSE_STRIP_HEADERS = _HOP_BY_HOP | {"content-encoding"}
 
 
 @app.api_route(
@@ -92,7 +94,7 @@ async def proxy(path: str, request: Request) -> Response:
 
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP
+        if k.lower() not in _REQUEST_STRIP_HEADERS
     }
 
     body = await request.body()
@@ -111,7 +113,7 @@ async def proxy(path: str, request: Request) -> Response:
 
     resp_headers = {
         k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP
+        if k.lower() not in _RESPONSE_STRIP_HEADERS
     }
 
     # Stream SSE (text/event-stream) and large bodies; otherwise return buffered.

@@ -148,8 +148,12 @@ def test_validator_stats_shape_and_buckets(fresh_history):
     resp = client.get("/v1/system/validator-stats?window=24h")
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert {"histogram", "mean", "p50", "p95", "count", "by_version", "window_seconds"} <= data.keys()
+    assert {
+        "histogram", "mean", "p50", "p95", "count", "by_version",
+        "timeline", "timeline_bucket_seconds", "window_seconds",
+    } <= data.keys()
     assert len(data["histogram"]) == 10
+    assert len(data["timeline"]) == 48
     assert data["count"] == 6
     # Bucket 0 (0.0-0.1) should have 1 (0.05); bucket 1: 1; bucket 6: 1; etc.
     assert data["histogram"][0] == 1
@@ -171,6 +175,77 @@ def test_validator_stats_by_version(fresh_history):
     assert bv["1.17.0-rc5"]["count"] == 2
     assert bv["1.17.0-rc4"]["count"] == 1
     assert abs(bv["1.17.0-rc5"]["mean"] - 0.85) < 1e-3
+
+
+def test_validator_stats_timeline_groups_scores(fresh_history):
+    now = time.time()
+    _insert_clip(fresh_history, clip_id="old-a", validator_score=0.2, created_at=now - 7200)
+    _insert_clip(fresh_history, clip_id="new-a", validator_score=0.8, created_at=now - 700)
+    _insert_clip(fresh_history, clip_id="new-b", validator_score=0.6, created_at=now - 680)
+    resp = client.get("/v1/system/validator-stats?window=3h&timeline_buckets=12")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["timeline"]) == 12
+    non_empty = [slot for slot in data["timeline"] if slot["count"]]
+    assert [slot["count"] for slot in non_empty] == [1, 2]
+    assert non_empty[0]["mean"] == pytest.approx(0.2, abs=1e-3)
+    assert non_empty[1]["mean"] == pytest.approx(0.7, abs=1e-3)
+
+
+def test_validator_stats_recent_runs_and_trend(fresh_history):
+    now = time.time()
+    for i, score in enumerate([0.40, 0.50, 0.60, 0.70, 0.80, 0.90]):
+        _insert_clip(
+            fresh_history,
+            clip_id=f"trend-{i}",
+            validator_score=score,
+            validator_version="1.19.0-rc2",
+            lora_applied_id="lora-A" if i >= 3 else None,
+            ab_arm="candidate" if i >= 3 else "baseline",
+            created_at=now - (6 - i) * 60,
+        )
+    fresh_history._conn.execute(
+        """UPDATE generations
+           SET validator_payload_json = ?, gen_config_json = ?, params_json = ?
+           WHERE id = ?""",
+        (
+            '{"recommendation":"pass","tier3":{"verdict":"pass","score":0.9}}',
+            '{"sampler":"cfg_pp","fast_stage1_steps":12,"cfg_scale":3.0,'
+            '"scheduler_max_shift":1.85,"scheduler_base_shift":0.95}',
+            '{"image_strength":0.8,"duration":1.96,"resolution":"2560x1440"}',
+            "trend-5",
+        ),
+    )
+    fresh_history._conn.commit()
+
+    resp = client.get("/v1/system/validator-stats?window=24h")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["trend"]["latest_score"] == pytest.approx(0.90, abs=1e-3)
+    assert data["trend"]["latest_delta"] == pytest.approx(0.10, abs=1e-3)
+    assert data["trend"]["last5_count"] == 5
+    assert data["trend"]["previous5_count"] == 1
+    assert data["trend"]["last5_mean"] == pytest.approx(0.70, abs=1e-3)
+    assert data["trend"]["previous5_mean"] == pytest.approx(0.40, abs=1e-3)
+    assert data["trend"]["last5_delta"] == pytest.approx(0.30, abs=1e-3)
+
+    recent = data["recent"]
+    assert len(recent) == 6
+    assert recent[0]["id"] == "trend-5"
+    assert recent[0]["validator_score"] == pytest.approx(0.90, abs=1e-3)
+    assert recent[0]["delta_vs_previous"] == pytest.approx(0.10, abs=1e-3)
+    assert recent[0]["recommendation"] == "pass"
+    assert recent[0]["tier3_verdict"] == "pass"
+    assert recent[0]["lora_applied_id"] == "lora-A"
+    assert recent[0]["ab_arm"] == "candidate"
+    assert recent[0]["adjustment_summary"] == "cfg_pp · s1 12 · cfg 3.0 · shift 1.85"
+    assert recent[0]["generation_config"]["sampler"] == "cfg_pp"
+    assert recent[0]["generation_config"]["stage1_steps"] == 12
+    assert recent[0]["generation_config"]["image_strength"] == pytest.approx(0.8)
+
+    limited = client.get("/v1/system/validator-stats?window=24h&recent_limit=3")
+    assert limited.status_code == 200, limited.text
+    assert len(limited.json()["recent"]) == 3
 
 
 # ---------------------------------------------------------------------------
