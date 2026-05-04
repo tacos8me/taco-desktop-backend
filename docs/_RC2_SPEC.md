@@ -1,5 +1,7 @@
 # taco-backend v1.19.0-rc2 spec — operator depth (logs, debug, schema, per-job)
 
+> **Historical scratchpad** — preserved as the original build spec for v1.19.0-rc2. The features described here shipped with the rc2 release; current operator-facing references are in [INDEX.md](./INDEX.md), [OPERATOR_QUICKSTART.md](./OPERATOR_QUICKSTART.md), and [TRAINING_LOOP_STATUS.md](./TRAINING_LOOP_STATUS.md).
+
 **Audience**: codex (or any single-agent build runner). Read top-to-bottom; everything you need is here.
 **Repo**: `/mnt/nvme-1/servers/taco-backend` (ONLY — do not touch other repos for this sprint).
 **Branch**: master. Do NOT create a branch. Stage by explicit path. DO NOT commit (operator commits).

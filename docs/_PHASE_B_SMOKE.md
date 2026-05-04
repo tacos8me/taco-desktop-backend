@@ -1,5 +1,7 @@
 # Phase B end-to-end smoke + privacy gate verification
 
+> **Historical scratchpad** — preserved as a permanent audit trail of the v1.18.0-rc4 Phase B smoke. For current state of the retrieval surface, see [RETRIEVAL_WORKFLOW.md](./RETRIEVAL_WORKFLOW.md). For the v1.20.0 progress snapshot, see [TRAINING_LOOP_STATUS.md](./TRAINING_LOOP_STATUS.md).
+
 **Date**: 2026-04-29
 **Backend version**: v1.18.0-rc4
 **Validator version**: 1.17.0-rc5

@@ -1,14 +1,20 @@
 # taco-backend — Docs Index
 
-**Version**: v1.18.0-rc3 (2026-04-29).
+**Version**: v1.20.0 (2026-05-04).
 
-taco-backend is a FastAPI inference server fronting an LTX-2.3 video stack and Flux 2 image stack on two RTX PRO 6000 Blackwell GPUs, with a constellation of sidecars (ACE music, JoyAI / ERNIE image-edit, madmom downbeats, sapiens pose, plus a remote LTX worker pool on Modal + RunPod). It powers the noodlefinger product family (`noodle-i`, `noodle-v`, `noodle-mv`) via `api.noodlefinger.io`, and is the substrate for the capture+validator+retrieval+training flywheel that turns every shipped MV clip into labeled training data.
+taco-backend is a FastAPI inference server fronting an LTX-2.3 video stack and Flux 2 image stack on two RTX PRO 6000 Blackwell GPUs, with a constellation of sidecars (ACE music, JoyAI / ERNIE image-edit, madmom downbeats, sapiens pose, plus a remote LTX worker pool on Modal + RunPod). It powers the noodlefinger product family (`noodle-i`, `noodle-v`, `noodle-mv`) via `api.noodlefinger.io`, and is the substrate for the capture → validate → retrieve → rate → train flywheel that turns every shipped MV clip into labeled training data.
 
 ## What shipped recently
 
-- **v1.18.0-rc3** (2026-04-29) — Phase C training infrastructure: weekly preference-pair ETL (`scripts/construct_preference_pairs.py`), SFT-on-chosen LoRA trainer (`scripts/train_dpo_sft.py`, dry-run by default), A/B decision cron (`scripts/ab_decision.py`), `POST /v1/system/lora/rollback` admin endpoint. Infrastructure-only; first real training run waits ~6-8 weeks for the corpus to cross ~1000 pairs. Test suite 230 → 245 green.
-- **v1.18.0-rc2** (2026-04) — Phase B retrieval: sqlite-vec virtual table, `POST /v2/embeddings/search`, `POST /v2/embeddings/recommend-loras`, `POST /v2/system/bulk-revalidate`, per-key rate-limit middleware on `/v2/embeddings/*`, end-to-end `lora_applied_id` persistence on every video v2 endpoint, embeddings-block telemetry in `/v1/system/metrics`.
-- **v1.18.0-rc1** (2026-04) — Schema v4 keystone migration (`history_store.CURRENT_SCHEMA_VERSION 3 → 4`): additive nullable columns on `generations` / `preference_pairs` / `training_runs` for Phase B + Phase C. Schema-only; no feature wiring. Idempotent re-run safe.
+- **v1.20.0** (2026-05-04) — operator rating + exemplar-LoRA build loop + sigma/VAE knobs. Schema v6 → v7 → v8 (additive); 13 new endpoints across L1 (per-clip rating), L3 (active-learning queue + threshold overrides + recommend-loras boosts), and L2.5 (exemplar set CRUD + async admin LoRA build). New `scripts/construct_human_rating_pairs.py` (Path C′) + `scripts/build_lora_from_exemplars.py` + `configs/exemplar_lora.yaml`. 7 new `gen_config` keys for stage 1 sigmas + VAE tiling with structured 422 validation envelope + atomic write + append-only audit log. Dashboard polish: 21 tooltips + default badges. New `RATING_LORA_INTEGRATION.md` and `TRAINING_LOOP_STATUS.md`. Test suite 291 → 370 green.
+- **v1.19.0-rc2** (2026-04-29) — operator depth: structured logs, debug endpoints, schema enrichment, per-job drill-in views.
+- **v1.19.0-rc1** (2026-04-29) — validator tier-2 real Sapiens-2 pose inference (was stub since v1.17.0-rc2). Sidecar at `:8096` runs DETR person detection + `facebook/sapiens2-pose-0.4b` 308-keypoint inference on cuda:1; lazy-load + idle eviction; `POST /v1/admin/evict` for on-demand reclaim.
+- **v1.18.0-rc6** (2026-04-29) — `shot_uuid` + `shot_config_key` Pydantic declarations on every video v2 model; closes the rc1 lineage capture loop.
+- **v1.18.0-rc5** (2026-04-29) — `_ab_arm` cohort capture (schema v6) + passive-dispatch `motion_intent` wire-through; coordinated noodlefinger-mcp v0.8.1 ship.
+- **v1.18.0-rc4** (2026-04-29) — embedding-dim fix: schema v5 rebuild of `clip_embeddings` at FLOAT[4096] + model swap to `qwen3-embed-8b`.
+- **v1.18.0-rc3** (2026-04-29) — Phase C training infrastructure: weekly preference-pair ETL, SFT-on-chosen LoRA trainer (dry-run default), A/B decision cron, `POST /v1/system/lora/rollback` admin endpoint.
+- **v1.18.0-rc2** (2026-04) — Phase B retrieval: sqlite-vec virtual table, `POST /v2/embeddings/search`, `POST /v2/embeddings/recommend-loras`, `POST /v2/system/bulk-revalidate`, per-key rate-limit middleware.
+- **v1.18.0-rc1** (2026-04) — schema v4 keystone migration for Phase B + Phase C.
 
 Full history → [CHANGELOG.md](../CHANGELOG.md). Per-version code highlights → [../CLAUDE.md](../CLAUDE.md).
 
@@ -16,9 +22,10 @@ Full history → [CHANGELOG.md](../CHANGELOG.md). Per-version code highlights �
 
 | Phase | Status | Doc |
 |---|---|---|
-| A — capture + validator | LIVE (v1.17.0-rc1..rc5) | [CAPTURE_VALIDATOR.md](./CAPTURE_VALIDATOR.md) |
-| B — retrieval | LIVE (v1.18.0-rc2) | [RETRIEVAL_WORKFLOW.md](./RETRIEVAL_WORKFLOW.md) |
+| A — capture + validator | LIVE (v1.17.0-rc1..rc5; tier-2 real in v1.19.0-rc1) | [CAPTURE_VALIDATOR.md](./CAPTURE_VALIDATOR.md) |
+| B — retrieval | LIVE (v1.18.0-rc2; embeddings rebuilt at FLOAT[4096] in rc4) | [RETRIEVAL_WORKFLOW.md](./RETRIEVAL_WORKFLOW.md) |
 | C — SFT training | INFRA SHIPPED (v1.18.0-rc3); first run pending corpus | [PHASE_C_TRAINING_RUNBOOK.md](./PHASE_C_TRAINING_RUNBOOK.md) |
+| C′ — human-rating ETL + exemplar LoRA | LIVE (v1.20.0) — endpoints + scripts shipped; first L2.5 build operator-driven | [RATING_LORA_INTEGRATION.md](./RATING_LORA_INTEGRATION.md) + [TRAINING_LOOP_STATUS.md](./TRAINING_LOOP_STATUS.md) |
 | D — forward look | NOT STARTED | [CAPTURE_VALIDATOR_ROADMAP.md](./CAPTURE_VALIDATOR_ROADMAP.md) |
 
 ## I want to...
@@ -39,6 +46,7 @@ Full history → [CHANGELOG.md](../CHANGELOG.md). Per-version code highlights �
 | use Phase B retrieval (`find_similar_shots` / `recommend_loras`) | [RETRIEVAL_WORKFLOW.md](./RETRIEVAL_WORKFLOW.md) |
 | find UI gaps for the build queue | [UX_GAPS.md](./UX_GAPS.md) |
 | run the first SFT training cycle | [PHASE_C_TRAINING_RUNBOOK.md](./PHASE_C_TRAINING_RUNBOOK.md) |
+| see the training loop's current state (what's wired, what's next, open action items) | [TRAINING_LOOP_STATUS.md](./TRAINING_LOOP_STATUS.md) |
 | understand the capture+validator machine | [CAPTURE_VALIDATOR.md](./CAPTURE_VALIDATOR.md) |
 | see what's next (Phase D forward-look) | [CAPTURE_VALIDATOR_ROADMAP.md](./CAPTURE_VALIDATOR_ROADMAP.md) |
 | build a music video via MCP | [MCP.md](./MCP.md) + [MV_EDITING.md](./MV_EDITING.md) |
@@ -94,8 +102,10 @@ Alphabetized. Each entry: filename — one-sentence description — *audience*.
 - [PHASE_C_TRAINING_RUNBOOK.md](./PHASE_C_TRAINING_RUNBOOK.md) — Operator playbook for the SFT-on-chosen LoRA trainer: pre-flight, weekly cron, first run, A/B monitoring, rollback, troubleshooting. *operator*
 - [PRIVACY_GOVERNANCE.md](./PRIVACY_GOVERNANCE.md) — What the system captures per generation, who can see it, what enters training, how opt-out works — the data-governance surface. *operator / auditor*
 - [QUICKSTART.md](./QUICKSTART.md) — Frontend / SDK 5-minute onboarding; minimal payloads to hit each endpoint. *client*
+- [RATING_LORA_INTEGRATION.md](./RATING_LORA_INTEGRATION.md) — v1.20.0 third-party client contract for the rating + exemplar-LoRA endpoints. Per-endpoint curl, privacy gate, error envelope, integration testing recipe, gotchas. *client / developer*
 - [retake-frontend-guide.md](./retake-frontend-guide.md) — How to wire `/v2/retake` (regenerate a time window of an existing video) into a frontend. *client*
 - [RETRIEVAL_WORKFLOW.md](./RETRIEVAL_WORKFLOW.md) — Workflow guide for Phase B retrieval tools (`find_similar_shots`, `recommend_loras`, `bulk_revalidate`) during MV authoring. *agent / operator*
+- [TRAINING_LOOP_STATUS.md](./TRAINING_LOOP_STATUS.md) — Operator-facing progress snapshot for the rating → preference-pairs → train_dpo_sft → A/B → rollback loop and the L2.5 exemplar fine-tune path. Names what is wired, what is not, and where to read each contract. *operator / developer*
 - [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) — Symptom → check → fix triage layer for on-call: HTTP errors, validator NULLs, sidecar crashes, capacity FAQ. *operator*
 - [UX_GAPS.md](./UX_GAPS.md) — Inventory of UI surfaces today, mapping of every Phase-B/C capability to the surface it should live on, P0/P1/P2 build queue. *developer / product*
 - [../AGENTS.md](../AGENTS.md) — Performance-optimization backlog by tier; agent-facing scratchpad of identified-but-not-shipped optimizations. *agent / developer*

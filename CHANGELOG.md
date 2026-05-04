@@ -2,6 +2,83 @@
 
 All notable changes to taco-backend. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v1.20.0 — 2026-05-04
+
+### Feat: operator rating + exemplar-LoRA build loop + sigma/VAE knobs
+
+Single release across multiple parallel work streams. Closes the human-in-the-loop rating + exemplar-LoRA construction sprint (Phase 1 + Phase 2 + Phase 3 prereqs) plus operator-tunable stage 1 sigmas and VAE tiling controls (F-1/F-2/F-3). Test suite 291 → 370 green. Restart taco-backend to pick up schema v8 + 13 new endpoints + sigma/VAE wiring (atomic; ≤5s).
+
+**Phase 1 — rating + exemplar backend (schema v6 → v7).**
+
+- New tables: `human_ratings`, `exemplar_sets`, `exemplar_set_members`. New columns on `api_key_metadata`: `validator_pass_threshold_override`, `validator_retake_threshold_override`, `cross_bearer_rating_consent_at`. Idempotent additive ALTER ladder. New `delete_rater_corpus(rater_hash)` helper for right-to-delete cascade across `human_ratings` + `exemplar_set_members` + `preference_pairs` + `exemplar_sets`.
+- 13 new endpoints across L1 (single-clip rating), L3 (queue + thresholds + boosts), L2.5 (exemplar curation + LoRA build):
+  - `POST/PATCH/DELETE /v1/clips/{id}/rating[/{rid}]`, `GET /v1/clips/{id}/ratings`
+  - `GET /v1/ratings/queue` — active-learning, cross-cohort diverse
+  - `GET/POST /v1/api-keys/me/validator-thresholds` — clamped global±0.15
+  - `POST /v2/embeddings/recommend-loras` gains `session_boosts` param (per-LoRA score boost map)
+  - `POST /v1/exemplar-sets`, `GET` list, `GET` detail, `POST/DELETE /v1/exemplar-sets/{id}/members`
+  - `POST /v1/exemplar-sets/{id}/build-lora` (admin; async, returns 202 in <500ms), `GET /v1/exemplar-sets/{id}/builds`, `POST /v1/exemplar-sets/{id}/build/{run_id}/cancel`
+- Path C′ writer: human_rating preference_pairs land with `signal_strength=0.75` + `pending_construction_until=now+86400` (24h quarantine). New `scripts/construct_human_rating_pairs.py` runs hourly, re-validates 5 invariants (bearer opt-in, validator composite NOT NULL, cross-bearer consent, validator_visible_at_rating filter, source-pause flag), commits or deletes. `train_dpo_sft.py` SELECT gains `AND pending_construction_until IS NULL` so quarantined pairs cannot enter training.
+- New `scripts/build_lora_from_exemplars.py` (~360 LOC) — defense-in-depth dry-run; `--execute` spawns ltx-trainer subprocess; SIGTERM handler flips `training_runs.status='cancelled'` + cleans tempdir. Mirrors `train_dpo_sft.py` safety pattern. Async path via asyncio monitor + `subprocess.Popen` — no ASGI worker blocking.
+- New `configs/exemplar_lora.yaml` — rank=32, steps=1500, lr=1e-4.
+
+**Phase 1 polish — structured envelope + anti-fatigue.**
+
+- 8 new error_codes plumbed through `_error()` envelope: `EXEMPLAR_SET_NOT_FOUND`, `EXEMPLAR_OWNER_REQUIRED`, `EXEMPLAR_ACCESS_DENIED`, `EXEMPLAR_SET_FULL`, `CLIP_NOT_FOUND`, `CLIP_ALREADY_IN_SET`, `CLIP_NOT_IN_SET`, `RATE_LIMIT_TOO_FAST`, `SESSION_CAP_EXCEEDED`.
+- Per-rater anti-fatigue gate: 2-second minimum between submissions + 200/90min session cap.
+- `PATCH /v1/clips/{id}/rating/{rid}` now re-checks privacy gate (catches a bearer flipping opt-in mid-session). `_RATING_QUEUE_PASS` / `_RATING_QUEUE_RETAKE` imported from `validator` module — single source of truth.
+
+**Phase 2 — dashboard rating UIs (leatherjacket-dashboard, separate repo).**
+
+Three new sections in the operator dashboard:
+- 2-up pairwise player on retake-completion + 7-tag taxonomy at retake-mark (pre-suggested from `tier3.retake_hint`); validator-score blur-until-click (P0-3 anchoring mitigation).
+- Per-clip ⭐ exemplar star + multi-set manager + build kickoff modal + status banner with eval-loss sparkline.
+- Threshold sliders (clamped) + LoRA recommend list with `session_boost` badges + localStorage-persistent boost map.
+- Pairwise modal close handler now marks the pair as seen regardless of submit success, breaking the auth-fail re-open loop.
+
+**Phase 3 prereqs — schema v8 + cross-cohort diversity + async build.**
+
+- Schema v8: `system_flags(name, value, updated_at)` for kill-switch support. `preference_pairs.pending_construction_until` column.
+- Cross-cohort diversity in `/v1/ratings/queue`: oversample at 4× limit, SQL-tag novel-cohort vs caller's last 100 rated cohorts, Python merge fills `ceil(min_diversity × limit)` slots with novel-cohort first. `RATING_QUEUE_MIN_COHORT_DIVERSITY=0.3` default; env-var-configurable.
+- Async LoRA build path: build endpoint returns 202 in <500ms; subprocess monitor flips `training_runs.status`. Cancel SIGTERMs registered proc.
+
+**Sigma + VAE operator knobs (F-1/F-2/F-3).**
+
+- 7 new `gen_config` keys: `stage1_sigmas`, `pro_stage1_sigmas`, `vae_spatial_tile_px`, `vae_spatial_overlap_px`, `vae_temporal_tile_frames`, `vae_temporal_overlap_frames`, `vae_tiling_threshold_frames`.
+- `_get_stage1_sigmas` helper centralizes 9 stage-1 sigma sites in `split_model_manager.py` (t2v fast/pro, t2v_hq, i2v fast/pro, a2v fast/pro, retake, outpaint). Override list when set; falls back to `LTX2Scheduler` when None or length-mismatched. `_get_decode_tiling` reads 5 VAE keys from `gen_config`; defaults preserved for legacy callers.
+- `POST /v1/system/config` gains structured 422 validation envelope: `INVALID_SIGMA_LENGTH`, `INVALID_SIGMA_RANGE`, `INVALID_SIGMA_NAN`, `INVALID_SIGMA_TYPE`, `INVALID_VAE_TILE_SIZE`, `INVALID_VAE_OVERLAP`, `INVALID_VAE_THRESHOLD`. Hard 422 for invariant violations; 200 with `warnings[]` for soft signals (non-monotonic, first<0.95, last>0.01).
+- Atomic config write: `.gen_config.json.tmp` → `os.replace`; appends per-write diff to `.gen_config.history.jsonl` audit log (append-only, no rotation — fine at single-operator volume).
+- Sidecar pass-through: `ltx_sidecar_client.generate()` accepts optional `gen_config_overrides`. `server.py` turbo dispatch builds 19-key whitelist (7 new + 12 pre-existing operator knobs) from `_gen_config` and forwards. Modal + RunPod sidecars adopt save/apply/restore around the match block (separate deploys; not in this commit). Local sidecar reloads from disk per-request — no protocol change needed.
+- Dashboard adds Stage 1 Sigmas (Fast), Stage 1 Sigmas (Pro/HQ), VAE Tiling sections. ComfyUI 9-step preset for fast stage 1 = `[1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]`. Live tile-preview math. 422 `error_code` + 200 `warnings` surface as toasts. Existing stage 2 UI preserved (low-risk parallel; not refactored).
+
+**Dashboard polish — 21 tooltips + default badges.**
+
+Every sampling and VAE knob row in `dashboard.html` now ships an inline tooltip (effect, useful range, when to touch it) and a "default" badge that highlights when the operator has drifted from the shipped baseline. Reduces the cognitive load of discovering what each lever does without leaving the page.
+
+**Tests.**
+
+370 green / 0 failed (was 291 after rc2). New test files:
+- `test_human_ratings.py` (28 tests) — rating endpoints, thresholds, recommend-loras boosts, safety invariants
+- `test_exemplar_lora_build.py` (14 tests) — set CRUD, privacy, dry-run, cancel, status state machine
+- `test_v1_20_schema.py` (9 tests) — v6→v7→v8 migrations, delete cascade
+- `test_phase3_etl.py` (10 tests) — ETL re-validation + pause flag
+- `test_sidecar_pass_through.py` (7 tests) — turbo dispatch + Modal/RunPod save-apply-restore
+- `test_gen_config_overrides.py` (14 tests) — stage1/VAE validation, atomic write, audit log
+
+22 of those tests are explicitly safety-marked (length-coupling, value-range, privacy-gate, opt-in-recheck, atomic-write).
+
+**Operator action items (post-deploy).**
+
+1. Restart taco-backend to pick up schema v8 + 13 new endpoints + sigma/VAE wiring.
+2. Set `BACKEND_BEARER` on the leatherjacket-dashboard process so the rating proxy can authenticate to taco-backend.
+3. Redeploy Modal + RunPod sidecars (operator-managed, not in this repo) to consume `gen_config_overrides` body field. Pre-deploy sidecars silently ignore the new field (no break).
+4. Tier-3 Gemma judge upstream (`gemma-4-31b-it`) is currently 502'ing — restart llama-swap upstream then `POST /v2/system/bulk-revalidate` to recompute scores against any clips that landed during the outage.
+
+**Cross-doc.**
+
+- New `docs/RATING_LORA_INTEGRATION.md` (643 lines) — full third-party client contract with curl examples for all 14 endpoints, privacy gate cheat-sheet, error envelope, integration testing recipe, gotchas. Cross-linked from `docs/INDEX.md` + `CLAUDE.md`.
+- New `docs/TRAINING_LOOP_STATUS.md` — operator-facing progress snapshot for the rating → preference-pairs → train_dpo_sft → A/B → rollback loop and the L2.5 exemplar fine-tune path. Names what's wired, what's not, and where to read each contract.
+
 ## v1.19.0-rc1 — 2026-04-29
 
 ### Feat: validator tier-2 — real Sapiens-2 pose inference (was stub since rc2)

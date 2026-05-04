@@ -2,7 +2,7 @@
 
 Dual-GPU inference server for AI video, image, music generation, and image editing. Powers [noodle-i](https://i.noodlefinger.io) (image), [noodle-v](https://v.noodlefinger.io) (video), and [m.noodlefinger.io](https://m.noodlefinger.io) (music video).
 
-**Version**: v1.14.1 (2026-04-26) — CORS fix: allow `*.noodlefinger.io` origins; auth middleware now skips OPTIONS preflights so browsers can complete cross-origin requests. (v1.14.0 added IC-LoRA HDR endpoint `/v2/video-hdr` for video LDR→HDR transform via Lightricks `LTX-2.3-22b-IC-LoRA-HDR`.)
+**Version**: v1.20.0 (2026-05-04) — operator rating + exemplar-LoRA build loop + sigma/VAE knobs. 13 new endpoints across L1/L3/L2.5 (per-clip rating, active-learning queue, threshold overrides, exemplar set CRUD, async LoRA build), schema v6 → v7 → v8 (additive), 7 new `gen_config` keys for stage 1 sigmas + VAE tiling, structured 422 validation envelope on `POST /v1/system/config`, atomic config write + audit log, dashboard polish (21 tooltips + default badges). 370 / 0 tests green. See [`docs/RATING_LORA_INTEGRATION.md`](docs/RATING_LORA_INTEGRATION.md) for the third-party client contract and [`docs/TRAINING_LOOP_STATUS.md`](docs/TRAINING_LOOP_STATUS.md) for the training-loop progress snapshot.
 **Public API base URL**: `https://api.noodlefinger.io` *(Cloudflare-proxied — `taco.noodlefinger.io` was retired 2026-04-18, DNS no longer resolves)*
 
 ## Features
@@ -21,6 +21,9 @@ Dual-GPU inference server for AI video, image, music generation, and image editi
 - **Turbo mode + multi-provider pool** -- runtime toggle claims both GPUs for LTX (2 concurrent local workers); optional Modal-backed pool *(v1.6)* adds up to 10 remote workers *(max raised 4 → 10 in v1.13.0)*; v1.9.0 adds RunPod as a second provider alongside Modal (up to 2 more) for **up to 14 concurrent video workers** (2 local + 10 Modal + 2 RunPod), tunable live from the dashboard
 - **Batch scheduler** -- submit up to 50 generation jobs in a single request, auto-sorted to minimize GPU swaps, per-item result download
 - **Generation history + reproducibility** *(v1.4)* -- every completed v2 job persists to SQLite with raw request body, gen-config snapshot, seed, and enhanced prompt; thumbnails auto-generated
+- **Validator pipeline** *(v1.17.0..v1.19.0)* -- 3-tier on-complete dispatch (RAFT optical-flow + Sapiens-2 pose + Gemma judge) writes `validator_score` + `validator_payload_json` to every opted-in completed video; `POST /v2/video/analyze-motion` runs the same pipeline synchronously
+- **Operator rating + exemplar-LoRA loop** *(v1.20.0)* -- per-clip rating endpoints (`/v1/clips/{id}/rating[s]`), active-learning cross-cohort-diverse queue (`/v1/ratings/queue`), per-bearer validator thresholds (clamped global ± 0.15), exemplar set curation + admin-gated async LoRA build (`/v1/exemplar-sets/{id}/build-lora`); see [`docs/RATING_LORA_INTEGRATION.md`](docs/RATING_LORA_INTEGRATION.md)
+- **Stage 1 sigma + VAE tile knobs** *(v1.20.0)* -- 7 new `gen_config` keys, structured 422 validation envelope, atomic config write + append-only audit log at `.gen_config.history.jsonl`, sidecar pass-through via `gen_config_overrides` body field
 - **Dashboard** -- real-time GPU telemetry, sampler toggle, advanced generation controls (14 tunable params), remote-pool slider, management at `/dashboard`
   - **Live Workers panel** *(v1.13.0)* -- per-worker busy/idle status (local + Modal + RunPod) with in-flight job summary, backed by `GET /v1/system/workers`
 
@@ -102,14 +105,17 @@ All endpoints except `/health` require `Authorization: Bearer <api-key>`. Every 
 
 | Document | Contents |
 |----------|----------|
-| [API Reference](docs/API.md) | Full 74-endpoint spec with request/response schemas, error taxonomy, common types |
+| [API Reference](docs/API.md) | Full endpoint spec with request/response schemas, error taxonomy, common types |
 | [Quick Start Guide](docs/QUICKSTART.md) | 5-minute integration guide for frontend devs |
+| [Rating + Exemplar-LoRA Integration](docs/RATING_LORA_INTEGRATION.md) | v1.20.0 third-party client contract: per-endpoint curl, privacy gate, error envelope |
+| [Training Loop Status](docs/TRAINING_LOOP_STATUS.md) | Operator-facing progress snapshot for the rating → preference-pairs → train_dpo_sft loop and the L2.5 exemplar fine-tune path |
 | [Outpaint Frontend Guide](docs/outpaint-frontend-guide.md) | `/v2/video-outpaint` integration (v1.7.0) |
 | [HDR Frontend Guide](docs/hdr-frontend-guide.md) | `/v2/video-hdr` integration (v1.14.0) |
 | [Retake Frontend Guide](docs/retake-frontend-guide.md) | `/v2/retake` integration for noodle-v |
 | [GPU Architecture](docs/gpu-architecture.md) | Dual-GPU layout, swap mechanics, turbo mode, remote pool, latency tables |
 | [Models & Latency](docs/models.md) | All model specs (incl. LoRA registry), step counts, VRAM, speed benchmarks |
 | [Configuration](docs/configuration.md) | Environment variables, .env, systemd units |
+| [Phase C Training Runbook](docs/PHASE_C_TRAINING_RUNBOOK.md) | Operator playbook for the SFT-on-chosen LoRA trainer |
 | [CLAUDE.md](CLAUDE.md) | Codebase onboarding guide for AI assistants |
 | [CHANGELOG](CHANGELOG.md) | Per-version deltas back to v1.1 |
 

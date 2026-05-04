@@ -1,5 +1,7 @@
 # Cross-doc Consistency Review
 
+> **Historical scratchpad** — preserved for archaeology. Captured against v1.18.0-rc3 (2026-04-29). For the current state of the docs, start at [INDEX.md](./INDEX.md). For the v1.20.0 progress snapshot, see [TRAINING_LOOP_STATUS.md](./TRAINING_LOOP_STATUS.md).
+
 **Reviewed:** 2026-04-29 / v1.18.0-rc3
 **Scope:** All docs in `/mnt/nvme-1/servers/taco-backend/docs/` + repo-root `CLAUDE.md`, `AGENTS.md`, `CHANGELOG.md`.
 **Approach:** Read-only. Source of truth = code (`server.py`, `validator.py`, `config.py`, `history_store.py`, `scripts/*.py`, `configs/sft_quality_lora.yaml`) + repo-root `CLAUDE.md` cheat-sheet.
