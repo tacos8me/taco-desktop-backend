@@ -3454,6 +3454,102 @@ section h2 {
         <!-- dynamically populated by renderS2Sigmas() -->
       </div>
 
+      <div class="btn-row-label" style="margin-top:16px">Stage 1 Sigmas (Fast) <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(distilled override)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Steps <span class="adv-val" id="advStage1FastStepsVal">8</span></label>
+          <input type="range" id="advStage1FastSteps" min="2" max="20" step="1" value="8"
+                 oninput="document.getElementById('advStage1FastStepsVal').textContent=this.value"
+                 onchange="setSigmaSteps('stage1_sigmas', parseInt(this.value))">
+        </div>
+        <div class="adv-control">
+          <label>Preset</label>
+          <select id="advStage1FastPreset" onchange="setSigmasFromPreset('stage1_sigmas', this.value)">
+            <option value="upstream">computed (default)</option>
+            <option value="comfyui-9-step">ComfyUI 9-step</option>
+            <option value="custom">custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="adv-row" id="stage1_sigmas_sliders" style="flex-wrap:wrap;gap:8px">
+        <!-- dynamically populated by renderSigmas() -->
+      </div>
+      <div class="btn-grid" style="margin-top:4px">
+        <button class="btn" onclick="resetSigmaOverride('stage1_sigmas')">Reset Stage 1 Fast (use computed)</button>
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">Stage 1 Sigmas (Pro/HQ) <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(dev/hq override)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Steps <span class="adv-val" id="advStage1ProStepsVal">30</span></label>
+          <input type="range" id="advStage1ProSteps" min="4" max="50" step="1" value="30"
+                 oninput="document.getElementById('advStage1ProStepsVal').textContent=this.value"
+                 onchange="setSigmaSteps('pro_stage1_sigmas', parseInt(this.value))">
+        </div>
+        <div class="adv-control">
+          <label>Preset</label>
+          <select id="advStage1ProPreset" onchange="setSigmasFromPreset('pro_stage1_sigmas', this.value)">
+            <option value="upstream">computed (default)</option>
+            <option value="custom">custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="adv-row" id="pro_stage1_sigmas_sliders" style="flex-wrap:wrap;gap:8px">
+        <!-- dynamically populated by renderSigmas() -->
+      </div>
+      <div class="btn-grid" style="margin-top:4px">
+        <button class="btn" onclick="resetSigmaOverride('pro_stage1_sigmas')">Reset Stage 1 Pro (use computed)</button>
+      </div>
+
+      <div class="btn-row-label" style="margin-top:16px">VAE Tiling <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(decode-time)</span></div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Preset</label>
+          <select id="advVaePreset" onchange="applyVaePreset(this.value)">
+            <option value="defensive">defensive (512/64 / 64/24 / thr 257)</option>
+            <option value="comfyui">ComfyUI-style (768/64 / 256/8 / thr 0)</option>
+            <option value="custom">custom</option>
+          </select>
+        </div>
+      </div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Spatial tile (px) <span class="adv-val" id="advVaeSpatialVal">512</span></label>
+          <input type="range" id="advVaeSpatial" min="64" max="768" step="32" value="512"
+                 oninput="document.getElementById('advVaeSpatialVal').textContent=this.value; updateVaePreview()"
+                 onchange="setConfig({vae_spatial_tile_px: parseInt(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Spatial overlap (px) <span class="adv-val" id="advVaeSpatialOvVal">64</span></label>
+          <input type="range" id="advVaeSpatialOv" min="0" max="256" step="32" value="64"
+                 oninput="document.getElementById('advVaeSpatialOvVal').textContent=this.value; updateVaePreview()"
+                 onchange="setConfig({vae_spatial_overlap_px: parseInt(this.value)})">
+        </div>
+      </div>
+      <div class="adv-row">
+        <div class="adv-control">
+          <label>Temporal tile (frames) <span class="adv-val" id="advVaeTemporalVal">64</span></label>
+          <input type="range" id="advVaeTemporal" min="16" max="256" step="8" value="64"
+                 oninput="document.getElementById('advVaeTemporalVal').textContent=this.value; updateVaePreview()"
+                 onchange="setConfig({vae_temporal_tile_frames: parseInt(this.value)})">
+        </div>
+        <div class="adv-control">
+          <label>Temporal overlap (frames) <span class="adv-val" id="advVaeTemporalOvVal">24</span></label>
+          <input type="range" id="advVaeTemporalOv" min="0" max="120" step="8" value="24"
+                 oninput="document.getElementById('advVaeTemporalOvVal').textContent=this.value; updateVaePreview()"
+                 onchange="setConfig({vae_temporal_overlap_frames: parseInt(this.value)})">
+        </div>
+      </div>
+      <div class="adv-row">
+        <div class="adv-control" style="min-width:240px">
+          <label>Tiling threshold (frames) <span class="adv-val" id="advVaeThresholdVal">257</span></label>
+          <input type="range" id="advVaeThreshold" min="0" max="1024" step="1" value="257"
+                 oninput="document.getElementById('advVaeThresholdVal').textContent=this.value; updateVaePreview()"
+                 onchange="setConfig({vae_tiling_threshold_frames: parseInt(this.value)})">
+        </div>
+      </div>
+      <div id="vaeTilingPreview" class="muted" style="margin-top:6px;font-size:0.75rem;color:var(--text-dim)">at 1080×1920×81fr → SINGLE-PASS (below threshold 257)</div>
+
       <div class="btn-row-label" style="margin-top:16px">Sampler <span style="font-size:0.65rem;color:var(--text-dim);text-transform:none;letter-spacing:0">(both models)</span></div>
       <div class="adv-row">
         <div class="adv-control">
@@ -4265,11 +4361,34 @@ function toggleAdvanced() {
 }
 
 async function setConfig(fields) {
-  const data = await callEndpoint('POST', '/v1/system/config', fields);
+  // Direct fetch so we can surface 422 error_code + warnings inline (callEndpoint
+  // already toasts pass/fail, but we want richer signal for sigma/VAE invariants).
+  const headers = { ...getAuthHeaders() };
+  let res, data;
+  try {
+    res = await fetch('/v1/system/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(fields),
+    });
+    data = await res.json();
+  } catch (err) {
+    toast('/v1/system/config -> ' + err.message, 'err');
+    return null;
+  }
+  if (!res.ok) {
+    const code = data && (data.error_code || data.error) || res.status;
+    const msg = data && (data.message || data.detail) || '';
+    toast(`config error: ${code}${msg ? ' — ' + msg : ''}`, 'err');
+    return null;
+  }
+  if (data && Array.isArray(data.warnings) && data.warnings.length) {
+    toast(`warning: ${data.warnings.join('; ')}`, 'warn');
+  }
   if (data && data.status === 'ok') {
-    // Update controls from the POST response (authoritative, no cache)
     updateAdvancedControls(data);
   }
+  return data;
 }
 
 function setStage2Preset(preset) {
@@ -4340,6 +4459,167 @@ async function resetConfig() {
   if (data) {
     updateAdvancedControls(data);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1 sigma overrides + VAE tiling (F-3)
+// ---------------------------------------------------------------------------
+
+let _currentSigmas = {
+  stage1_sigmas: null,
+  pro_stage1_sigmas: null,
+};
+
+const _SIGMA_PRESETS = {
+  stage1_sigmas: {
+    upstream: null,
+    'comfyui-9-step': [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0],
+  },
+  pro_stage1_sigmas: {
+    upstream: null,
+  },
+};
+
+function _matchSigmaPreset(configKey, sigmas) {
+  if (sigmas == null) return 'upstream';
+  const presets = _SIGMA_PRESETS[configKey] || {};
+  for (const [name, preset] of Object.entries(presets)) {
+    if (preset == null) continue;
+    if (Array.isArray(preset) && Array.isArray(sigmas) && preset.length === sigmas.length
+        && preset.every((v, i) => Math.abs(v - sigmas[i]) < 1e-6)) {
+      return name;
+    }
+  }
+  return 'custom';
+}
+
+function setSigmasFromPreset(configKey, preset) {
+  if (preset === 'custom') return;  // no-op; user edits sliders directly
+  const presets = _SIGMA_PRESETS[configKey] || {};
+  if (!(preset in presets)) return;
+  const sigmas = presets[preset];  // may be null = computed
+  setConfig({[configKey]: sigmas}).then(() => renderSigmas(configKey, sigmas));
+}
+
+function setSigmaSteps(configKey, n) {
+  const current = _currentSigmas[configKey];
+  const start = (Array.isArray(current) && current.length && current[0] > 0) ? current[0] : 1.0;
+  const sigmas = [];
+  for (let i = 0; i <= n; i++) {
+    sigmas.push(parseFloat((start * (1 - i / n)).toFixed(4)));
+  }
+  setConfig({[configKey]: sigmas}).then(() => renderSigmas(configKey, sigmas));
+}
+
+function resetSigmaOverride(configKey) {
+  setConfig({[configKey]: null}).then(() => renderSigmas(configKey, null));
+}
+
+function renderSigmas(configKey, sigmas) {
+  _currentSigmas[configKey] = sigmas;
+  const containerId = configKey + '_sliders';
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+  if (!sigmas || !Array.isArray(sigmas) || sigmas.length === 0) {
+    const div = document.createElement('div');
+    div.className = 'muted';
+    div.style.cssText = 'font-size:0.75rem;color:var(--text-dim);padding:6px';
+    div.textContent = 'computed via scheduler (max_shift, base_shift, steps) — override off';
+    container.appendChild(div);
+    return;
+  }
+  const idPrefix = configKey === 'stage1_sigmas' ? 's1f' : 's1p';
+  for (let i = 0; i < sigmas.length - 1; i++) {
+    const val = sigmas[i];
+    const div = document.createElement('div');
+    div.className = 'adv-control';
+    div.style.minWidth = '120px';
+    div.innerHTML = `
+      <label>σ${i+1} <span class="adv-val" id="${idPrefix}sig${i}Val">${parseFloat(val).toFixed(3)}</span></label>
+      <input type="range" min="0.0" max="1.0" step="0.001" value="${val}"
+             id="${idPrefix}sig${i}"
+             oninput="document.getElementById('${idPrefix}sig${i}Val').textContent=parseFloat(this.value).toFixed(3)"
+             onchange="updateSigma('${configKey}', ${i}, parseFloat(this.value))">
+    `;
+    container.appendChild(div);
+  }
+  // Terminal sigma label (last value, fixed semantically)
+  const termDiv = document.createElement('div');
+  termDiv.className = 'adv-control';
+  termDiv.style.minWidth = '80px';
+  const lastVal = sigmas[sigmas.length - 1];
+  termDiv.innerHTML = `<label>σ<sub>end</sub> <span class="adv-val">${parseFloat(lastVal).toFixed(3)}</span></label><div style="height:20px;display:flex;align-items:center;color:var(--text-dim);font-size:0.75rem">terminal</div>`;
+  container.appendChild(termDiv);
+  // Sync steps slider
+  const stepsId = configKey === 'stage1_sigmas' ? 'advStage1FastSteps' : 'advStage1ProSteps';
+  const stepsValId = stepsId + 'Val';
+  setSlider(stepsId, stepsValId, sigmas.length - 1, 0);
+}
+
+function updateSigma(configKey, index, value) {
+  const current = _currentSigmas[configKey];
+  if (!Array.isArray(current)) return;
+  const sigmas = [...current];
+  sigmas[index] = parseFloat(value);
+  _currentSigmas[configKey] = sigmas;
+  setConfig({[configKey]: sigmas});
+}
+
+// VAE tiling
+const _VAE_PRESETS = {
+  defensive: {vae_spatial_tile_px: 512, vae_spatial_overlap_px: 64, vae_temporal_tile_frames: 64, vae_temporal_overlap_frames: 24, vae_tiling_threshold_frames: 257},
+  comfyui:   {vae_spatial_tile_px: 768, vae_spatial_overlap_px: 64, vae_temporal_tile_frames: 256, vae_temporal_overlap_frames: 8, vae_tiling_threshold_frames: 0},
+};
+
+function applyVaePreset(preset) {
+  if (preset === 'custom') return;
+  const cfg = _VAE_PRESETS[preset];
+  if (!cfg) return;
+  setConfig(cfg).then((data) => {
+    if (data) updateVaeSliders(data);
+    updateVaePreview();
+  });
+}
+
+function updateVaeSliders(gc) {
+  if (!gc) return;
+  const focused = document.activeElement;
+  const keys = [
+    ['vae_spatial_tile_px',         'advVaeSpatial',      'advVaeSpatialVal'],
+    ['vae_spatial_overlap_px',      'advVaeSpatialOv',    'advVaeSpatialOvVal'],
+    ['vae_temporal_tile_frames',    'advVaeTemporal',     'advVaeTemporalVal'],
+    ['vae_temporal_overlap_frames', 'advVaeTemporalOv',   'advVaeTemporalOvVal'],
+    ['vae_tiling_threshold_frames', 'advVaeThreshold',    'advVaeThresholdVal'],
+  ];
+  for (const [key, sliderId, labelId] of keys) {
+    if (gc[key] === undefined || gc[key] === null) continue;
+    if (focused?.id === sliderId) continue;
+    setSlider(sliderId, labelId, gc[key], 0);
+  }
+}
+
+function updateVaePreview() {
+  const w = 1920, h = 1080, f = 81;
+  const tx = parseInt(document.getElementById('advVaeSpatial')?.value || '512');
+  const txOv = parseInt(document.getElementById('advVaeSpatialOv')?.value || '64');
+  const tf = parseInt(document.getElementById('advVaeTemporal')?.value || '64');
+  const tfOv = parseInt(document.getElementById('advVaeTemporalOv')?.value || '24');
+  const thr = parseInt(document.getElementById('advVaeThreshold')?.value || '257');
+  const el = document.getElementById('vaeTilingPreview');
+  if (!el) return;
+  let preview;
+  if (f <= thr) {
+    preview = `at ${h}×${w}×${f}fr → SINGLE-PASS (below threshold ${thr})`;
+  } else {
+    const sxStride = Math.max(1, tx - txOv);
+    const tfStride = Math.max(1, tf - tfOv);
+    const sx = Math.max(1, Math.ceil(w / sxStride));
+    const sy = Math.max(1, Math.ceil(h / sxStride));
+    const st = Math.max(1, Math.ceil(f / tfStride));
+    preview = `at ${h}×${w}×${f}fr → ${st} temporal × ${sx*sy} spatial = ${st*sx*sy} tiles`;
+  }
+  el.textContent = preview;
 }
 
 // ---------------------------------------------------------------------------
@@ -4461,6 +4741,35 @@ function updateAdvancedControls(gc) {
   // Eta sliders
   if (focused?.id !== 'advEtaS1') setSlider('advEtaS1', 'advEtaS1Val', gc.eta_stage1, 1);
   if (focused?.id !== 'advEtaDef') setSlider('advEtaDef', 'advEtaDefVal', gc.eta_default, 1);
+
+  // Stage 1 sigma overrides (F-3): null = computed (override off)
+  if ('stage1_sigmas' in gc && !focused?.id?.startsWith('s1fsig') && focused?.id !== 'advStage1FastSteps') {
+    renderSigmas('stage1_sigmas', gc.stage1_sigmas);
+    const sel = document.getElementById('advStage1FastPreset');
+    if (sel && focused?.id !== 'advStage1FastPreset') {
+      sel.value = _matchSigmaPreset('stage1_sigmas', gc.stage1_sigmas);
+    }
+  }
+  if ('pro_stage1_sigmas' in gc && !focused?.id?.startsWith('s1psig') && focused?.id !== 'advStage1ProSteps') {
+    renderSigmas('pro_stage1_sigmas', gc.pro_stage1_sigmas);
+    const sel = document.getElementById('advStage1ProPreset');
+    if (sel && focused?.id !== 'advStage1ProPreset') {
+      sel.value = _matchSigmaPreset('pro_stage1_sigmas', gc.pro_stage1_sigmas);
+    }
+  }
+
+  // VAE tiling sliders (F-3)
+  updateVaeSliders(gc);
+  // VAE preset auto-detect: match against known presets, else "custom"
+  const vaeSel = document.getElementById('advVaePreset');
+  if (vaeSel && focused?.id !== 'advVaePreset') {
+    let matched = 'custom';
+    for (const [name, cfg] of Object.entries(_VAE_PRESETS)) {
+      if (Object.entries(cfg).every(([k, v]) => gc[k] === v)) { matched = name; break; }
+    }
+    vaeSel.value = matched;
+  }
+  updateVaePreview();
 }
 
 function setSlider(sliderId, labelId, value, decimals) {

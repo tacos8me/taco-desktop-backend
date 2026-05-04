@@ -574,6 +574,16 @@ _DEFAULT_GEN_CONFIG = {
     "rescale_scale": 0.7,
     "modality_scale": 3.0,
     "stage2_sigmas": [0.85, 0.725, 0.4219, 0.0],
+    # Stage 1 sigma overrides (v1.19.x F-1). null = compute via LTX2Scheduler;
+    # list[float] of length steps+1 = use directly. Validation enforced at write time.
+    "stage1_sigmas": None,
+    "pro_stage1_sigmas": None,
+    # VAE decode tiling knobs (v1.19.x F-1). Defaults match upstream TilingConfig.default().
+    "vae_spatial_tile_px": 512,
+    "vae_spatial_overlap_px": 64,
+    "vae_temporal_tile_frames": 64,
+    "vae_temporal_overlap_frames": 24,
+    "vae_tiling_threshold_frames": 257,
 }
 
 
@@ -592,12 +602,38 @@ def _load_gen_config() -> dict:
     return copy.deepcopy(_DEFAULT_GEN_CONFIG)
 
 
-def _save_gen_config() -> None:
-    """Persist current config to disk."""
+_CONFIG_HISTORY_PATH = Path(__file__).parent / ".gen_config.history.jsonl"
+
+
+def _save_gen_config(*, prev: dict | None = None) -> None:
+    """Persist current config to disk via atomic temp+rename.
+
+    When ``prev`` is supplied, append a diff record to ``.gen_config.history.jsonl``
+    listing the changed keys with their old + new values.
+    """
     try:
-        _CONFIG_PATH.write_text(_json.dumps(_gen_config, indent=2))
+        tmp_path = _CONFIG_PATH.with_suffix(_CONFIG_PATH.suffix + ".tmp")
+        tmp_path.write_text(_json.dumps(_gen_config, indent=2))
+        os.replace(tmp_path, _CONFIG_PATH)  # atomic on POSIX
     except Exception:
         logger.warning("Failed to save gen_config", exc_info=True)
+        return
+    if prev is None:
+        return
+    try:
+        changed = {k: v for k, v in _gen_config.items() if prev.get(k) != v}
+        if not changed:
+            return
+        record = {
+            "ts": time.time(),
+            "changed_keys": sorted(changed.keys()),
+            "old": {k: prev.get(k) for k in changed},
+            "new": dict(changed),
+        }
+        with _CONFIG_HISTORY_PATH.open("a") as fh:
+            fh.write(_json.dumps(record) + "\n")
+    except Exception:
+        logger.warning("Failed to append gen_config history", exc_info=True)
 
 
 _gen_config = _load_gen_config()
@@ -691,9 +727,53 @@ def _cfg_pp_step_state(
     return _replace(state, latent=x_next.to(state.latent.dtype))
 
 
+def _get_stage1_sigmas(
+    *,
+    is_fast: bool,
+    steps: int,
+    max_shift: float,
+    base_shift: float,
+    device,
+    latent: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Resolve stage 1 sigmas: operator override (validated at write time) or LTX2Scheduler.
+
+    Override length contract: ``len(sigmas) == steps + 1`` (boundary anchor at index 0).
+    Validation lives at the /v1/system/config write boundary; readers trust the value.
+    Falls back to LTX2Scheduler when the override slot is null *or* — defensively —
+    when the persisted length doesn't match the current step count (handles the
+    edge case of a config file edited by hand or out of sync after a steps change).
+    """
+    key = "stage1_sigmas" if is_fast else "pro_stage1_sigmas"
+    override = _gen_config.get(key)
+    if override is not None and len(override) == steps + 1:
+        return torch.tensor(override, dtype=torch.float32, device=device)
+    kwargs = {"steps": steps, "max_shift": max_shift, "base_shift": base_shift}
+    if latent is not None:
+        kwargs["latent"] = latent
+    return LTX2Scheduler().execute(**kwargs).to(device=device, dtype=torch.float32)
+
+
 def _get_decode_tiling(num_frames: int) -> TilingConfig | None:
-    """Skip tiling for short videos to avoid temporal boundary artifacts."""
-    return None if num_frames <= SHORT_VIDEO_THRESHOLD else DECODE_TILING
+    """Skip tiling for short videos to avoid temporal boundary artifacts.
+
+    Reads VAE tile/overlap/threshold from ``_gen_config`` so operators can tune
+    per-deploy without a code change. Defaults match upstream
+    ``TilingConfig.default()`` and the historical 257-frame threshold.
+    """
+    threshold = _gen_config.get("vae_tiling_threshold_frames", SHORT_VIDEO_THRESHOLD)
+    if num_frames <= threshold:
+        return None
+    return TilingConfig(
+        spatial_config=SpatialTilingConfig(
+            tile_size_in_pixels=_gen_config.get("vae_spatial_tile_px", 512),
+            tile_overlap_in_pixels=_gen_config.get("vae_spatial_overlap_px", 64),
+        ),
+        temporal_config=TemporalTilingConfig(
+            tile_size_in_frames=_gen_config.get("vae_temporal_tile_frames", 64),
+            tile_overlap_in_frames=_gen_config.get("vae_temporal_overlap_frames", 24),
+        ),
+    )
 
 
 @contextmanager
@@ -1296,7 +1376,13 @@ class SplitModelManager:
         )
 
         if is_fast:
-            sigmas = LTX2Scheduler().execute(steps=_gen_config["fast_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(device=device, dtype=torch.float32)
+            sigmas = _get_stage1_sigmas(
+                is_fast=True,
+                steps=_gen_config["fast_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+            )
             s1_steps = len(sigmas) - 1
 
             denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)
@@ -1312,7 +1398,14 @@ class SplitModelManager:
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
+            sigmas = _get_stage1_sigmas(
+                is_fast=False,
+                steps=_gen_config["pro_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+                latent=empty_latent,
+            )
             s1_steps = len(sigmas) - 1
 
             video_guider_params = MultiModalGuiderParams(
@@ -1453,7 +1546,14 @@ class SplitModelManager:
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=hq_params.num_inference_steps, max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
+        sigmas = _get_stage1_sigmas(
+            is_fast=False,
+            steps=hq_params.num_inference_steps,
+            max_shift=_gen_config["scheduler_max_shift"],
+            base_shift=_gen_config["scheduler_base_shift"],
+            device=device,
+            latent=empty_latent,
+        )
         # res2s: 2 NFE per step + 1 final
         s1_nfe = 2 * hq_params.num_inference_steps + 1
 
@@ -1603,12 +1703,25 @@ class SplitModelManager:
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
-            sigmas = LTX2Scheduler().execute(steps=_gen_config["fast_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(device=device, dtype=torch.float32)
+            sigmas = _get_stage1_sigmas(
+                is_fast=True,
+                steps=_gen_config["fast_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+            )
             s1_steps = len(sigmas) - 1
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
+            sigmas = _get_stage1_sigmas(
+                is_fast=False,
+                steps=_gen_config["pro_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+                latent=empty_latent,
+            )
             s1_steps = len(sigmas) - 1
 
         # Create initial states for stage 1
@@ -1804,12 +1917,25 @@ class SplitModelManager:
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
 
         if is_fast:
-            sigmas = LTX2Scheduler().execute(steps=_gen_config["fast_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(device=device, dtype=torch.float32)
+            sigmas = _get_stage1_sigmas(
+                is_fast=True,
+                steps=_gen_config["fast_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+            )
             s1_steps = len(sigmas) - 1
         else:
             params = _DEV_PARAMS
             empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_shape).to_torch_shape())
-            sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
+            sigmas = _get_stage1_sigmas(
+                is_fast=False,
+                steps=_gen_config["pro_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+                latent=empty_latent,
+            )
             s1_steps = len(sigmas) - 1
 
         # Create initial states for stage 1 (audio frozen)
@@ -1992,7 +2118,14 @@ class SplitModelManager:
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(output_shape).to_torch_shape())
-        sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=_gen_config["pro_stage1_steps"], max_shift=_gen_config["scheduler_max_shift"], base_shift=_gen_config["scheduler_base_shift"]).to(dtype=torch.float32, device=device)
+        sigmas = _get_stage1_sigmas(
+                is_fast=False,
+                steps=_gen_config["pro_stage1_steps"],
+                max_shift=_gen_config["scheduler_max_shift"],
+                base_shift=_gen_config["scheduler_base_shift"],
+                device=device,
+                latent=empty_latent,
+            )
         total_steps = len(sigmas) - 1
 
         transformer = BatchSplitAdapter(worker.ledger.transformer(), max_batch_size=1)
@@ -2161,11 +2294,13 @@ class SplitModelManager:
             stage_1_shape, fps, noiser, dtype, device, video_conds=stage_1_cond,
         )
 
-        sigmas = LTX2Scheduler().execute(
+        sigmas = _get_stage1_sigmas(
+            is_fast=True,
             steps=_gen_config["fast_stage1_steps"],
             max_shift=_gen_config["scheduler_max_shift"],
             base_shift=_gen_config["scheduler_base_shift"],
-        ).to(device=device, dtype=torch.float32)
+            device=device,
+        )
         s1_steps = len(sigmas) - 1
 
         denoiser = SimpleDenoiser(v_context=v_context_p, a_context=a_context_p)

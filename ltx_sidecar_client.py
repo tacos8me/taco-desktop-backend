@@ -140,6 +140,11 @@ class LtxSidecarClient:
         # v1.12: chain-segment MP4 for multi-frame latent conditioning.
         segment_path: str | None = None,
         segment_b64: str | None = None,
+        # v1.19.x F-2: per-request gen_config overrides forwarded to remote
+        # sidecars (Modal/RunPod) which freeze gen_config at container init
+        # and can't see taco-backend's .gen_config.json. When None or empty,
+        # the request body is byte-identical to today (backward compat).
+        gen_config_overrides: dict | None = None,
     ) -> bytes:
         """POST /generate — returns raw MP4 bytes.
 
@@ -197,6 +202,9 @@ class LtxSidecarClient:
             payload["segment_path"] = segment_path
         if segment_b64 is not None:
             payload["segment_b64"] = segment_b64
+        # v1.19.x F-2: pass operator gen_config overrides through to remote.
+        if gen_config_overrides:
+            payload["gen_config_overrides"] = gen_config_overrides
 
         url = f"{self._base_url}/generate"
         t0 = time.perf_counter()

@@ -120,6 +120,11 @@ class JobType(StrEnum):
     IMAGE_EDIT = "image-edit"
     EXPORT_COMPOSITION = "export-composition"
     MUSIC_GENERATION = "music-generation"
+    # v1.19.0 Phase 1 / L2.5 — operator-curated exemplar LoRA build.
+    # Tracked through `training_runs.status`; no new in-memory worker
+    # state. The orchestrator script lives at
+    # `scripts/build_lora_from_exemplars.py` and is spawned out-of-band.
+    LORA_BUILD = "lora-build"
 
 
 _MEDIA_TYPES: dict[JobType, str] = {

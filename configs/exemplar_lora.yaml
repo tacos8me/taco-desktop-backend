@@ -1,0 +1,86 @@
+# Exemplar LoRA fine-tune config — v0.0.1 (Phase 1 / L2.5)
+#
+# Operator-curated exemplar fine-tune. Driven by
+#   POST /v1/exemplar-sets/{set_id}/build-lora
+# which spawns scripts/build_lora_from_exemplars.py and that in turn
+# materializes a temporary ltx-trainer dataset + spawns
+#   /mnt/nvme-1/repos/LTX-2/packages/ltx-trainer/scripts/train.py
+# with a per-build YAML derived from THIS template.
+#
+# ltx-trainer is step-based, NOT epoch-based (see
+# `optimization.steps` in ltx-trainer's ltx2_av_lora.yaml — there is no
+# `epochs` knob upstream). 1500 steps is a reasonable default for 20-30
+# exemplar clips at LoRA rank 32; ltx-trainer's default is 2000.
+
+# Identity
+run_id_prefix: "exemplar"
+
+# Base model — keep aligned with current production distilled checkpoint.
+base_model_path: "/mnt/nvme-1/huggingface/ltx-2.3-checkpoints/ltx-2.3-22b-distilled-1.1.safetensors"
+text_encoder_path: "/mnt/nvme-1/huggingface/hub/models--google--gemma-3-12b-pt/snapshots/295efb63d01a7017928f273a94ebb86105c9526f"
+
+# LoRA hyperparams. q/k/v/out_proj is the same target set used in the
+# Phase C SFT config and by the existing IC-LoRA training; matches the
+# ltx-trainer "to_k/to_q/to_v/to_out.0" short-pattern that fans across
+# both video and audio attention branches.
+rank: 32
+alpha: 32
+dropout: 0.0
+target_modules:
+  - "to_k"
+  - "to_q"
+  - "to_v"
+  - "to_out.0"
+
+# Optimization. Step-based per upstream contract.
+steps: 1500
+learning_rate: 1.0e-4
+batch_size: 1
+gradient_accumulation_steps: 1
+optimizer_type: "adamw"
+scheduler_type: "linear"
+max_grad_norm: 1.0
+enable_gradient_checkpointing: true
+mixed_precision_mode: "bf16"
+seed: 42
+
+# Training-strategy defaults. with_audio toggles whether ltx-trainer's
+# audio branch is jointly trained. Most operator-curated exemplar sets
+# are video-first; flip to true when the exemplar set is audio-anchored
+# (a2v compositions where the audio drives motion).
+first_frame_conditioning_p: 0.5
+with_audio: false
+
+# Validation. Validation is expensive during a 10-15h run. We keep
+# generic prompts here; the orchestrator MAY override with one prompt
+# sampled from the exemplar set.
+validation_interval: 250
+validation_prompts:
+  - "Cinematic close-up shot, soft natural light, shallow depth of field, slow camera move."
+validation_negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+validation_video_dims: [576, 576, 49]
+validation_frame_rate: 24.0
+validation_seed: 42
+validation_inference_steps: 30
+
+# Checkpointing
+checkpoint_interval: 250
+checkpoint_keep_last_n: 3
+checkpoint_precision: "bfloat16"
+
+# Frozen at training-time into training_runs.hyperparams_json for
+# downstream reproducibility / postmortem analysis.
+hyperparams:
+  rank: 32
+  alpha: 32
+  steps: 1500
+  learning_rate: 1.0e-4
+  optimizer: adamw
+  bf16: true
+  gradient_checkpointing: true
+  seed: 42
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0

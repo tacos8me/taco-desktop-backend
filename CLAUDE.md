@@ -71,6 +71,7 @@ v1.13.0: `GET /v1/system/workers` live-worker introspection endpoint; dashboard 
 | Music structure analyzer (madmom) | [madmom downbeat sidecar (v1.16.0)](#madmom-downbeat-sidecar-v1160) — `POST /v1/music/analyze` with `analyzer="madmom"` |
 | Dashboard + live tuning | [Dashboard](#dashboard-and-gpu-telemetry-v12-advanced-controls-v13) + [Generation config](#generation-config-v13) |
 | Client-facing API shape | `docs/API.md` (canonical) |
+| Integrating a third-party rating client (rating + exemplar-LoRA) | `docs/RATING_LORA_INTEGRATION.md` |
 | LLM-driven workflows | `docs/MCP.md` (noodlefinger-mcp tier-0 + tier-1) |
 | Shipped-feature archaeology | `CHANGELOG.md` + `AGENTS.md` (per-version deltas) |
 | Rate-limit / concurrency tuning | `docs/operator-tuning.md` (v1.16.1) |

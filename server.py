@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy as _copy
 import json as _json_mod
+import math
 import os
 import subprocess
 import time
@@ -115,6 +117,37 @@ _batch_queue: asyncio.Queue[str] = asyncio.Queue()
 
 # Turbo mode — dual-GPU LTX inference (2 concurrent video jobs)
 _VIDEO_JOB_TYPES = {JobType.TEXT_TO_VIDEO, JobType.IMAGE_TO_VIDEO, JobType.AUDIO_TO_VIDEO, JobType.RETAKE, JobType.VIDEO_OUTPAINT, JobType.VIDEO_HDR}
+
+# v1.19.x F-2: operator-tunable gen_config keys forwarded to remote sidecars
+# (Modal/RunPod) per-request. Remote containers freeze gen_config at boot and
+# have no view of taco-backend's `.gen_config.json`, so we ship the live values
+# in the request body. Keys here are a strict superset of the F-1 additions —
+# pre-existing knobs (sampler/cfg/stg/etc.) are included so dashboard edits to
+# them propagate to remote workers too (closes a latent bug where they didn't).
+OPERATOR_TUNABLE_GEN_CONFIG_KEYS = frozenset({
+    # F-1 additions (stage1 sigmas + VAE tiling)
+    "stage1_sigmas",
+    "pro_stage1_sigmas",
+    "vae_spatial_tile_px",
+    "vae_spatial_overlap_px",
+    "vae_temporal_tile_frames",
+    "vae_temporal_overlap_frames",
+    "vae_tiling_threshold_frames",
+    # Pre-existing operator-tunable keys
+    "fast_stage1_steps",
+    "pro_stage1_steps",
+    "scheduler_max_shift",
+    "scheduler_base_shift",
+    "cfg_scale",
+    "stg_scale",
+    "rescale_scale",
+    "modality_scale",
+    "stg_blocks",
+    "eta_stage1",
+    "eta_default",
+    "stage2_sigmas",
+    "sampler",
+})
 _turbo_active: bool = False
 _turbo_worker_task: asyncio.Task | None = None         # local sidecar worker (cuda:1)
 
@@ -1525,12 +1558,15 @@ def _resolve_flux_lora(body) -> tuple[str | None, float] | JSONResponse:
     return str(flux_lora_registry.resolve_path(body.lora.id)), body.lora.strength
 
 
-def _error(status: int, msg: str) -> JSONResponse:
+def _error(status: int, msg: str, error_code: str | None = None) -> JSONResponse:
     # Avoid leaking internal filesystem paths in error responses
     text = msg[:500]
     if "/mnt/" in text or "/home/" in text or "/tmp/" in text:
         text = "Internal server error"
-    return JSONResponse(status_code=status, content={"error": text, "message": text, "detail": text})
+    payload: dict[str, Any] = {"error": text, "message": text, "detail": text}
+    if error_code is not None:
+        payload["error_code"] = error_code
+    return JSONResponse(status_code=status, content=payload)
 
 
 def _serve_with_http_cache(
@@ -2887,6 +2923,196 @@ async def api_keys_me_training_opt_in_set(request: Request) -> JSONResponse:
     return JSONResponse(content={"opted_in": bool(body["opted_in"])})
 
 
+def _lookup_validator_threshold_overrides(api_key: str) -> tuple[float | None, float | None]:
+    """Read per-bearer (pass, retake) threshold overrides from api_key_metadata.
+
+    Returns ``(None, None)`` when the bearer has no row, the columns are
+    missing (pre-v7 DBs in tests), or any of the lookups fail. The caller
+    treats ``None`` as "use the global default".
+    """
+    if not api_key:
+        return (None, None)
+    try:
+        from history_store import _hash_key
+        row = history._conn.execute(
+            "SELECT validator_pass_threshold_override, "
+            "validator_retake_threshold_override "
+            "FROM api_key_metadata WHERE api_key_hash = ?",
+            (_hash_key(api_key),),
+        ).fetchone()
+    except Exception:
+        return (None, None)
+    if row is None:
+        return (None, None)
+    pass_o = row["validator_pass_threshold_override"] if hasattr(row, "keys") else row[0]
+    retake_o = row["validator_retake_threshold_override"] if hasattr(row, "keys") else row[1]
+    pass_o = float(pass_o) if pass_o is not None else None
+    retake_o = float(retake_o) if retake_o is not None else None
+    return (pass_o, retake_o)
+
+
+@app.get("/v1/api-keys/me/validator-thresholds")
+async def api_keys_me_validator_thresholds_get(request: Request) -> JSONResponse:
+    """Read the calling bearer's validator threshold overrides.
+
+    Returns ``pass`` / ``retake`` overrides (NULL when unset → global
+    fallback applies) plus the global ``fallback_pass`` /
+    ``fallback_retake`` constants for client-side rendering.
+    """
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    else:
+        api_key = _extract_api_key(request) or ""
+    from validator import GLOBAL_PASS_THRESHOLD, GLOBAL_RETAKE_THRESHOLD
+    pass_o, retake_o = _lookup_validator_threshold_overrides(api_key)
+    return JSONResponse(content={
+        "pass": pass_o,
+        "retake": retake_o,
+        "fallback_pass": GLOBAL_PASS_THRESHOLD,
+        "fallback_retake": GLOBAL_RETAKE_THRESHOLD,
+    })
+
+
+@app.post("/v1/api-keys/me/validator-thresholds")
+async def api_keys_me_validator_thresholds_set(request: Request) -> JSONResponse:
+    """Set the calling bearer's validator threshold overrides.
+
+    Body: ``{"pass": float | null, "retake": float | null}``. Each value
+    is clamped to ``GLOBAL_* ± THRESHOLD_OVERRIDE_RANGE`` (default ± 0.15);
+    422 on out-of-range. Sanity check: if both submitted values are
+    non-null AND ``pass <= retake``, returns 422 with
+    ``error_code=INVALID_THRESHOLD_INVERSION``. Single-knob updates
+    re-validate against the stored counterpart (or its global fallback
+    if NULL) so an in-flight inversion can't slip through.
+    """
+    if config.API_KEYS:
+        api_key = _extract_api_key(request)
+        if not api_key:
+            return _error(401, "Missing API key")
+    else:
+        api_key = _extract_api_key(request) or ""
+    if not api_key:
+        return _error(400, "Bearer required for threshold override")
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "JSON body required")
+
+    if "pass" not in body and "retake" not in body:
+        return _error(422, "Body must include `pass` and/or `retake`")
+
+    from validator import (
+        GLOBAL_PASS_THRESHOLD,
+        GLOBAL_RETAKE_THRESHOLD,
+        THRESHOLD_OVERRIDE_RANGE,
+    )
+
+    def _coerce(name: str, default: float) -> tuple[bool, float | None]:
+        if name not in body:
+            return (False, None)
+        v = body[name]
+        if v is None:
+            return (True, None)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return (False, None)  # signaled via 422 below
+        return (True, float(v))
+
+    pass_present = "pass" in body
+    retake_present = "retake" in body
+    if pass_present and body["pass"] is not None and not isinstance(body["pass"], (int, float)):
+        return _error(422, "`pass` must be number or null")
+    if retake_present and body["retake"] is not None and not isinstance(body["retake"], (int, float)):
+        return _error(422, "`retake` must be number or null")
+    if pass_present and isinstance(body["pass"], bool):
+        return _error(422, "`pass` must be number or null")
+    if retake_present and isinstance(body["retake"], bool):
+        return _error(422, "`retake` must be number or null")
+
+    pass_val: float | None = float(body["pass"]) if pass_present and body["pass"] is not None else None
+    retake_val: float | None = float(body["retake"]) if retake_present and body["retake"] is not None else None
+
+    pass_lo = GLOBAL_PASS_THRESHOLD - THRESHOLD_OVERRIDE_RANGE
+    pass_hi = GLOBAL_PASS_THRESHOLD + THRESHOLD_OVERRIDE_RANGE
+    retake_lo = GLOBAL_RETAKE_THRESHOLD - THRESHOLD_OVERRIDE_RANGE
+    retake_hi = GLOBAL_RETAKE_THRESHOLD + THRESHOLD_OVERRIDE_RANGE
+
+    if pass_val is not None and not (pass_lo <= pass_val <= pass_hi):
+        return _error(
+            422,
+            f"`pass` {pass_val} outside allowed range [{pass_lo:.2f}, {pass_hi:.2f}]",
+        )
+    if retake_val is not None and not (retake_lo <= retake_val <= retake_hi):
+        return _error(
+            422,
+            f"`retake` {retake_val} outside allowed range [{retake_lo:.2f}, {retake_hi:.2f}]",
+        )
+
+    # Sanity: pass must remain strictly greater than retake. For single-knob
+    # updates, validate against the stored counterpart (or the global default
+    # if that side is also NULL) so an inversion can't slip through in two
+    # POSTs.
+    stored_pass, stored_retake = _lookup_validator_threshold_overrides(api_key)
+    effective_pass = pass_val if pass_present else stored_pass
+    effective_retake = retake_val if retake_present else stored_retake
+    if effective_pass is None:
+        effective_pass = GLOBAL_PASS_THRESHOLD
+    if effective_retake is None:
+        effective_retake = GLOBAL_RETAKE_THRESHOLD
+    if pass_present and pass_val is None:
+        effective_pass = GLOBAL_PASS_THRESHOLD
+    if retake_present and retake_val is None:
+        effective_retake = GLOBAL_RETAKE_THRESHOLD
+    if effective_pass <= effective_retake:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "pass must remain strictly greater than retake",
+                "error_code": "INVALID_THRESHOLD_INVERSION",
+                "effective_pass": effective_pass,
+                "effective_retake": effective_retake,
+            },
+        )
+
+    from history_store import _hash_key
+    now = time.time()
+    key_hash = _hash_key(api_key)
+
+    # Build the UPSERT — only the fields present in the body are updated.
+    # INSERT path supplies defaults for required columns (training_opt_in
+    # default 1 mirrors `_maybe_seed_api_key_metadata`).
+    insert_pass = pass_val if pass_present else None
+    insert_retake = retake_val if retake_present else None
+    set_clauses = ["updated_at = excluded.updated_at"]
+    if pass_present:
+        set_clauses.append(
+            "validator_pass_threshold_override = excluded.validator_pass_threshold_override"
+        )
+    if retake_present:
+        set_clauses.append(
+            "validator_retake_threshold_override = excluded.validator_retake_threshold_override"
+        )
+    history._conn.execute(
+        f"""INSERT INTO api_key_metadata
+            (api_key_hash, training_opt_in, tier, notes, created_at, updated_at,
+             validator_pass_threshold_override, validator_retake_threshold_override)
+            VALUES (?, 1, 'pro', NULL, ?, ?, ?, ?)
+            ON CONFLICT(api_key_hash) DO UPDATE SET
+              {", ".join(set_clauses)}""",
+        (key_hash, now, now, insert_pass, insert_retake),
+    )
+    history._conn.commit()
+
+    pass_o, retake_o = _lookup_validator_threshold_overrides(api_key)
+    return JSONResponse(content={
+        "pass": pass_o,
+        "retake": retake_o,
+        "fallback_pass": GLOBAL_PASS_THRESHOLD,
+        "fallback_retake": GLOBAL_RETAKE_THRESHOLD,
+    })
+
+
 @app.get("/health")
 async def health() -> dict:
     if _paused:
@@ -3320,6 +3546,16 @@ async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> by
             if provider_mount:
                 remote_lora_path = remote_lora_path.replace(local_loras_dir, provider_mount)
 
+    # v1.19.x F-2: ship operator gen_config overrides per request — remote
+    # sidecars freeze gen_config at container init, so the dashboard's live
+    # values must travel in-band to take effect. Whitelist via
+    # OPERATOR_TUNABLE_GEN_CONFIG_KEYS to keep payload bounded.
+    gen_config_overrides = {
+        k: v
+        for k, v in split_model_manager._gen_config.items()
+        if k in OPERATOR_TUNABLE_GEN_CONFIG_KEYS
+    }
+
     return await client.generate(
         job_type=job.type,
         prompt=p["prompt"], model=p.get("model", "ltx-2-3-fast"),
@@ -3342,6 +3578,8 @@ async def _dispatch_job_turbo_remote(job: Job, *, provider: str = "modal") -> by
         position=p.get("position"),
         conditioning_strength=p.get("conditioning_strength"),
         skip_stage_2=p.get("skip_stage_2"),
+        # v1.19.x F-2: per-request operator gen_config overrides
+        gen_config_overrides=gen_config_overrides,
     )
 
 
@@ -3884,6 +4122,127 @@ async def get_gen_config() -> JSONResponse:
     return JSONResponse(content=dict(_gen_config))
 
 
+def _validate_gen_config_patch(patch: dict, current: dict) -> tuple[dict, list[str]]:
+    """Validate a partial gen_config update. Returns (validated_patch, warnings).
+
+    Raises ValueError(error_code, message) on hard violations. Soft warnings
+    (e.g. non-monotonic sigmas) are returned as a list and surfaced to the caller
+    in the 200-OK response without rejecting the write.
+    """
+    warnings: list[str] = []
+    out: dict = {}
+
+    def _fail(error_code: str, message: str) -> None:
+        raise ValueError(error_code, message)
+
+    # Resolve effective step counts after this patch (so length validation matches the
+    # post-write state, not the pre-write state — operator may bump steps + sigmas
+    # in one POST).
+    effective_fast_steps = int(patch.get("fast_stage1_steps", current.get("fast_stage1_steps", 8)))
+    effective_pro_steps = int(patch.get("pro_stage1_steps", current.get("pro_stage1_steps", 30)))
+
+    def _check_sigma_list(name: str, val, expected_len: int) -> list | None:
+        if val is None:
+            return None
+        if not isinstance(val, (list, tuple)):
+            _fail("INVALID_SIGMA_TYPE", f"{name} must be null or a list of floats")
+        cleaned: list[float] = []
+        for v in val:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                _fail("INVALID_SIGMA_TYPE", f"{name} entries must be numeric")
+            f = float(v)
+            if f != f:  # NaN check
+                _fail("INVALID_SIGMA_NAN", f"{name} contains NaN")
+            if f < 0.0 or f > 1.0:
+                _fail("INVALID_SIGMA_RANGE", f"{name} entries must be in [0, 1]; got {f}")
+            cleaned.append(f)
+        if len(cleaned) != expected_len:
+            _fail(
+                "INVALID_SIGMA_LENGTH",
+                f"{name} must have length {expected_len} (steps+1); got {len(cleaned)}",
+            )
+        if any(cleaned[i] < cleaned[i + 1] for i in range(len(cleaned) - 1)):
+            warnings.append(f"{name} is not monotonically non-increasing")
+        if cleaned and cleaned[0] < 0.95:
+            warnings.append(f"{name}[0]={cleaned[0]} is below the typical 0.95 boundary anchor")
+        if cleaned and cleaned[-1] > 0.01:
+            warnings.append(f"{name}[-1]={cleaned[-1]} is above the typical 0.01 terminal sigma")
+        return cleaned
+
+    def _check_int(name: str, val, *, min_val: int, max_val: int | None = None,
+                   div_by: int | None = None, error_code: str) -> int:
+        if isinstance(val, bool) or not isinstance(val, int):
+            _fail(error_code, f"{name} must be an integer")
+        if val < min_val:
+            _fail(error_code, f"{name} must be >= {min_val}; got {val}")
+        if max_val is not None and val > max_val:
+            _fail(error_code, f"{name} must be <= {max_val}; got {val}")
+        if div_by is not None and val % div_by != 0:
+            _fail(error_code, f"{name} must be divisible by {div_by}; got {val}")
+        return val
+
+    if "stage1_sigmas" in patch:
+        out["stage1_sigmas"] = _check_sigma_list(
+            "stage1_sigmas", patch["stage1_sigmas"], effective_fast_steps + 1,
+        )
+
+    if "pro_stage1_sigmas" in patch:
+        out["pro_stage1_sigmas"] = _check_sigma_list(
+            "pro_stage1_sigmas", patch["pro_stage1_sigmas"], effective_pro_steps + 1,
+        )
+
+    if "vae_spatial_tile_px" in patch:
+        out["vae_spatial_tile_px"] = _check_int(
+            "vae_spatial_tile_px", patch["vae_spatial_tile_px"],
+            min_val=64, max_val=768, div_by=32, error_code="INVALID_VAE_TILE_SIZE",
+        )
+
+    if "vae_spatial_overlap_px" in patch:
+        ov = _check_int(
+            "vae_spatial_overlap_px", patch["vae_spatial_overlap_px"],
+            min_val=0, div_by=32, error_code="INVALID_VAE_OVERLAP",
+        )
+        eff_tile = out.get("vae_spatial_tile_px", current.get("vae_spatial_tile_px", 512))
+        if ov >= eff_tile:
+            _fail("INVALID_VAE_OVERLAP", f"vae_spatial_overlap_px ({ov}) must be < vae_spatial_tile_px ({eff_tile})")
+        out["vae_spatial_overlap_px"] = ov
+
+    if "vae_temporal_tile_frames" in patch:
+        out["vae_temporal_tile_frames"] = _check_int(
+            "vae_temporal_tile_frames", patch["vae_temporal_tile_frames"],
+            min_val=16, max_val=256, div_by=8, error_code="INVALID_VAE_TILE_SIZE",
+        )
+
+    if "vae_temporal_overlap_frames" in patch:
+        ov = _check_int(
+            "vae_temporal_overlap_frames", patch["vae_temporal_overlap_frames"],
+            min_val=0, div_by=8, error_code="INVALID_VAE_OVERLAP",
+        )
+        eff_tile = out.get("vae_temporal_tile_frames", current.get("vae_temporal_tile_frames", 64))
+        if ov >= eff_tile:
+            _fail("INVALID_VAE_OVERLAP", f"vae_temporal_overlap_frames ({ov}) must be < vae_temporal_tile_frames ({eff_tile})")
+        out["vae_temporal_overlap_frames"] = ov
+
+    if "vae_tiling_threshold_frames" in patch:
+        out["vae_tiling_threshold_frames"] = _check_int(
+            "vae_tiling_threshold_frames", patch["vae_tiling_threshold_frames"],
+            min_val=0, error_code="INVALID_VAE_THRESHOLD",
+        )
+
+    # Pass-through any other known keys without structural validation (legacy behavior
+    # for sampler / cfg_scale / stg_blocks / etc — those are validated implicitly by
+    # the generation path).
+    for key, value in patch.items():
+        if key in out:
+            continue
+        if key in current:
+            out[key] = value
+        else:
+            logger.warning("Unknown gen_config key ignored: %s", key)
+
+    return out, warnings
+
+
 @app.post("/v1/system/config")
 async def set_gen_config(request: Request) -> JSONResponse:
     """Update generation configuration. Merges body into current config."""
@@ -3891,14 +4250,27 @@ async def set_gen_config(request: Request) -> JSONResponse:
     if deny is not None:
         return deny
     global _gpu_cache
+    import copy as _copy
     import split_model_manager
     body = await request.json()
-    for key, value in body.items():
-        if key in split_model_manager._gen_config:
-            split_model_manager._gen_config[key] = value
+    if not isinstance(body, dict):
+        return _error(422, "Body must be a JSON object", error_code="INVALID_BODY")
+    try:
+        validated, warnings = _validate_gen_config_patch(body, dict(split_model_manager._gen_config))
+    except ValueError as exc:
+        if len(exc.args) == 2:
+            error_code, message = exc.args
+            return _error(422, str(message), error_code=str(error_code))
+        return _error(422, str(exc))
+    prev = _copy.deepcopy(split_model_manager._gen_config)
+    for key, value in validated.items():
+        split_model_manager._gen_config[key] = value
     _gpu_cache = None  # invalidate so next poll returns fresh config
-    split_model_manager._save_gen_config()
-    return JSONResponse(content={"status": "ok", **dict(split_model_manager._gen_config)})
+    split_model_manager._save_gen_config(prev=prev)
+    payload: dict = {"status": "ok", **dict(split_model_manager._gen_config)}
+    if warnings:
+        payload["warnings"] = warnings
+    return JSONResponse(content=payload)
 
 
 @app.post("/v1/system/config/reset")
@@ -4107,6 +4479,934 @@ async def lora_rollback(request: Request) -> JSONResponse:
         "reason": reason,
         "applied_at": now,
         "note": "MCP_PRODUCTION_LORA written to .env; restart mcp/taco-backend to fully apply",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (v1.19.0-rc3 / v1.20.0) — human-rating endpoints (L1 + L3).
+#
+# Five endpoints implementing the rating spine of plan
+# §"Endpoints" + §"preference_pairs Writer Logic" (Path C′):
+#   POST   /v1/clips/{clip_id}/rating
+#   PATCH  /v1/clips/{clip_id}/rating/{rating_id}
+#   DELETE /v1/clips/{clip_id}/rating/{rating_id}
+#   GET    /v1/clips/{clip_id}/ratings
+#   GET    /v1/ratings/queue
+#
+# All errors use the structured envelope from plan §"Error envelope":
+#   {"error": "<short>", "error_code": "<TOKEN>", "message": "...",
+#    "detail": <optional>}
+#
+# Pair writes use ``signal_source='human_rating'`` + ``signal_strength=0.75``
+# + ``pending_construction_until = now + 86400`` (Path C′ 24h quarantine).
+# ``train_dpo_sft.py`` won't pick these up until the construction-time
+# invariant re-check job clears the column.
+# ---------------------------------------------------------------------------
+
+_RATING_SIGNAL_STRENGTH = 0.75
+_RATING_PAIR_QUARANTINE_S = 86400.0
+_RATING_PAIR_KINDS = {"pair_chose_a", "pair_chose_b"}
+_RATING_AUDIT_KINDS = {"pair_tie", "tag", "warn"}
+_RATING_VALID_KINDS = _RATING_PAIR_KINDS | _RATING_AUDIT_KINDS
+from validator import GLOBAL_PASS_THRESHOLD as _RATING_QUEUE_PASS
+from validator import GLOBAL_RETAKE_THRESHOLD as _RATING_QUEUE_RETAKE
+_RATING_QUEUE_CENTER = (_RATING_QUEUE_PASS + _RATING_QUEUE_RETAKE) / 2
+# Safety Gap-E (P0-2c): reserve ≥this fraction of each queue page for
+# clips whose shot_config_key the caller has NOT recently rated.
+# Blocks single-cohort reward-hacking by ensuring rater sees ≥30%
+# cohort-novel candidates per page. Override via env.
+try:
+    _RATING_QUEUE_MIN_COHORT_DIVERSITY = float(
+        os.environ.get("RATING_QUEUE_MIN_COHORT_DIVERSITY", "0.3")
+    )
+except ValueError:
+    _RATING_QUEUE_MIN_COHORT_DIVERSITY = 0.3
+_RATING_QUEUE_MIN_COHORT_DIVERSITY = max(
+    0.0, min(1.0, _RATING_QUEUE_MIN_COHORT_DIVERSITY)
+)
+# Window of "recently rated" cohorts (by row count, not time) used to
+# decide novelty. 100 covers ~a session's worth of work without making
+# the rater chase ancient cohorts forever.
+_RATING_QUEUE_RECENT_COHORT_WINDOW = 100
+
+
+def _rating_error(
+    status: int,
+    error_code: str,
+    message: str,
+    detail: dict | None = None,
+) -> JSONResponse:
+    """Structured envelope per plan §"Error envelope".
+
+    ``error`` is snake_case token; ``error_code`` is SCREAMING_SNAKE_CASE.
+    """
+    payload: dict[str, Any] = {
+        "error": error_code.lower(),
+        "error_code": error_code,
+        "message": message,
+    }
+    if detail is not None:
+        payload["detail"] = detail
+    return JSONResponse(status_code=status, content=payload)
+
+
+# Plan invariant #4 — anti-fatigue gate. The token-bucket middleware
+# (10/s burst 10) is broad anti-DDoS; these caps are per-rater anti-
+# fatigue. Tracked via ``human_ratings.created_at`` (non-retracted,
+# non-superseded) so the state survives process restart.
+_RATING_MIN_INTERVAL_S = 2.0
+_RATING_SESSION_WINDOW_S = 90.0 * 60.0
+_RATING_SESSION_CAP = 200
+
+
+def _check_rating_fatigue_gate(rater_hash: str) -> JSONResponse | None:
+    """Return a 409 response if the rater violates anti-fatigue caps.
+
+    Skipped when ``rater_hash`` is empty (auth disabled). DB-side lookup
+    so the gate is correct across worker processes / restarts.
+    """
+    if not rater_hash:
+        return None
+    now = time.time()
+    last = history._conn.execute(
+        "SELECT MAX(created_at) AS last FROM human_ratings "
+        "WHERE rater_api_key_hash = ?",
+        (rater_hash,),
+    ).fetchone()
+    if last is not None and last["last"] is not None:
+        delta = now - float(last["last"])
+        if delta < _RATING_MIN_INTERVAL_S:
+            return _rating_error(
+                409,
+                "RATE_LIMIT_TOO_FAST",
+                f"minimum {_RATING_MIN_INTERVAL_S}s between ratings; last was {delta:.2f}s ago",
+            )
+    cnt_row = history._conn.execute(
+        "SELECT COUNT(*) AS n FROM human_ratings "
+        "WHERE rater_api_key_hash = ? AND created_at >= ?",
+        (rater_hash, now - _RATING_SESSION_WINDOW_S),
+    ).fetchone()
+    cnt = int(cnt_row["n"]) if cnt_row else 0
+    if cnt >= _RATING_SESSION_CAP:
+        return _rating_error(
+            409,
+            "SESSION_CAP_EXCEEDED",
+            f"session cap reached: {cnt}/{_RATING_SESSION_CAP} ratings within {int(_RATING_SESSION_WINDOW_S/60)}min",
+        )
+    return None
+
+
+def _is_training_opted_in_by_hash(api_key_hash: str) -> bool:
+    """Hash-based variant of :func:`_is_training_opted_in`.
+
+    The clip's bearer is identified by ``generations.api_key_hash`` — we
+    never see the raw bearer. Mirrors the default-opt-out semantics: a
+    bearer with no ``api_key_metadata`` row is treated as opted out (rc1
+    seed populated every ``.api_keys`` line at v3 migration time, so any
+    real bearer should already have a row).
+    """
+    if not api_key_hash:
+        return False
+    try:
+        row = history._conn.execute(
+            "SELECT training_opt_in FROM api_key_metadata WHERE api_key_hash = ?",
+            (api_key_hash,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["training_opt_in"])
+    except Exception:
+        logger.warning("training_opt_in lookup by hash failed", exc_info=True)
+        return False
+
+
+def _privacy_gate_allows(rater_hash: str, clip_row: sqlite3.Row) -> bool:
+    """Plan §"409 conditions"::``PRIVACY_GATE_BLOCKED``.
+
+    Same-bearer rating is always allowed (rater rates own clip). Cross-
+    bearer rating requires both:
+      1. The clip's bearer has ``training_opt_in = 1``, AND
+      2. The clip's bearer has ``cross_bearer_rating_consent_at`` non-NULL.
+    """
+    bearer_hash = clip_row["api_key_hash"] if clip_row is not None else None
+    if not bearer_hash:
+        return False
+    if rater_hash == bearer_hash:
+        return True
+    try:
+        row = history._conn.execute(
+            "SELECT training_opt_in, cross_bearer_rating_consent_at "
+            "FROM api_key_metadata WHERE api_key_hash = ?",
+            (bearer_hash,),
+        ).fetchone()
+    except Exception:
+        logger.warning("privacy gate lookup failed", exc_info=True)
+        return False
+    if row is None:
+        return False
+    if not bool(row["training_opt_in"]):
+        return False
+    return row["cross_bearer_rating_consent_at"] is not None
+
+
+def _bearer_or_401(request: Request) -> tuple[str, JSONResponse | None]:
+    """Resolve the bearer; return ``(api_key, deny)``.
+
+    When ``API_KEYS`` is empty (auth disabled), returns ``("", None)``.
+    Callers must still handle the empty-bearer case (privacy gate uses
+    the bearer's hash as identity, so a missing bearer can't rate
+    cross-bearer).
+    """
+    api_key = _extract_api_key(request) or ""
+    if config.API_KEYS and not api_key:
+        return "", _rating_error(401, "MISSING_API_KEY", "Missing API key")
+    return api_key, None
+
+
+class RatingSubmitRequest(BaseModel):
+    """``POST /v1/clips/{clip_id}/rating`` body.
+
+    Mirrors plan §"Rating submission contract". ``payload`` is a free-form
+    blob persisted as ``human_ratings.rating_payload_json``; the fields
+    we DO inspect (extracted by the endpoint):
+
+      - ``payload.validator_visible_at_rating`` (REQUIRED, bool) — anchoring
+        bias flag; unset → 422.
+      - ``payload.pair_partner_clip_id`` — REQUIRED for ``pair_chose_*``.
+      - ``payload.lr_seed`` — REQUIRED for ``pair_chose_*`` (audit-only;
+        backend logs but does not validate the value).
+
+    Tags / comment / freetext metadata flow through unchanged.
+    """
+
+    kind: str = Field(..., max_length=32)
+    value: float = Field(..., ge=-1.0, le=1.0)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class RatingPatchRequest(BaseModel):
+    """``PATCH /v1/clips/{clip_id}/rating/{rating_id}`` body.
+
+    All three fields are optional; absent fields preserve the stored
+    value. Patch creates a NEW row that supersedes the old one — see plan
+    §"Rating mutation contracts".
+    """
+
+    kind: str | None = Field(default=None, max_length=32)
+    value: float | None = Field(default=None, ge=-1.0, le=1.0)
+    payload: dict[str, Any] | None = None
+
+
+def _rating_row_to_dict(row: sqlite3.Row, *, admin: bool) -> dict[str, Any]:
+    """Serialize a ``human_ratings`` row for the audit GET endpoint.
+
+    Non-admin callers see ``rater_api_key_hash`` truncated to 8 chars per
+    plan §"Rating mutation contracts (PATCH / DELETE / GET)".
+    """
+    raw_hash = row["rater_api_key_hash"] or ""
+    payload_raw = row["rating_payload_json"]
+    try:
+        payload = _json_mod.loads(payload_raw) if payload_raw else {}
+    except Exception:
+        payload = {}
+    return {
+        "rating_id": row["rating_id"],
+        "rater_api_key_hash": raw_hash if admin else raw_hash[:8],
+        "kind": row["rating_kind"],
+        "value": row["rating_value"],
+        "payload": payload,
+        "validator_version": row["validator_version_at_rating"],
+        "validator_composite_at_rating": row["validator_composite_at_rating"],
+        "pair_id": row["pair_id"],
+        "pair_partner_clip_id": row["pair_partner_clip_id"],
+        "created_at": row["created_at"],
+        "retracted_at": row["retracted_at"],
+        "superseded_by": row["superseded_by"],
+    }
+
+
+def _insert_rating_and_pair(
+    *,
+    clip_id: str,
+    clip_row: sqlite3.Row,
+    rater_hash: str,
+    body: RatingSubmitRequest,
+    validator_visible: bool,
+    payload_json: str,
+    partner_clip_id: str | None,
+    now: float,
+    supersedes_rating_id: int | None = None,
+) -> dict[str, Any]:
+    """Insert ``human_ratings`` row + (for pair_*) staged ``preference_pairs``.
+
+    Returns the response payload (rating_id, pair_id, pair_consumed,
+    superseded_rating_id, ...). The caller is responsible for any
+    pre-checks (privacy gate, composite-NULL guard, etc.) and for
+    clearing any conflicting active row before calling.
+
+    Path C′: when ``kind ∈ {pair_chose_a, pair_chose_b}``, also INSERTs a
+    ``preference_pairs`` row with ``pending_construction_until = now +
+    86400``. The hourly construct_human_rating_pairs job re-validates 5
+    invariants before clearing the column.
+    """
+    composite = clip_row["validator_score"]
+    validator_version = clip_row["validator_version"] or config.VALIDATOR_VERSION
+
+    pair_id: int | None = None
+    pair_consumed = False
+    if body.kind in _RATING_PAIR_KINDS and partner_clip_id:
+        if body.kind == "pair_chose_a":
+            chosen, rejected = clip_id, partner_clip_id
+        else:
+            chosen, rejected = partner_clip_id, clip_id
+        pending_until = now + _RATING_PAIR_QUARANTINE_S
+        cur = history._conn.execute(
+            """INSERT OR IGNORE INTO preference_pairs
+               (chosen_clip_id, rejected_clip_id, signal_source,
+                signal_strength, validator_version, created_at,
+                pending_construction_until)
+               VALUES (?, ?, 'human_rating', ?, ?, ?, ?)""",
+            (
+                chosen,
+                rejected,
+                _RATING_SIGNAL_STRENGTH,
+                validator_version,
+                now,
+                pending_until,
+            ),
+        )
+        if cur.lastrowid:
+            pair_id = int(cur.lastrowid)
+        else:
+            existing = history._conn.execute(
+                """SELECT pair_id, used_in_training_run_id
+                   FROM preference_pairs
+                   WHERE chosen_clip_id = ? AND rejected_clip_id = ?
+                     AND signal_source = 'human_rating'""",
+                (chosen, rejected),
+            ).fetchone()
+            if existing is not None:
+                pair_id = int(existing["pair_id"])
+                if existing["used_in_training_run_id"]:
+                    pair_consumed = True
+
+    cur = history._conn.execute(
+        """INSERT INTO human_ratings
+           (clip_id, rater_api_key_hash, rating_kind, rating_value,
+            rating_payload_json, validator_version_at_rating,
+            validator_composite_at_rating, validator_visible_at_rating,
+            pair_id, pair_partner_clip_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            clip_id,
+            rater_hash,
+            body.kind,
+            body.value,
+            payload_json,
+            validator_version,
+            composite,
+            1 if validator_visible else 0,
+            pair_id,
+            partner_clip_id,
+            now,
+        ),
+    )
+    rating_id = int(cur.lastrowid)
+
+    if supersedes_rating_id is not None:
+        history._conn.execute(
+            "UPDATE human_ratings SET superseded_by = ? WHERE rating_id = ?",
+            (rating_id, supersedes_rating_id),
+        )
+
+    history._conn.commit()
+    return {
+        "rating_id": rating_id,
+        "clip_id": clip_id,
+        "kind": body.kind,
+        "value": body.value,
+        "pair_id": pair_id,
+        "pair_consumed": pair_consumed,
+        "validator_version": validator_version,
+        "validator_composite_at_rating": composite,
+        "created_at": now,
+        "superseded_rating_id": supersedes_rating_id,
+    }
+
+
+@app.post("/v1/clips/{clip_id}/rating")
+async def clip_rating_submit(clip_id: str, request: Request) -> JSONResponse:
+    """Submit a rating against a clip. Plan §"Rating submission contract".
+
+    422 on missing required fields or kind not in enum. 404 when the
+    clip doesn't exist. 409 with ``PRIVACY_GATE_BLOCKED`` when cross-
+    bearer rating is rejected, ``VALIDATOR_COMPOSITE_NULL`` when the
+    clip has no validator opinion. ``pair_chose_*`` rows write to
+    ``preference_pairs`` with ``pending_construction_until = now +
+    86400`` (Path C′).
+    """
+    api_key, deny = _bearer_or_401(request)
+    if deny is not None:
+        return deny
+    rater_hash = _sha256_key(api_key) if api_key else ""
+
+    fatigue = _check_rating_fatigue_gate(rater_hash)
+    if fatigue is not None:
+        return fatigue
+
+    try:
+        raw = await request.json()
+    except Exception:
+        return _rating_error(400, "INVALID_JSON", "JSON body required")
+    try:
+        body = RatingSubmitRequest.model_validate(raw)
+    except Exception as exc:
+        return _rating_error(422, "INVALID_BODY", str(exc))
+
+    if body.kind not in _RATING_VALID_KINDS:
+        return _rating_error(
+            422,
+            "INVALID_KIND",
+            f"kind must be one of {sorted(_RATING_VALID_KINDS)}",
+        )
+    if "validator_visible_at_rating" not in body.payload or not isinstance(
+        body.payload["validator_visible_at_rating"], bool
+    ):
+        return _rating_error(
+            422,
+            "MISSING_VALIDATOR_VISIBLE_FLAG",
+            "payload.validator_visible_at_rating is required (bool)",
+        )
+    validator_visible = bool(body.payload["validator_visible_at_rating"])
+
+    partner_clip_id: str | None = None
+    if body.kind in _RATING_PAIR_KINDS:
+        partner = body.payload.get("pair_partner_clip_id")
+        if not partner or not isinstance(partner, str):
+            return _rating_error(
+                422,
+                "MISSING_PAIR_PARTNER",
+                "payload.pair_partner_clip_id is required for pair_chose_*",
+            )
+        partner_clip_id = partner
+        if "lr_seed" not in body.payload:
+            return _rating_error(
+                422,
+                "MISSING_LR_SEED",
+                "payload.lr_seed is required for pair_chose_*",
+            )
+
+    clip_row = history._conn.execute(
+        "SELECT id, api_key_hash, validator_score, validator_version "
+        "FROM generations WHERE id = ?",
+        (clip_id,),
+    ).fetchone()
+    if clip_row is None:
+        return _rating_error(404, "CLIP_NOT_FOUND", f"clip_id {clip_id!r} not found")
+
+    if rater_hash and not _privacy_gate_allows(rater_hash, clip_row):
+        return _rating_error(
+            409,
+            "PRIVACY_GATE_BLOCKED",
+            "cross-bearer rating rejected: bearer opted out or no consent",
+        )
+
+    if clip_row["validator_score"] is None:
+        return _rating_error(
+            409,
+            "VALIDATOR_COMPOSITE_NULL",
+            "clip has no validator opinion; cannot rate against null anchor",
+        )
+
+    if partner_clip_id:
+        partner_row = history._conn.execute(
+            "SELECT id, api_key_hash FROM generations WHERE id = ?",
+            (partner_clip_id,),
+        ).fetchone()
+        if partner_row is None:
+            return _rating_error(
+                404,
+                "PARTNER_CLIP_NOT_FOUND",
+                f"pair_partner_clip_id {partner_clip_id!r} not found",
+            )
+        if rater_hash and not _privacy_gate_allows(rater_hash, partner_row):
+            return _rating_error(
+                409,
+                "PRIVACY_GATE_BLOCKED",
+                "cross-bearer rating rejected on partner clip",
+            )
+
+    payload_json = _json_mod.dumps(body.payload, separators=(",", ":"))
+    if len(payload_json.encode("utf-8")) > 64_000:
+        return _rating_error(422, "PAYLOAD_TOO_LARGE", "payload exceeds 64 KB")
+    now = time.time()
+
+    existing = history._conn.execute(
+        """SELECT rating_id, pair_id FROM human_ratings
+           WHERE rater_api_key_hash = ? AND clip_id = ? AND rating_kind = ?
+             AND retracted_at IS NULL AND superseded_by IS NULL""",
+        (rater_hash, clip_id, body.kind),
+    ).fetchone()
+
+    supersedes: int | None = None
+    if existing is not None:
+        supersedes = int(existing["rating_id"])
+        old_pair_id = existing["pair_id"]
+        if old_pair_id is not None:
+            consumed = history._conn.execute(
+                "SELECT used_in_training_run_id FROM preference_pairs "
+                "WHERE pair_id = ?",
+                (old_pair_id,),
+            ).fetchone()
+            if consumed is None or not consumed["used_in_training_run_id"]:
+                history._conn.execute(
+                    "DELETE FROM preference_pairs WHERE pair_id = ? "
+                    "AND used_in_training_run_id IS NULL",
+                    (old_pair_id,),
+                )
+        history._conn.execute(
+            "UPDATE human_ratings SET superseded_by = -1 WHERE rating_id = ?",
+            (supersedes,),
+        )
+        history._conn.commit()
+
+    try:
+        result = _insert_rating_and_pair(
+            clip_id=clip_id,
+            clip_row=clip_row,
+            rater_hash=rater_hash,
+            body=body,
+            validator_visible=validator_visible,
+            payload_json=payload_json,
+            partner_clip_id=partner_clip_id,
+            now=now,
+            supersedes_rating_id=supersedes,
+        )
+    except sqlite3.IntegrityError as exc:
+        return _rating_error(
+            409,
+            "IDEMPOTENCE_CONFLICT",
+            f"active rating already exists for this rater+clip+kind: {exc}",
+        )
+
+    return JSONResponse(content=result)
+
+
+@app.patch("/v1/clips/{clip_id}/rating/{rating_id}")
+async def clip_rating_patch(clip_id: str, rating_id: int, request: Request) -> JSONResponse:
+    """Update a rating in place. Plan §"Rating mutation contracts".
+
+    Auth: owner (rater) OR admin. Creates a NEW row that supersedes the
+    old one; the old ``rating_id`` becomes immutable history.
+    """
+    api_key, deny = _bearer_or_401(request)
+    if deny is not None:
+        return deny
+    rater_hash = _sha256_key(api_key) if api_key else ""
+
+    fatigue = _check_rating_fatigue_gate(rater_hash)
+    if fatigue is not None:
+        return fatigue
+
+    try:
+        raw = await request.json()
+    except Exception:
+        return _rating_error(400, "INVALID_JSON", "JSON body required")
+    try:
+        patch = RatingPatchRequest.model_validate(raw)
+    except Exception as exc:
+        return _rating_error(422, "INVALID_BODY", str(exc))
+
+    existing = history._conn.execute(
+        """SELECT rating_id, clip_id, rater_api_key_hash, rating_kind,
+                  rating_value, rating_payload_json,
+                  validator_visible_at_rating, pair_id, pair_partner_clip_id,
+                  retracted_at, superseded_by
+           FROM human_ratings WHERE rating_id = ?""",
+        (rating_id,),
+    ).fetchone()
+    if existing is None or existing["clip_id"] != clip_id:
+        return _rating_error(404, "RATING_NOT_FOUND", "rating_id not found")
+    if existing["retracted_at"] is not None or existing["superseded_by"] is not None:
+        return _rating_error(409, "RATING_INACTIVE", "rating already retracted or superseded")
+
+    is_admin = bool(api_key and _is_admin_api_key(api_key))
+    if not is_admin and existing["rater_api_key_hash"] != rater_hash:
+        return _rating_error(403, "NOT_OWNER", "only the rater or an admin may patch")
+
+    new_kind = patch.kind if patch.kind is not None else existing["rating_kind"]
+    new_value = patch.value if patch.value is not None else existing["rating_value"]
+    if new_kind not in _RATING_VALID_KINDS:
+        return _rating_error(
+            422,
+            "INVALID_KIND",
+            f"kind must be one of {sorted(_RATING_VALID_KINDS)}",
+        )
+
+    try:
+        old_payload = _json_mod.loads(existing["rating_payload_json"] or "{}")
+    except Exception:
+        old_payload = {}
+    if patch.payload is not None:
+        merged_payload = {**old_payload, **patch.payload}
+    else:
+        merged_payload = old_payload
+    if "validator_visible_at_rating" not in merged_payload or not isinstance(
+        merged_payload["validator_visible_at_rating"], bool
+    ):
+        return _rating_error(
+            422,
+            "MISSING_VALIDATOR_VISIBLE_FLAG",
+            "payload.validator_visible_at_rating must be present after merge",
+        )
+    validator_visible = bool(merged_payload["validator_visible_at_rating"])
+
+    partner_clip_id: str | None = existing["pair_partner_clip_id"]
+    if new_kind in _RATING_PAIR_KINDS:
+        partner = merged_payload.get("pair_partner_clip_id") or partner_clip_id
+        if not partner or not isinstance(partner, str):
+            return _rating_error(
+                422,
+                "MISSING_PAIR_PARTNER",
+                "payload.pair_partner_clip_id is required for pair_chose_*",
+            )
+        partner_clip_id = partner
+        merged_payload["pair_partner_clip_id"] = partner
+
+    clip_row = history._conn.execute(
+        "SELECT id, api_key_hash, validator_score, validator_version "
+        "FROM generations WHERE id = ?",
+        (clip_id,),
+    ).fetchone()
+    if clip_row is None:
+        return _rating_error(404, "CLIP_NOT_FOUND", f"clip_id {clip_id!r} not found")
+    if clip_row["validator_score"] is None:
+        return _rating_error(
+            409,
+            "VALIDATOR_COMPOSITE_NULL",
+            "clip has no validator opinion; cannot patch rating against null anchor",
+        )
+    if rater_hash and not _privacy_gate_allows(rater_hash, clip_row):
+        return _rating_error(
+            409,
+            "PRIVACY_GATE_BLOCKED",
+            "cross-bearer rating rejected: bearer opted out or no consent",
+        )
+
+    pair_consumed_old = False
+    old_pair_id = existing["pair_id"]
+    if old_pair_id is not None:
+        consumed = history._conn.execute(
+            "SELECT used_in_training_run_id FROM preference_pairs WHERE pair_id = ?",
+            (old_pair_id,),
+        ).fetchone()
+        if consumed and consumed["used_in_training_run_id"]:
+            pair_consumed_old = True
+        else:
+            history._conn.execute(
+                "DELETE FROM preference_pairs WHERE pair_id = ? "
+                "AND used_in_training_run_id IS NULL",
+                (old_pair_id,),
+            )
+
+    history._conn.execute(
+        "UPDATE human_ratings SET superseded_by = -1 WHERE rating_id = ?",
+        (int(existing["rating_id"]),),
+    )
+
+    now = time.time()
+    payload_json = _json_mod.dumps(merged_payload, separators=(",", ":"))
+    if len(payload_json.encode("utf-8")) > 64_000:
+        return _rating_error(422, "PAYLOAD_TOO_LARGE", "payload exceeds 64 KB")
+
+    new_body = RatingSubmitRequest(kind=new_kind, value=new_value, payload=merged_payload)
+    try:
+        result = _insert_rating_and_pair(
+            clip_id=clip_id,
+            clip_row=clip_row,
+            rater_hash=existing["rater_api_key_hash"],
+            body=new_body,
+            validator_visible=validator_visible,
+            payload_json=payload_json,
+            partner_clip_id=partner_clip_id,
+            now=now,
+            supersedes_rating_id=int(existing["rating_id"]),
+        )
+    except sqlite3.IntegrityError as exc:
+        return _rating_error(
+            409,
+            "IDEMPOTENCE_CONFLICT",
+            f"could not supersede: {exc}",
+        )
+
+    result["supersedes_rating_id"] = int(existing["rating_id"])
+    if pair_consumed_old:
+        result["pair_consumed"] = True
+    return JSONResponse(content=result)
+
+
+@app.delete("/v1/clips/{clip_id}/rating/{rating_id}")
+async def clip_rating_delete(clip_id: str, rating_id: int, request: Request) -> JSONResponse:
+    """Retract a rating. Plan §"Rating mutation contracts".
+
+    Auth: owner OR admin. Soft-deletes the ``human_ratings`` row (sets
+    ``retracted_at``) and DELETEs the corresponding ``preference_pairs``
+    row IF unconsumed. Already-consumed pairs are immutable; the rating
+    is retracted but the trained-against artifact is unchanged.
+    """
+    api_key, deny = _bearer_or_401(request)
+    if deny is not None:
+        return deny
+    rater_hash = _sha256_key(api_key) if api_key else ""
+
+    existing = history._conn.execute(
+        """SELECT rating_id, clip_id, rater_api_key_hash, pair_id,
+                  retracted_at
+           FROM human_ratings WHERE rating_id = ?""",
+        (rating_id,),
+    ).fetchone()
+    if existing is None or existing["clip_id"] != clip_id:
+        return _rating_error(404, "RATING_NOT_FOUND", "rating_id not found")
+    if existing["retracted_at"] is not None:
+        return _rating_error(409, "RATING_ALREADY_RETRACTED", "rating already retracted")
+
+    is_admin = bool(api_key and _is_admin_api_key(api_key))
+    if not is_admin and existing["rater_api_key_hash"] != rater_hash:
+        return _rating_error(403, "NOT_OWNER", "only the rater or an admin may retract")
+
+    now = time.time()
+    pair_deleted = False
+    pair_id = existing["pair_id"]
+    if pair_id is not None:
+        consumed = history._conn.execute(
+            "SELECT used_in_training_run_id FROM preference_pairs WHERE pair_id = ?",
+            (pair_id,),
+        ).fetchone()
+        if consumed and not consumed["used_in_training_run_id"]:
+            history._conn.execute(
+                "DELETE FROM preference_pairs WHERE pair_id = ? "
+                "AND used_in_training_run_id IS NULL",
+                (pair_id,),
+            )
+            pair_deleted = True
+
+    history._conn.execute(
+        "UPDATE human_ratings SET retracted_at = ? WHERE rating_id = ?",
+        (now, rating_id),
+    )
+    history._conn.commit()
+    return JSONResponse(content={
+        "rating_id": rating_id,
+        "retracted_at": now,
+        "preference_pair_deleted": pair_deleted,
+        "pair_id": pair_id,
+    })
+
+
+@app.get("/v1/clips/{clip_id}/ratings")
+async def clip_ratings_list(clip_id: str, request: Request) -> JSONResponse:
+    """List ratings for a clip. Plan §"Rating mutation contracts".
+
+    Auth: clip's bearer OR rater OR admin. Non-admin sees rater hash
+    truncated to 8 chars. Admin sees full hashes.
+    """
+    api_key, deny = _bearer_or_401(request)
+    if deny is not None:
+        return deny
+    caller_hash = _sha256_key(api_key) if api_key else ""
+
+    clip_row = history._conn.execute(
+        "SELECT id, api_key_hash FROM generations WHERE id = ?",
+        (clip_id,),
+    ).fetchone()
+    if clip_row is None:
+        return _rating_error(404, "CLIP_NOT_FOUND", f"clip_id {clip_id!r} not found")
+
+    is_admin = bool(api_key and _is_admin_api_key(api_key))
+    is_clip_bearer = clip_row["api_key_hash"] == caller_hash
+    has_any_rating = False
+    if api_key:
+        has_any_rating_row = history._conn.execute(
+            "SELECT 1 FROM human_ratings WHERE clip_id = ? "
+            "AND rater_api_key_hash = ? LIMIT 1",
+            (clip_id, caller_hash),
+        ).fetchone()
+        has_any_rating = has_any_rating_row is not None
+    if config.API_KEYS and not (is_admin or is_clip_bearer or has_any_rating):
+        return _rating_error(
+            403,
+            "NOT_AUTHORIZED",
+            "only the clip's bearer, a rater, or an admin may read ratings",
+        )
+
+    rows = history._conn.execute(
+        """SELECT rating_id, rater_api_key_hash, rating_kind, rating_value,
+                  rating_payload_json, validator_version_at_rating,
+                  validator_composite_at_rating, validator_visible_at_rating,
+                  pair_id, pair_partner_clip_id, superseded_by, created_at,
+                  retracted_at
+           FROM human_ratings WHERE clip_id = ?
+           ORDER BY created_at ASC, rating_id ASC""",
+        (clip_id,),
+    ).fetchall()
+    return JSONResponse(content={
+        "clip_id": clip_id,
+        "ratings": [_rating_row_to_dict(r, admin=is_admin) for r in rows],
+    })
+
+
+def _decode_queue_cursor(cursor: str | None) -> str | None:
+    if not cursor:
+        return None
+    try:
+        import base64
+        return base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _encode_queue_cursor(clip_id: str) -> str:
+    import base64
+    return base64.urlsafe_b64encode(clip_id.encode("utf-8")).decode("ascii")
+
+
+@app.get("/v1/ratings/queue")
+async def ratings_queue(request: Request) -> JSONResponse:
+    """Active-learning queue. Plan §"Active-learning queue contract".
+
+    Returns borderline-composite clips (0.45 ≤ composite ≤ 0.65) the
+    caller hasn't yet rated, ordered by ``ABS(composite - 0.55) ASC``
+    with ``clip_id`` as stable tiebreaker for cursor pagination. Default
+    limit 20, max 50.
+    """
+    api_key, deny = _bearer_or_401(request)
+    if deny is not None:
+        return deny
+    caller_hash = _sha256_key(api_key) if api_key else ""
+
+    qp = request.query_params
+    try:
+        limit = int(qp.get("limit", "20"))
+    except ValueError:
+        return _rating_error(422, "INVALID_LIMIT", "limit must be an integer")
+    if limit < 1:
+        limit = 1
+    if limit > 50:
+        limit = 50
+    cursor = _decode_queue_cursor(qp.get("cursor"))
+
+    # Safety Gap-E (P0-2c): cohort-diversity stratification. Pull a
+    # superset ordered by distance + cohort-novelty (a recent-cohort
+    # LEFT JOIN flags each row), then merge in Python so the page
+    # holds ≥ceil(min_diversity * limit) novel-cohort clips when any
+    # are available. Falls back gracefully when the corpus is too
+    # cohort-thin to satisfy the quota.
+    recent_cohorts_subquery = (
+        "(SELECT g2.shot_config_key AS sck FROM human_ratings hr "
+        "    JOIN generations g2 ON g2.id = hr.clip_id "
+        "    WHERE hr.rater_api_key_hash = ? "
+        "      AND hr.retracted_at IS NULL "
+        "      AND hr.superseded_by IS NULL "
+        "      AND g2.shot_config_key IS NOT NULL "
+        "    GROUP BY g2.shot_config_key "
+        "    ORDER BY MAX(hr.created_at) DESC "
+        "    LIMIT ?)"
+    )
+    sql = (
+        "SELECT g.id, g.validator_score, g.validator_version, "
+        "       g.shot_config_key, "
+        "       CASE WHEN g.shot_config_key IS NULL "
+        "            OR g.shot_config_key NOT IN " + recent_cohorts_subquery + " "
+        "            THEN 1 ELSE 0 END AS is_novel_cohort "
+        "FROM generations g "
+        "WHERE g.validator_score IS NOT NULL "
+        "  AND g.validator_score >= ? AND g.validator_score <= ? "
+        "  AND NOT EXISTS ( "
+        "    SELECT 1 FROM human_ratings h "
+        "    WHERE h.clip_id = g.id AND h.rater_api_key_hash = ? "
+        "      AND h.retracted_at IS NULL AND h.superseded_by IS NULL "
+        "  ) "
+    )
+    params: list[Any] = [
+        caller_hash,
+        _RATING_QUEUE_RECENT_COHORT_WINDOW,
+        _RATING_QUEUE_RETAKE,
+        _RATING_QUEUE_PASS,
+        caller_hash,
+    ]
+    if cursor is not None:
+        sql += "  AND g.id > ? "
+        params.append(cursor)
+    # Oversample so the diversity merge has enough candidates of each
+    # bucket to satisfy the quota. 4x covers worst-case
+    # cohort-monoculture without unbounded blow-up.
+    overscan = max(limit * 4, limit + 1)
+    sql += (
+        "ORDER BY ABS(g.validator_score - ?) ASC, g.id ASC "
+        "LIMIT ?"
+    )
+    params.append(_RATING_QUEUE_CENTER)
+    params.append(overscan)
+
+    rows = history._conn.execute(sql, params).fetchall()
+
+    novel_quota = math.ceil(_RATING_QUEUE_MIN_COHORT_DIVERSITY * limit)
+    novel_rows = [r for r in rows if r["is_novel_cohort"] == 1]
+    seen_rows = [r for r in rows if r["is_novel_cohort"] == 0]
+    selected: list[Any] = []
+    seen_ids: set[str] = set()
+    # Phase 1: take up to ``novel_quota`` from novel_rows preserving
+    # their distance order.
+    for r in novel_rows:
+        if len(selected) >= novel_quota:
+            break
+        if r["id"] in seen_ids:
+            continue
+        selected.append(r)
+        seen_ids.add(r["id"])
+    # Phase 2: backfill from the merged stream (distance-ordered)
+    # until we hit ``limit``. ``rows`` is already distance-ordered, so
+    # iterating it preserves the user-visible "closest to band-center
+    # first" guarantee for the non-quota slots.
+    for r in rows:
+        if len(selected) >= limit:
+            break
+        if r["id"] in seen_ids:
+            continue
+        selected.append(r)
+        seen_ids.add(r["id"])
+    # Phase 3: if we under-filled the quota (corpus is cohort-thin),
+    # we still serve whatever we have — never zero results.
+    items = []
+    for row in selected:
+        items.append({
+            "clip_id": row["id"],
+            "validator_composite": row["validator_score"],
+            "validator_version": row["validator_version"],
+            "shot_config_key": row["shot_config_key"],
+            "thumbnail_uri": f"/v2/history/{row['id']}/thumbnail",
+        })
+    next_cursor = None
+    if len(rows) > len(selected) and items:
+        next_cursor = _encode_queue_cursor(items[-1]["clip_id"])
+
+    total_borderline_row = history._conn.execute(
+        """SELECT COUNT(*) AS c FROM generations g
+           WHERE g.validator_score IS NOT NULL
+             AND g.validator_score >= ? AND g.validator_score <= ?
+             AND NOT EXISTS (
+               SELECT 1 FROM human_ratings h
+               WHERE h.clip_id = g.id AND h.rater_api_key_hash = ?
+                 AND h.retracted_at IS NULL AND h.superseded_by IS NULL
+             )""",
+        (_RATING_QUEUE_RETAKE, _RATING_QUEUE_PASS, caller_hash),
+    ).fetchone()
+    total_borderline = int(total_borderline_row["c"]) if total_borderline_row else 0
+
+    return JSONResponse(content={
+        "items": items,
+        "next_cursor": next_cursor,
+        "total_borderline": total_borderline,
     })
 
 
@@ -4903,6 +6203,10 @@ async def _dispatch_validator(job: Job) -> None:
                 motion_intent = row["motion_intent"] if hasattr(row, "keys") else row[0]
         except Exception:
             logger.warning("validator dispatch: motion_intent lookup failed for %s", job.id, exc_info=True)
+        # v1.19.0+ L1: per-bearer threshold overrides — read from
+        # api_key_metadata so the operator's tightened pass/retake bar
+        # influences passive dispatch from the next clip onward.
+        pass_o, retake_o = _lookup_validator_threshold_overrides(job.api_key or "")
         payload = await run_all_tiers(
             video_uri=job.result_uri,
             video_path=str(path),
@@ -4910,6 +6214,8 @@ async def _dispatch_validator(job: Job) -> None:
             chat=chat,
             history=history,
             motion_intent=motion_intent,
+            pass_threshold=pass_o,
+            retake_threshold=retake_o,
         )
         # Update the history row with the score so /v2/history shows it.
         try:
@@ -6065,6 +7371,11 @@ async def v2_analyze_motion(body: AnalyzeMotionRequest, request: Request) -> JSO
 
     try:
         from validator import run_all_tiers
+        # v1.19.0+ L1: per-bearer threshold overrides apply to synchronous
+        # validator runs too, so the manual /v2/video/analyze-motion path
+        # produces recommendations consistent with passive dispatch.
+        api_key = _extract_api_key(request) or ""
+        pass_o, retake_o = _lookup_validator_threshold_overrides(api_key)
         payload = await run_all_tiers(
             video_uri=body.video_uri,
             video_path=str(video_path),
@@ -6074,6 +7385,8 @@ async def v2_analyze_motion(body: AnalyzeMotionRequest, request: Request) -> JSO
             history=history,
             validator_version=body.validator_version,
             tiers=body.tiers,
+            pass_threshold=pass_o,
+            retake_threshold=retake_o,
         )
         return JSONResponse(content=payload)
     except Exception as exc:
@@ -6116,6 +7429,12 @@ _RATE_LIMITED_PATH_PREFIXES = (
     "/v1/system/bearers",
     "/v1/system/sidecars",
     "/v1/system/storage",
+    # Phase 1 (schema v7) — human-rating endpoints. /v1/clips/ catches both
+    # POST/PATCH/DELETE on /v1/clips/{id}/rating[/rid] and the GET
+    # /v1/clips/{id}/ratings audit list. The active-learning queue is
+    # rate-limited the same way.
+    "/v1/clips/",
+    "/v1/ratings/queue",
 )
 
 
@@ -6229,6 +7548,14 @@ class RecommendLorasRequest(BaseModel):
     motion_intent: str | None = Field(default=None, max_length=200)
     k: int = Field(default=3, ge=1, le=10)
     min_validator_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    # v1.19.0+ L1: client-managed per-LoRA boost map (rating-driven; sticky
+    # within the operator's session). Each entry is clamped to ±0.10
+    # server-side before being added to the rank score; backend stores no
+    # state about this map across requests.
+    session_boosts: dict[str, float] | None = Field(default=None)
+
+
+SESSION_BOOST_CAP = 0.10
 
 
 class BulkRevalidateRequest(BaseModel):
@@ -6466,6 +7793,19 @@ async def v2_embeddings_recommend_loras(
             no_lora["sum"] / no_lora["count"] if no_lora and no_lora["count"] else 0.0
         )
 
+        # v1.19.0+ L1 session_boosts (optional). Clamped per-LoRA to
+        # ±SESSION_BOOST_CAP before being added to rank_score. Applied
+        # AFTER the existing 0.7·mean + 0.3·boost ranking and BEFORE the
+        # top-k slice. Backend stores nothing about the boost map.
+        boosts: dict[str, float] = {}
+        if body.session_boosts:
+            for lid, raw in body.session_boosts.items():
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                boosts[lid] = max(-SESSION_BOOST_CAP, min(SESSION_BOOST_CAP, v))
+
         recs = []
         for lid, agg in per_lora.items():
             if lid is None:
@@ -6474,13 +7814,16 @@ async def v2_embeddings_recommend_loras(
             mean_strength = agg["sum_strength"] / agg["count"]
             expected_boost = mean_score - no_lora_mean
             rank = 0.7 * mean_score + 0.3 * max(0.0, expected_boost)
+            session_boost = boosts.get(lid, 0.0)
+            rank_with_boost = rank + session_boost
             recs.append({
                 "lora_id": lid,
                 "mean_validator_score": round(mean_score, 4),
                 "sample_count": agg["count"],
                 "mean_strength": round(mean_strength, 3),
                 "expected_boost": round(expected_boost, 4),
-                "rank_score": round(rank, 4),
+                "session_boost": round(session_boost, 4),
+                "rank_score": round(rank_with_boost, 4),
             })
         recs.sort(key=lambda r: r["rank_score"], reverse=True)
         recs = recs[: body.k]
@@ -6572,12 +7915,22 @@ async def v2_system_bulk_revalidate(
 
 
 @app.get("/v2/history")
-async def v2_history(request: Request, limit: int = 50, offset: int = 0, type: str | None = None) -> JSONResponse:
+async def v2_history(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    type: str | None = None,
+    inline_thumbs: int = 0,
+) -> JSONResponse:
     api_key = _extract_api_key(request)
     if not api_key:
         return _error(401, "Missing API key")
     items = history.list(api_key, limit=min(limit, 200), offset=offset, job_type=type)
     results = []
+    # When inline_thumbs=1, embed each row's thumbnail JPEG bytes as base64 in
+    # the response. Eliminates one round-trip per tile through CF tunnel —
+    # for a 100-row page that's ~700ms saved on slow links.
+    inline = bool(inline_thumbs)
     for item in items:
         r = {
             "id": item["id"],
@@ -6592,6 +7945,17 @@ async def v2_history(request: Request, limit: int = 50, offset: int = 0, type: s
         }
         if item["thumbnail_uri"]:
             r["thumbnail_url"] = f"/v2/history/{item['id']}/thumbnail"
+            if inline:
+                try:
+                    thumb_id = item["thumbnail_uri"].removeprefix("thumb://")
+                    path = config.THUMBNAIL_DIR / thumb_id
+                    if path.exists():
+                        # Cap at ~32KB per thumb so a runaway file can't bloat
+                        # the response. Q70 JPEGs are typically 5-12KB.
+                        data = path.read_bytes()[:32_768]
+                        r["thumbnail_b64"] = base64.b64encode(data).decode("ascii")
+                except OSError:
+                    pass  # silently fall back to thumbnail_url
         if item["result_uri"]:
             r["image_url"] = f"/v2/history/{item['id']}/image"
         results.append(r)
@@ -7662,6 +9026,588 @@ async def v2_compositions_export(comp_id: str, request: Request) -> JSONResponse
     except Exception:
         logger.warning("composition_clips lineage write failed for %s", comp_id, exc_info=True)
     return _submit_job(JobType.EXPORT_COMPOSITION, params, request)
+
+
+# ---------------------------------------------------------------------------
+# v1.19.0 Phase 1 / L2.5 — exemplar set + LoRA build endpoints
+#
+# Operator workflow: stars 20-30 exemplar clips → kicks off
+# `scripts/build_lora_from_exemplars.py` → registered as candidate in
+# `lora_registry`. See plan §"L2.5 — operator-curated exemplar LoRA
+# fine-tune" for the full design.
+# ---------------------------------------------------------------------------
+
+
+_EXEMPLAR_SET_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+_EXEMPLAR_DEFAULT_MAX_MEMBERS = 200
+_EXEMPLAR_BUILD_MIN_MEMBERS = 20
+
+
+class ExemplarSetCreate(BaseModel):
+    set_id: str = Field(min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=500)
+    max_members: int | None = Field(default=None, ge=1, le=10000)
+
+
+class ExemplarMemberAdd(BaseModel):
+    clip_id: str = Field(min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ExemplarBuildRequest(BaseModel):
+    rank: int | None = Field(default=None, ge=4, le=256)
+    learning_rate: float | None = Field(default=None, gt=0, le=1.0)
+    steps: int | None = Field(default=None, ge=100, le=20000)
+    base_model: str | None = Field(default=None, max_length=500)
+    dry_run: bool = True
+
+
+def _exemplar_owner_hash(set_id: str) -> str | None:
+    row = history._conn.execute(
+        "SELECT rater_api_key_hash FROM exemplar_sets WHERE set_id = ?",
+        (set_id,),
+    ).fetchone()
+    return row["rater_api_key_hash"] if row else None
+
+
+def _require_exemplar_owner(
+    set_id: str, request: Request
+) -> tuple[str, str] | JSONResponse:
+    """Bearer must own the set OR be admin. Returns (api_key, owner_hash)
+    on success, JSONResponse on denial.
+    """
+    if not config.API_KEYS:
+        owner = _exemplar_owner_hash(set_id)
+        if owner is None:
+            return _error(404, "exemplar_set_not_found", "EXEMPLAR_SET_NOT_FOUND")
+        return ("", owner)
+    api_key = _extract_api_key(request) or ""
+    if not api_key:
+        return _error(401, "missing_api_key")
+    owner = _exemplar_owner_hash(set_id)
+    if owner is None:
+        return _error(404, "exemplar_set_not_found", "EXEMPLAR_SET_NOT_FOUND")
+    from history_store import _hash_key
+    caller_hash = _hash_key(api_key)
+    if caller_hash != owner and not _is_admin_api_key(api_key):
+        return _error(403, "exemplar_set_not_owned", "EXEMPLAR_OWNER_REQUIRED")
+    return (api_key, owner)
+
+
+def _bearer_has_clip_access(api_key: str, clip_id: str) -> tuple[bool, str | None]:
+    """Privacy gate for exemplar membership.
+
+    Mirrors the L3 rating-write privacy gate so an exemplar set cannot
+    be used as an exfiltration sidecar around the consent flag.
+    """
+    row = history._conn.execute(
+        "SELECT api_key_hash FROM generations WHERE id = ?",
+        (clip_id,),
+    ).fetchone()
+    if row is None:
+        return (False, "clip_not_found")
+    clip_hash = row["api_key_hash"]
+    if not config.API_KEYS:
+        return (True, None)
+    from history_store import _hash_key
+    if _hash_key(api_key) == clip_hash:
+        return (True, None)
+    consent_row = history._conn.execute(
+        "SELECT cross_bearer_rating_consent_at FROM api_key_metadata "
+        "WHERE api_key_hash = ?",
+        (clip_hash,),
+    ).fetchone()
+    if consent_row and consent_row["cross_bearer_rating_consent_at"] is not None:
+        return (True, None)
+    return (False, "cross_bearer_consent_required")
+
+
+def _exemplar_summary_row(row: Any) -> dict[str, Any]:
+    return {
+        "set_id": row["set_id"],
+        "description": row["description"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "last_built_lora_id": row["last_built_lora_id"],
+        "last_built_at": row["last_built_at"],
+        "max_members": row["max_members"],
+    }
+
+
+@app.post("/v1/exemplar-sets")
+async def exemplar_sets_create(body: ExemplarSetCreate, request: Request) -> JSONResponse:
+    """Create a named exemplar set. Idempotent on (set_id, owner)."""
+    if not _EXEMPLAR_SET_ID_RE.match(body.set_id):
+        return _error(
+            422,
+            "set_id must be alphanumeric with - or _ (1-64 chars, leading alnum)",
+        )
+    api_key = _extract_api_key(request)
+    if config.API_KEYS and not api_key:
+        return _error(401, "missing_api_key")
+    from history_store import _hash_key
+    owner_hash = _hash_key(api_key) if api_key else ""
+    now = time.time()
+    existing = history._conn.execute(
+        "SELECT * FROM exemplar_sets WHERE set_id = ?", (body.set_id,),
+    ).fetchone()
+    if existing is not None:
+        if config.API_KEYS and existing["rater_api_key_hash"] != owner_hash:
+            return _error(409, "set_id_taken_by_other_bearer")
+        return JSONResponse(
+            content={**_exemplar_summary_row(existing), "created": False},
+            status_code=200,
+        )
+    max_m = body.max_members or _EXEMPLAR_DEFAULT_MAX_MEMBERS
+    history._conn.execute(
+        """INSERT INTO exemplar_sets
+           (set_id, rater_api_key_hash, description,
+            created_at, updated_at, max_members)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (body.set_id, owner_hash, body.description, now, now, max_m),
+    )
+    history._conn.commit()
+    row = history._conn.execute(
+        "SELECT * FROM exemplar_sets WHERE set_id = ?", (body.set_id,),
+    ).fetchone()
+    return JSONResponse(
+        content={**_exemplar_summary_row(row), "created": True, "member_count": 0},
+        status_code=201,
+    )
+
+
+@app.get("/v1/exemplar-sets")
+async def exemplar_sets_list(request: Request) -> JSONResponse:
+    """List the caller's exemplar sets with member counts."""
+    api_key = _extract_api_key(request)
+    if config.API_KEYS and not api_key:
+        return _error(401, "missing_api_key")
+    from history_store import _hash_key
+    owner_hash = _hash_key(api_key) if api_key else ""
+    if not config.API_KEYS:
+        rows = history._conn.execute(
+            "SELECT * FROM exemplar_sets ORDER BY updated_at DESC"
+        ).fetchall()
+    else:
+        rows = history._conn.execute(
+            "SELECT * FROM exemplar_sets WHERE rater_api_key_hash = ? "
+            "ORDER BY updated_at DESC",
+            (owner_hash,),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        cnt = history._conn.execute(
+            "SELECT COUNT(*) AS n FROM exemplar_set_members WHERE set_id = ?",
+            (row["set_id"],),
+        ).fetchone()
+        out.append({
+            **_exemplar_summary_row(row),
+            "member_count": int(cnt["n"]) if cnt else 0,
+        })
+    return JSONResponse(content={"sets": out})
+
+
+@app.get("/v1/exemplar-sets/{set_id}")
+async def exemplar_set_detail(set_id: str, request: Request) -> JSONResponse:
+    auth = _require_exemplar_owner(set_id, request)
+    if isinstance(auth, JSONResponse):
+        return auth
+    set_row = history._conn.execute(
+        "SELECT * FROM exemplar_sets WHERE set_id = ?", (set_id,),
+    ).fetchone()
+    if set_row is None:
+        return _error(404, "exemplar_set_not_found", "EXEMPLAR_SET_NOT_FOUND")
+    member_rows = history._conn.execute(
+        """SELECT m.clip_id, m.added_at, m.note,
+                  g.prompt, g.result_uri, g.validator_score
+           FROM exemplar_set_members m
+           LEFT JOIN generations g ON g.id = m.clip_id
+           WHERE m.set_id = ?
+           ORDER BY m.added_at""",
+        (set_id,),
+    ).fetchall()
+    members = [
+        {
+            "clip_id": r["clip_id"],
+            "added_at": r["added_at"],
+            "note": r["note"],
+            "prompt": r["prompt"],
+            "result_uri": r["result_uri"],
+            "validator_score": r["validator_score"],
+        }
+        for r in member_rows
+    ]
+    return JSONResponse(content={
+        **_exemplar_summary_row(set_row),
+        "member_count": len(members),
+        "members": members,
+    })
+
+
+@app.post("/v1/exemplar-sets/{set_id}/members")
+async def exemplar_set_member_add(
+    set_id: str, body: ExemplarMemberAdd, request: Request
+) -> JSONResponse:
+    auth = _require_exemplar_owner(set_id, request)
+    if isinstance(auth, JSONResponse):
+        return auth
+    api_key, _owner_hash = auth
+    set_row = history._conn.execute(
+        "SELECT max_members FROM exemplar_sets WHERE set_id = ?", (set_id,),
+    ).fetchone()
+    if set_row is None:
+        return _error(404, "exemplar_set_not_found", "EXEMPLAR_SET_NOT_FOUND")
+    cnt_row = history._conn.execute(
+        "SELECT COUNT(*) AS n FROM exemplar_set_members WHERE set_id = ?",
+        (set_id,),
+    ).fetchone()
+    cnt = int(cnt_row["n"]) if cnt_row else 0
+    if cnt >= int(set_row["max_members"]):
+        return _error(
+            422,
+            f"EXEMPLAR_SET_FULL: {cnt}/{set_row['max_members']} members",
+            "EXEMPLAR_SET_FULL",
+        )
+    if config.API_KEYS:
+        ok, reason = _bearer_has_clip_access(api_key, body.clip_id)
+        if not ok:
+            if reason == "clip_not_found":
+                return _error(404, "clip_not_found", "CLIP_NOT_FOUND")
+            return _error(403, reason or "clip_access_denied", "EXEMPLAR_ACCESS_DENIED")
+    now = time.time()
+    try:
+        history._conn.execute(
+            """INSERT INTO exemplar_set_members
+               (set_id, clip_id, added_at, note)
+               VALUES (?, ?, ?, ?)""",
+            (set_id, body.clip_id, now, body.note),
+        )
+        history._conn.execute(
+            "UPDATE exemplar_sets SET updated_at = ? WHERE set_id = ?",
+            (now, set_id),
+        )
+        history._conn.commit()
+    except sqlite3.IntegrityError:
+        return _error(409, "clip_already_in_set", "CLIP_ALREADY_IN_SET")
+    return JSONResponse(
+        content={"set_id": set_id, "clip_id": body.clip_id, "added_at": now},
+        status_code=201,
+    )
+
+
+@app.delete("/v1/exemplar-sets/{set_id}/members/{clip_id}")
+async def exemplar_set_member_remove(
+    set_id: str, clip_id: str, request: Request
+) -> JSONResponse:
+    auth = _require_exemplar_owner(set_id, request)
+    if isinstance(auth, JSONResponse):
+        return auth
+    cur = history._conn.execute(
+        "DELETE FROM exemplar_set_members WHERE set_id = ? AND clip_id = ?",
+        (set_id, clip_id),
+    )
+    history._conn.execute(
+        "UPDATE exemplar_sets SET updated_at = ? WHERE set_id = ?",
+        (time.time(), set_id),
+    )
+    history._conn.commit()
+    if cur.rowcount == 0:
+        return _error(404, "member_not_found", "CLIP_NOT_IN_SET")
+    return JSONResponse(content={"set_id": set_id, "clip_id": clip_id, "removed": True})
+
+
+# Registry of in-flight LoRA build subprocesses keyed by run_id. The
+# value is the live ``subprocess.Popen`` (or test-mock equivalent) so
+# the cancel endpoint can SIGTERM it. A 10-15h build cannot block the
+# ASGI worker — the build endpoint spawns the orchestrator out-of-band
+# and a small asyncio task monitors the PID and flips
+# ``training_runs.status`` on exit.
+_lora_build_processes: dict[str, Any] = {}
+
+
+def _spawn_lora_build_subprocess(
+    *, run_id: str, set_id: str, cfg_path: Path, overrides: dict[str, Any],
+) -> Any:
+    """Spawn the build orchestrator out-of-band.
+
+    Isolated for test mocking — patching this lets us simulate a fast
+    exit (success / non-zero / SIGTERM) without consuming a GPU.
+    """
+    args: list[str] = [
+        sys.executable,
+        str(Path(__file__).parent / "scripts" / "build_lora_from_exemplars.py"),
+        "--set-id", set_id,
+        "--run-id", run_id,
+        "--config", str(cfg_path),
+        "--execute",
+    ]
+    if overrides.get("rank") is not None:
+        args += ["--rank", str(overrides["rank"])]
+    if overrides.get("steps") is not None:
+        args += ["--steps", str(overrides["steps"])]
+    if overrides.get("learning_rate") is not None:
+        args += ["--lr", str(overrides["learning_rate"])]
+    if overrides.get("base_model_path") is not None:
+        args += ["--base-model", str(overrides["base_model_path"])]
+    log_path = Path(__file__).parent / "training_runs" / run_id / "build.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = log_path.open("ab")
+    return subprocess.Popen(
+        args, stdout=log_fh, stderr=subprocess.STDOUT, close_fds=True,
+    )
+
+
+async def _monitor_lora_build_subprocess(
+    *, run_id: str, proc: Any, history_ref: Any,
+) -> None:
+    """Watch the build subprocess and flip ``training_runs.status`` on exit.
+
+    Runs in the event loop as a fire-and-forget task. Polls
+    ``proc.poll()`` once a second to avoid blocking the loop. On exit:
+
+      - returncode == 0 → status='completed'
+      - 143 / -15 (SIGTERM) → status='cancelled'
+      - otherwise → status='failed'
+
+    The status UPDATE is conditional on the row still being in
+    ``running``, so the script's own terminal write (insert_training_run
+    on success, _on_sigterm on cancel) is never clobbered.
+
+    Registry cleanup happens only after a successful exit observation —
+    NOT in a finally clause — because task cancellation (e.g. an event
+    loop tearing down with an unfinished build still running) must
+    leave the entry intact so a follow-up cancel POST still has a PID
+    to SIGTERM.
+    """
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        await asyncio.sleep(1.0)
+    if rc == 0:
+        new_status = "completed"
+    elif rc in (143, -15):
+        new_status = "cancelled"
+    else:
+        new_status = "failed"
+    try:
+        row = history_ref._conn.execute(
+            "SELECT status FROM training_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is not None and row["status"] == "running":
+            history_ref._conn.execute(
+                "UPDATE training_runs SET status = ? WHERE run_id = ?",
+                (new_status, run_id),
+            )
+            history_ref._conn.commit()
+    except Exception:
+        logger.warning(
+            "lora-build monitor: status flip failed for %s", run_id, exc_info=True,
+        )
+    logger.info("lora-build %s exited rc=%s status=%s", run_id, rc, new_status)
+    _lora_build_processes.pop(run_id, None)
+
+
+@app.post("/v1/exemplar-sets/{set_id}/build-lora")
+async def exemplar_build_lora(
+    set_id: str, body: ExemplarBuildRequest, request: Request
+) -> JSONResponse:
+    """Kick off an exemplar LoRA build.
+
+    Owner-bearer can dry-run; the real ``--execute`` path is admin-gated
+    because a real run consumes ~10-15 GPU-hours. Real runs return 202
+    immediately — the build runs in a detached subprocess and
+    ``training_runs.status`` is the source of truth (poll via
+    ``GET /v1/exemplar-sets/{set_id}/builds``).
+    """
+    auth = _require_exemplar_owner(set_id, request)
+    if isinstance(auth, JSONResponse):
+        return auth
+    real_run = not body.dry_run
+    if real_run:
+        deny = _require_admin(request)
+        if deny is not None:
+            return deny
+
+    import sys as _sys
+    scripts_dir = str(Path(__file__).parent / "scripts")
+    _sys.path.insert(0, scripts_dir)
+    try:
+        import build_lora_from_exemplars as builder  # type: ignore
+    finally:
+        try:
+            _sys.path.remove(scripts_dir)
+        except ValueError:
+            pass
+
+    cfg_path = Path(__file__).parent / "configs" / "exemplar_lora.yaml"
+    if not cfg_path.exists():
+        return _error(500, "exemplar_lora_config_missing")
+
+    overrides = {
+        "rank": body.rank,
+        "steps": body.steps,
+        "learning_rate": body.learning_rate,
+        "base_model_path": body.base_model,
+    }
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+
+    cfg = builder.load_config(cfg_path, set_id=set_id, overrides=overrides)
+
+    # Always run the dry-run path first: it validates the dataset, hard-
+    # links exemplar mp4s into the run dir, and renders the trainer
+    # YAML. Cheap (no GPU) and gives us the exact summary for the 202.
+    summary = builder.run_build(
+        set_id=set_id,
+        cfg=cfg,
+        dry_run=True,
+        history=history,
+        min_members=_EXEMPLAR_BUILD_MIN_MEMBERS,
+    )
+    if "error" in summary and summary["error"] == "insufficient_exemplars":
+        return JSONResponse(content=summary, status_code=422)
+
+    if not real_run:
+        summary["scheduled_for"] = None
+        return JSONResponse(content=summary, status_code=200)
+
+    # Real run: insert ``training_runs.status='running'`` so /builds
+    # reflects the in-flight build, spawn the orchestrator out-of-band,
+    # and return 202. A monitor task flips the status when the
+    # subprocess exits.
+    dataset_snapshot_path = Path(summary.get("dataset_snapshot_path") or "")
+    code_sha = builder.get_git_sha()
+    try:
+        builder.insert_training_run(
+            history, cfg=cfg, num_clips=summary["num_exemplar_clips"],
+            dataset_snapshot_path=dataset_snapshot_path,
+            code_sha=code_sha,
+            validator_version=config.VALIDATOR_VERSION,
+            status="running",
+        )
+    except Exception:
+        logger.exception("exemplar build: insert_training_run failed")
+        return _error(500, "training_run_insert_failed")
+
+    try:
+        proc = _spawn_lora_build_subprocess(
+            run_id=cfg.run_id, set_id=set_id, cfg_path=cfg_path,
+            overrides=overrides,
+        )
+    except Exception:
+        logger.exception("exemplar build: subprocess spawn failed")
+        try:
+            history._conn.execute(
+                "UPDATE training_runs SET status = 'failed' WHERE run_id = ?",
+                (cfg.run_id,),
+            )
+            history._conn.commit()
+        except Exception:
+            logger.warning("failed to flip status to failed after spawn error")
+        return _error(500, "lora_build_spawn_failed")
+
+    _lora_build_processes[cfg.run_id] = proc
+    asyncio.create_task(
+        _monitor_lora_build_subprocess(
+            run_id=cfg.run_id, proc=proc, history_ref=history,
+        ),
+        name=f"lora-build-monitor-{cfg.run_id}",
+    )
+
+    summary["scheduled_for"] = time.time()
+    summary["status"] = "running"
+    return JSONResponse(content=summary, status_code=202)
+
+
+@app.get("/v1/exemplar-sets/{set_id}/builds")
+async def exemplar_set_builds(set_id: str, request: Request) -> JSONResponse:
+    auth = _require_exemplar_owner(set_id, request)
+    if isinstance(auth, JSONResponse):
+        return auth
+    rows = history._conn.execute(
+        """SELECT run_id, base_model, base_model_sha, lora_output_path,
+                  num_pairs, val_loss, eval_metrics_json, trained_at,
+                  training_seed, hyperparams_json, dataset_snapshot_path,
+                  code_sha, validator_version_at_train, status,
+                  deployed_at, deprecated_at
+           FROM training_runs
+           WHERE run_id LIKE ?
+           ORDER BY trained_at DESC""",
+        (f"exemplar-{set_id}-%",),
+    ).fetchall()
+    builds = [
+        {
+            "run_id": r["run_id"],
+            "status": r["status"],
+            "trained_at": r["trained_at"],
+            "num_clips": r["num_pairs"],
+            "training_seed": r["training_seed"],
+            "code_sha": r["code_sha"],
+            "validator_version_at_train": r["validator_version_at_train"],
+            "lora_output_path": r["lora_output_path"],
+            "deployed_at": r["deployed_at"],
+            "deprecated_at": r["deprecated_at"],
+        }
+        for r in rows
+    ]
+    return JSONResponse(content={"set_id": set_id, "builds": builds})
+
+
+@app.post("/v1/exemplar-sets/{set_id}/build/{run_id}/cancel")
+async def exemplar_set_build_cancel(
+    set_id: str, run_id: str, request: Request
+) -> JSONResponse:
+    """Cancel a running exemplar build. Admin-gated.
+
+    SIGTERMs the registered subprocess (if any), sets
+    ``training_runs.status='cancelled'``, and best-effort cleans the
+    temp dataset dir under ``training_runs/<run_id>/``. The DB row
+    itself is preserved as audit.
+    """
+    deny = _require_admin(request)
+    if deny is not None:
+        return deny
+    row = history._conn.execute(
+        "SELECT run_id, status FROM training_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return _error(404, "training_run_not_found")
+    if not row["run_id"].startswith(f"exemplar-{set_id}-"):
+        return _error(409, "training_run_not_for_this_set")
+    if row["status"] in ("completed", "failed", "cancelled"):
+        return JSONResponse(content={
+            "run_id": run_id,
+            "status": row["status"],
+            "note": "already terminal; no state change",
+        })
+    proc = _lora_build_processes.get(run_id)
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            logger.warning(
+                "exemplar build cancel: SIGTERM failed for %s", run_id, exc_info=True,
+            )
+    history._conn.execute(
+        "UPDATE training_runs SET status = 'cancelled' WHERE run_id = ?",
+        (run_id,),
+    )
+    history._conn.commit()
+    run_dir = Path(__file__).parent / "training_runs" / run_id
+    if run_dir.exists():
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(run_dir, ignore_errors=True)
+        except Exception:
+            logger.warning("exemplar build cancel: tempdir cleanup failed", exc_info=True)
+    return JSONResponse(content={
+        "run_id": run_id,
+        "status": "cancelled",
+        "set_id": set_id,
+    })
 
 
 # ---------------------------------------------------------------------------

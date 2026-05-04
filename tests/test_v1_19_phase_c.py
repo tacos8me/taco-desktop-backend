@@ -44,9 +44,12 @@ def test_schema_v6_ab_arm_column_exists(fresh_db: HistoryStore) -> None:
     assert "ab_arm" in cols, "v6 migration must add ab_arm to generations"
 
 
-def test_schema_user_version_is_6(fresh_db: HistoryStore) -> None:
+def test_schema_user_version_is_at_least_6(fresh_db: HistoryStore) -> None:
+    # Test originally pinned to v6 (rc5 surface). Relaxed to >= 6 so future
+    # schema bumps don't break this v6-surface intent — same fix-pattern rc1
+    # applied to the v3 literal in test_v1_17_schema.py / test_v1_18_schema.py.
     v = fresh_db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert v == 6
+    assert v >= 6
 
 
 # ---------------------------------------------------------------------------

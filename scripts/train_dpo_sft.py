@@ -146,6 +146,7 @@ def select_chosen_ids(
            WHERE signal_strength >= ?
              AND validator_version = ?
              AND used_in_training_run_id IS NULL
+             AND pending_construction_until IS NULL
              AND chosen_clip_id IS NOT NULL""",
         (min_signal_strength, validator_version),
     ).fetchall()

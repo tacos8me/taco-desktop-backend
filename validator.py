@@ -48,6 +48,14 @@ from history_store import HistoryStore, _extract_frames_as_pils
 
 logger = logging.getLogger(__name__)
 
+# Global recommendation thresholds (v1.17.0-rc2). Per-bearer overrides
+# (v1.19.0+ L1 threshold endpoints) clamp to these ± 0.15 and forward through
+# `composite()` via kwargs. Inline literal use removed in favor of these
+# constants so threshold endpoints have a single source of truth.
+GLOBAL_PASS_THRESHOLD = 0.65
+GLOBAL_RETAKE_THRESHOLD = 0.45
+THRESHOLD_OVERRIDE_RANGE = 0.15
+
 
 # ---------------------------------------------------------------------------
 # Tier-3 judge response schema
@@ -436,6 +444,9 @@ def composite(
     tier1: dict | None,
     tier2: dict | None,
     tier3: dict | None,
+    *,
+    pass_threshold: float | None = None,
+    retake_threshold: float | None = None,
 ) -> dict:
     """Compute the composite score + recommendation.
 
@@ -443,7 +454,14 @@ def composite(
     its slot contributes 0.2·1.0 (= no penalty) so the composite stays
     additive. tier3.verdict="retake" force-overrides the recommendation
     regardless of numeric composite.
+
+    ``pass_threshold`` / ``retake_threshold`` accept per-bearer overrides
+    looked up from ``api_key_metadata`` (v1.19.0+ L1 feedback). When None,
+    fall back to ``GLOBAL_PASS_THRESHOLD`` / ``GLOBAL_RETAKE_THRESHOLD``.
+    The arithmetic of `score` is unchanged — only the cutoff comparisons.
     """
+    pass_thr = pass_threshold if pass_threshold is not None else GLOBAL_PASS_THRESHOLD
+    retake_thr = retake_threshold if retake_threshold is not None else GLOBAL_RETAKE_THRESHOLD
     parts = []
     notes: list[str] = []
     if tier1 is not None:
@@ -500,9 +518,9 @@ def composite(
 
     if tier3 is not None and tier3.get("verdict") == "retake":
         recommendation = "retake"
-    elif score >= 0.65:
+    elif score >= pass_thr:
         recommendation = "pass"
-    elif score >= 0.45:
+    elif score >= retake_thr:
         recommendation = "warn"
     else:
         recommendation = "retake"
@@ -591,6 +609,8 @@ async def run_all_tiers(
     validator_version: str | None = None,
     tiers: list[str] | None = None,
     motion_intent: str | None = None,
+    pass_threshold: float | None = None,
+    retake_threshold: float | None = None,
 ) -> dict:
     """Run the full validator pipeline + persist into validator_runs.
 
@@ -652,7 +672,11 @@ async def run_all_tiers(
             logger.warning("tier3 judge failed: %s", exc, exc_info=True)
             tier3 = None
 
-    comp = composite(tier1, tier2, tier3)
+    comp = composite(
+        tier1, tier2, tier3,
+        pass_threshold=pass_threshold,
+        retake_threshold=retake_threshold,
+    )
     overall_latency = time.perf_counter() - overall_t0
 
     payload = {

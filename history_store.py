@@ -16,7 +16,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 8
 
 # v1.18.0-rc2 — sqlite-vec extension for vector search. Loaded BEFORE
 # `PRAGMA journal_mode=WAL` per sqlite-vec docs (extension load must
@@ -126,6 +126,60 @@ CREATE TABLE IF NOT EXISTS api_key_metadata (
     created_at REAL,
     updated_at REAL
 );
+"""
+
+# v7 (v1.19.0-rc3 / v1.20.0) — three new tables backing the human-rating
+# capture (L3) + the L2.5 exemplar-set / LoRA-build loop. Created during
+# _migrate() on the v6→v7 bump. All CREATE TABLE / CREATE INDEX statements
+# use IF NOT EXISTS for idempotent re-run after a partial failure.
+_SCHEMA_V7_TABLES = """
+CREATE TABLE IF NOT EXISTS human_ratings (
+    rating_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    clip_id            TEXT    NOT NULL,
+    rater_api_key_hash TEXT    NOT NULL,
+    rating_kind        TEXT    NOT NULL,
+    rating_value       REAL    NOT NULL,
+    rating_payload_json TEXT,
+    validator_version_at_rating TEXT,
+    validator_composite_at_rating REAL,
+    validator_visible_at_rating INTEGER NOT NULL DEFAULT 0,
+    pair_id            INTEGER,
+    pair_partner_clip_id TEXT,
+    superseded_by      INTEGER,
+    created_at         REAL    NOT NULL,
+    retracted_at       REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_unique_active
+    ON human_ratings(rater_api_key_hash, clip_id, rating_kind)
+    WHERE retracted_at IS NULL AND superseded_by IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_hr_clip ON human_ratings(clip_id);
+CREATE INDEX IF NOT EXISTS idx_hr_rater ON human_ratings(rater_api_key_hash);
+CREATE INDEX IF NOT EXISTS idx_hr_pair ON human_ratings(pair_id) WHERE pair_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS exemplar_sets (
+    set_id              TEXT PRIMARY KEY,
+    rater_api_key_hash  TEXT NOT NULL,
+    description         TEXT,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    last_built_lora_id  TEXT,
+    last_built_at       REAL,
+    max_members         INTEGER NOT NULL DEFAULT 200
+);
+
+CREATE TABLE IF NOT EXISTS exemplar_set_members (
+    set_id      TEXT NOT NULL,
+    clip_id     TEXT NOT NULL,
+    added_at    REAL NOT NULL,
+    note        TEXT,
+    PRIMARY KEY (set_id, clip_id),
+    FOREIGN KEY (set_id) REFERENCES exemplar_sets(set_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_es_owner ON exemplar_sets(rater_api_key_hash);
+CREATE INDEX IF NOT EXISTS idx_esm_clip ON exemplar_set_members(clip_id);
 """
 
 
@@ -447,6 +501,11 @@ class HistoryStore:
         # missing), C extension load disabled at sqlite build time, or .so
         # ABI mismatch. None should crash backend startup.
         self._load_sqlite_vec()
+        # v7: exemplar_set_members FK cascades on exemplar_sets delete; SQLite
+        # honors `ON DELETE CASCADE` only when foreign_keys is ON (per-connection,
+        # default OFF). Set before executescript so the SCHEMA + migrations run
+        # under FK enforcement.
+        self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
         # WAL mode: readers never block the single writer. Without this, the
         # /v2/history list endpoint stalls behind the queue worker's thumbnail
@@ -772,6 +831,75 @@ class HistoryStore:
                     self._conn.execute(
                         "ALTER TABLE generations ADD COLUMN ab_arm TEXT"
                     )
+            if current < 7:
+                # v7 (v1.19.0-rc3 / v1.20.0) — human-rating capture (L3),
+                # per-bearer validator threshold overrides (L1), Path C′ staged
+                # construction window on preference_pairs, training-run state
+                # machine, and L2.5 exemplar-set + member tables for the
+                # operator-driven LoRA build loop. All additive; pre-v7 rows
+                # stay valid; ALTER TABLE statements guarded by PRAGMA
+                # table_info reflection for idempotent re-run.
+                akm_cols = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(api_key_metadata)"
+                    ).fetchall()
+                }
+                if "validator_pass_threshold_override" not in akm_cols:
+                    self._conn.execute(
+                        "ALTER TABLE api_key_metadata "
+                        "ADD COLUMN validator_pass_threshold_override REAL"
+                    )
+                if "validator_retake_threshold_override" not in akm_cols:
+                    self._conn.execute(
+                        "ALTER TABLE api_key_metadata "
+                        "ADD COLUMN validator_retake_threshold_override REAL"
+                    )
+                if "cross_bearer_rating_consent_at" not in akm_cols:
+                    self._conn.execute(
+                        "ALTER TABLE api_key_metadata "
+                        "ADD COLUMN cross_bearer_rating_consent_at REAL"
+                    )
+
+                pp_cols_v7 = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(preference_pairs)"
+                    ).fetchall()
+                }
+                if "pending_construction_until" not in pp_cols_v7:
+                    self._conn.execute(
+                        "ALTER TABLE preference_pairs "
+                        "ADD COLUMN pending_construction_until REAL "
+                        "DEFAULT NULL"
+                    )
+
+                tr_cols_v7 = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(training_runs)"
+                    ).fetchall()
+                }
+                if "status" not in tr_cols_v7:
+                    self._conn.execute(
+                        "ALTER TABLE training_runs "
+                        "ADD COLUMN status TEXT DEFAULT 'running'"
+                    )
+
+                self._conn.executescript(_SCHEMA_V7_TABLES)
+            if current < 8:
+                # v8 (Phase 3 prereq) — `system_flags` key/value table.
+                # Known keys: `human_rating_paused_until` (REAL epoch; if
+                # set AND > now, the human-rating ETL skips entirely),
+                # `lora_build_paused_until` (forward-looking, same shape).
+                # Not pre-populated; absence of a row is the unset state.
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS system_flags (
+                        name TEXT PRIMARY KEY,
+                        value TEXT,
+                        updated_at REAL NOT NULL
+                    )"""
+                )
             self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
             self._conn.commit()
             logger.info(
@@ -1123,6 +1251,90 @@ class HistoryStore:
             (comp_id,),
         ).fetchone()[0]
         return after - before
+
+    def delete_rater_corpus(self, rater_api_key_hash: str) -> dict[str, int]:
+        """Right-to-delete cascade for a single rater's contribution corpus.
+
+        Removes:
+          1. all ``human_ratings`` rows authored by ``rater_api_key_hash``
+          2. all ``exemplar_set_members`` rows under sets owned by the rater
+             (FK CASCADE handles this when the parent set is deleted, but
+             we delete members directly first so the count is accurate
+             when the rater owns no sets but contributed to others — not
+             possible today since membership is set-owner-only, but kept
+             for forward-compat)
+          3. all ``exemplar_sets`` owned by the rater (CASCADEs to
+             remaining members via FK)
+          4. all ``preference_pairs`` rows whose ``pair_id`` is referenced
+             by any of the deleted ``human_ratings`` rows (Path C′ cleanup —
+             only the unconsumed rows are still removable; rows whose
+             ``used_in_training_run_id`` is non-NULL are immutable and stay)
+
+        Returns a dict with per-table delete counts (caller can audit).
+        Caller is responsible for transactional context if a partial failure
+        is unacceptable; this method runs all DELETEs on the shared
+        connection and commits at the end.
+        """
+        # Capture pair_ids before deleting human_ratings so we can cascade
+        # to preference_pairs.
+        pair_id_rows = self._conn.execute(
+            """SELECT DISTINCT pair_id FROM human_ratings
+               WHERE rater_api_key_hash = ? AND pair_id IS NOT NULL""",
+            (rater_api_key_hash,),
+        ).fetchall()
+        pair_ids = [row["pair_id"] for row in pair_id_rows]
+
+        cur = self._conn.execute(
+            "DELETE FROM human_ratings WHERE rater_api_key_hash = ?",
+            (rater_api_key_hash,),
+        )
+        n_ratings = cur.rowcount
+
+        # Preference_pairs cascade — only delete pairs that haven't been
+        # consumed by training. Already-trained pairs are immutable; the
+        # documented retraction semantics say the model can't be unwound
+        # post-hoc.
+        n_pairs = 0
+        if pair_ids:
+            placeholders = ",".join("?" for _ in pair_ids)
+            cur = self._conn.execute(
+                f"DELETE FROM preference_pairs WHERE pair_id IN ({placeholders}) "
+                "AND used_in_training_run_id IS NULL",
+                pair_ids,
+            )
+            n_pairs = cur.rowcount
+
+        # Exemplar set members owned by this rater. Capture set_ids first
+        # then delete the set (FK CASCADE wipes any remaining members).
+        owned_set_rows = self._conn.execute(
+            "SELECT set_id FROM exemplar_sets WHERE rater_api_key_hash = ?",
+            (rater_api_key_hash,),
+        ).fetchall()
+        owned_set_ids = [row["set_id"] for row in owned_set_rows]
+
+        n_members = 0
+        if owned_set_ids:
+            placeholders = ",".join("?" for _ in owned_set_ids)
+            cur = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM exemplar_set_members "
+                f"WHERE set_id IN ({placeholders})",
+                owned_set_ids,
+            )
+            n_members = cur.fetchone()["c"]
+
+        cur = self._conn.execute(
+            "DELETE FROM exemplar_sets WHERE rater_api_key_hash = ?",
+            (rater_api_key_hash,),
+        )
+        n_sets = cur.rowcount
+
+        self._conn.commit()
+        return {
+            "human_ratings": n_ratings,
+            "preference_pairs": n_pairs,
+            "exemplar_sets": n_sets,
+            "exemplar_set_members": n_members,
+        }
 
     def find_id_by_result_uri(self, result_uri: str) -> str | None:
         """Return the most recent history-row id whose ``result_uri`` matches.

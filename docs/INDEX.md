@@ -33,6 +33,7 @@ Full history â†’ [CHANGELOG.md](../CHANGELOG.md). Per-version code highlights â†
 | tune validator / retrieval / rate-limit / export-quality knobs | [operator-tuning.md](./operator-tuning.md) |
 | look up a term | [GLOSSARY.md](./GLOSSARY.md) |
 | integrate as an HTTP client (full endpoint contract) | [API.md](./API.md) |
+| integrate a third-party rating client (rating + exemplar-LoRA endpoints) | [RATING_LORA_INTEGRATION.md](./RATING_LORA_INTEGRATION.md) |
 | understand why we made decision X | [DECISIONS.md](./DECISIONS.md) |
 | understand the privacy / multi-tenant story | [PRIVACY_GOVERNANCE.md](./PRIVACY_GOVERNANCE.md) |
 | use Phase B retrieval (`find_similar_shots` / `recommend_loras`) | [RETRIEVAL_WORKFLOW.md](./RETRIEVAL_WORKFLOW.md) |
